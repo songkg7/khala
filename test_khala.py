@@ -543,5 +543,63 @@ class KhalaConfigTest(unittest.TestCase):
         self.assertFalse(self.cfg.is_enabled_workspace("/anywhere"))
 
 
+class KhalaHookDispatchTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.state_path = self.dir / "state.db"
+        _make_hermes_state_db(self.state_path)
+        from khala.adapters.hermes import HermesAdapter
+
+        self.adapter = HermesAdapter(self.state_path)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_handle_hook_hermes(self):
+        sid, cwd = self.adapter.handle_hook({"session_id": "sess-9", "cwd": "/ws"})
+        self.assertEqual(sid, "sess-9")
+        self.assertEqual(cwd, "/ws")
+
+    def test_handle_hook_hermes_missing_session(self):
+        sid, cwd = self.adapter.handle_hook({"cwd": "/ws"})
+        self.assertIsNone(sid)
+        self.assertEqual(cwd, "/ws")
+
+    def test_hook_command_integration(self):
+        db = self.dir / "khala.db"
+        with patch.dict(
+            os.environ,
+            {"KHALA_DB": str(db), "KHALA_CONFIG_DIR": str(self.dir / "cfg"), "HERMES_STATE_DB": str(self.state_path)},
+        ):
+            code, out, _ = self._run("workspace", "add", str(self.dir))
+            self.assertEqual(code, 0)
+            # in-scope hook → syncs
+            code, out, _ = self._run("hook", "hermes", stdin='{"session_id":"sess-1","cwd": "%s"}' % self.dir)
+            self.assertEqual(code, 0)
+            self.assertIn('"status": "synced"', out)
+            # out-of-scope → skip
+            code, out, _ = self._run("hook", "hermes", stdin='{"session_id":"sess-1","cwd": "/tmp/elsewhere"}')
+            self.assertEqual(code, 0)
+            self.assertIn("workspace not enabled", out)
+
+    def _run(self, *args, stdin=""):
+        prev, sys.stdin = sys.stdin, io.StringIO(stdin)
+        prev_out, sys.stdout = sys.stdout, io.StringIO()
+        prev_err, sys.stderr = sys.stderr, io.StringIO()
+        try:
+            try:
+                code = main(list(args))
+            except SystemExit as exc:
+                code = exc.code or 0
+            out = sys.stdout.getvalue()
+            err = sys.stderr.getvalue()
+            return code, out, err
+        finally:
+            sys.stdin = prev
+            sys.stdout = prev_out
+            sys.stderr = prev_err
+
+
 if __name__ == "__main__":
     unittest.main()

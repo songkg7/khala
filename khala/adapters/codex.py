@@ -49,6 +49,16 @@ class CodexAdapter:
     def __init__(self, sessions_dir: Path = CODEX_SESSIONS_DIR) -> None:
         self.sessions_dir = sessions_dir
 
+    def handle_hook(self, payload: Mapping[str, Any]) -> tuple[str | None, str]:
+        """Extract (session_id, cwd) from a Codex hook payload.
+
+        Codex hook payloads schema is TBD — unblocked by the rollout-id from the
+        payload's session metadata when available. Empty → caller skips (no-op).
+        """
+        session_id = str(payload.get("session_id") or payload.get("rollout_id") or "")
+        cwd = str(payload.get("cwd") or "")
+        return (session_id or None, cwd)
+
     def _rollout_paths(self) -> list[Path]:
         paths: list[Path] = []
         # Codex nests rollouts as sessions/YYYY/MM/DD/rollout-*.jsonl; also accept

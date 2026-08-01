@@ -56,6 +56,13 @@ class HermesAdapter:
     def __init__(self, state_db: Path = HERMES_STATE_DB) -> None:
         self.state_db = state_db
 
+    def handle_hook(self, payload: Mapping[str, Any]) -> tuple[str | None, str]:
+        """Extract (session_id, cwd) from a Hermes shell-hook JSON payload."""
+        session_id = str(payload.get("session_id") or "")
+        cwd = str(payload.get("cwd") or "")
+        return (session_id or None, cwd)
+
+
     def list_sessions(self, limit: int = 200) -> list[str]:
         with _connections(self.state_db) as db:
             rows = db.execute(
