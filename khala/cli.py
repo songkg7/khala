@@ -35,8 +35,10 @@ def parser() -> argparse.ArgumentParser:
     ingest.add_argument("--adapter", help="MODULE:CALLABLE; stdin JSONL is the default")
     ingest.add_argument("source", nargs="?")
     sync_cmd = commands.add_parser("sync", help="Sync agent sessions into khala")
-    sync_cmd.add_argument("--adapter", default="hermes", help="Agent adapter name (available: hermes; drop new adapters into khala/adapters/)")
+    sync_cmd.add_argument("--adapter", default="hermes", help="Agent adapter name (available: hermes, codex)")
     sync_cmd.add_argument("--session-id", default=None, help="Sync only this session (incremental)")
+    sync_cmd.add_argument("--name", default=None, help="Override user name (default: git config user.name, else $USER)")
+    sync_cmd.add_argument("--email", default=None, help="Override user email (default: git config user.email)")
     return root
 
 
@@ -66,14 +68,18 @@ def main(argv: list[str] | None = None) -> int:
             output({"session_id": store.import_events(args.agent, events)})
         elif args.command == "sync":
             from khala.adapters import get_adapter
+            from khala.identity import User, resolve_user
             from khala.sync import sync as bulk_sync
             from khala.sync import sync_session as sync_one
 
             adapter = get_adapter(args.adapter)
+            user = resolve_user(Path.cwd())
+            if args.name or args.email:
+                user = User(name=args.name or user.name, email=args.email or user.email)
             if args.session_id:
-                result = sync_one(store, adapter, args.session_id)
+                result = sync_one(store, adapter, args.session_id, user=user, cwd=Path.cwd())
             else:
-                result = bulk_sync(store, adapter)
+                result = bulk_sync(store, adapter, user=user)
             output(result)
         return 0
     except (ImportError, AttributeError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:

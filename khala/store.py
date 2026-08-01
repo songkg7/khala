@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from khala.identity import User
 from khala.redact import redact
 
 
@@ -32,7 +33,9 @@ class Store:
                 agent TEXT NOT NULL,
                 external_id TEXT,
                 created_at TEXT NOT NULL,
-                metadata TEXT NOT NULL DEFAULT '{}'
+                metadata TEXT NOT NULL DEFAULT '{}',
+                user_name TEXT DEFAULT NULL,
+                user_email TEXT DEFAULT NULL
             );
             CREATE TABLE IF NOT EXISTS events (
                 id TEXT PRIMARY KEY,
@@ -61,16 +64,32 @@ class Store:
                 last_message_id INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (agent, external_id)
             );
-        """)
-
+            """
+        )
+        # ponytail: naive ADD-COLUMN migration; a real migration framework only
+        # when the schema churns more than once.
+        columns = [r[1] for r in self.db.execute("PRAGMA table_info(sessions)")]
+        if "user_id" in columns:
+            # older dev check-in used a single user_id column; normalize to name/email
+            self.db.execute("ALTER TABLE sessions RENAME COLUMN user_id TO user_name")
+            columns = [r[1] if r[1] != "user_id" else "user_name" for r in self.db.execute("PRAGMA table_info(sessions)")]
+        if "user_name" not in columns:
+            self.db.execute("ALTER TABLE sessions ADD COLUMN user_name TEXT DEFAULT NULL")
+        if "user_email" not in columns:
+            self.db.execute("ALTER TABLE sessions ADD COLUMN user_email TEXT DEFAULT NULL")
+        self.db.commit()
     def add_session(
         self, agent: str, external_id: str | None = None,
         metadata: Mapping[str, Any] | None = None,
+        user: User | None = None,
     ) -> str:
         session_id = str(uuid.uuid4())
         self.db.execute(
-            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?)",
-            (session_id, agent, external_id, _now(), json.dumps(metadata or {})),
+            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                session_id, agent, external_id, _now(), json.dumps(metadata or {}),
+                user.name if user else None, user.email if user else None,
+            ),
         )
         self.db.commit()
         return session_id
@@ -93,6 +112,13 @@ class Store:
                 (session_id,),
             )
         ]
+
+    def set_session_user(self, session_id: str, user: User) -> None:
+        self.db.execute(
+            "UPDATE sessions SET user_name = ?, user_email = ? WHERE id = ?",
+            (user.name, user.email, session_id),
+        )
+        self.db.commit()
 
     def get_watermark(self, agent: str, external_id: str) -> int:
         """Last-synced Hermes message ID for a session (used for incremental sync)."""
@@ -135,9 +161,9 @@ class Store:
 
     def import_events(
         self, agent: str, events: Iterable[Mapping[str, Any]],
-        external_id: str | None = None,
+        external_id: str | None = None, user: User | None = None,
     ) -> str:
-        session_id = self.add_session(agent, external_id)
+        session_id = self.add_session(agent, external_id, user=user)
         try:
             for event in events:
                 self.add_event(
@@ -161,6 +187,7 @@ class Store:
         rows = self.db.execute(
             """
             SELECT e.id, e.session_id, e.role, e.content, e.created_at, s.agent,
+                   s.user_name, s.user_email,
                    COALESCE(r.count, 0) AS recall_count,
                    bm25(events_fts) - COALESCE(r.count, 0) * 0.1 AS rank
             FROM events_fts
@@ -189,8 +216,9 @@ class Store:
         return [
             dict(row)
             for row in self.db.execute(
-                "SELECT id, role, content, created_at, metadata FROM events "
-                "WHERE session_id = ? ORDER BY created_at, rowid",
+                "SELECT e.id, e.role, e.content, e.created_at, e.metadata, s.user_name, s.user_email "
+                "FROM events e JOIN sessions s ON s.id = e.session_id " 
+                "WHERE e.session_id = ? ORDER BY e.created_at, e.rowid",
                 (session_id,),
             )
         ]

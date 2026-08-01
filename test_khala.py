@@ -2,13 +2,15 @@ import io
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from khala import Store, main, load_adapter, read_jsonl, redact
-from khala.adapters import get_adapter
+from khala.identity import resolve_user
 from khala.sync import sync_session
 
 
@@ -479,9 +481,41 @@ class KhalaCrossAgentCompatTest(unittest.TestCase):
         for session_id in (hermes_sid, codex_sid):
             for event in self.store.replay(session_id):
                 self.assertEqual(set(event.keys()),
-                                 {"id", "role", "content", "created_at", "metadata"},
+                                 {"id", "role", "content", "created_at", "metadata", "user_name", "user_email"},
                                  f"non-canonical event: {event}")
                 self.assertNotIn("hermes_message_id", event)
+
+
+class KhalaIdentityTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _init_git(self, name: str, email: str) -> None:
+        subprocess.run(["git", "init", "-q"], cwd=self.dir, check=True)
+        subprocess.run(["git", "config", "user.name", name], cwd=self.dir, check=True)
+        subprocess.run(["git", "config", "user.email", email], cwd=self.dir, check=True)
+
+    def test_resolve_from_git_config(self):
+        self._init_git("Alice Kim", "alice@example.com")
+        user = resolve_user(self.dir)
+        self.assertEqual(user.name, "Alice Kim")
+        self.assertEqual(user.email, "alice@example.com")
+
+    def test_fallback_to_env_user(self):
+        # Blank global/system git config → no identity anywhere → falls back to $USER.
+        with patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}):
+            user = resolve_user(self.dir)
+        self.assertEqual(user.name, os.environ.get("USER"))
+        self.assertIsNone(user.email)
+
+    def test_git_global_config_is_used(self):
+        # Non-repo dir still picks up the user's global git identity.
+        user = resolve_user(self.dir)
+        self.assertIsNotNone(user.name)
 
 
 if __name__ == "__main__":
