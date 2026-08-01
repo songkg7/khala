@@ -12,7 +12,10 @@ requires-python = ">=3.9"
 khala = "khala.cli:main"
 
 [tool.setuptools]
-packages = ["khala"]
+packages = [
+    "khala",
+    "khala.adapters",
+]
 
 [tool.ruff]
 line-length = 100

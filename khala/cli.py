@@ -39,6 +39,18 @@ def parser() -> argparse.ArgumentParser:
     sync_cmd.add_argument("--session-id", default=None, help="Sync only this session (incremental)")
     sync_cmd.add_argument("--name", default=None, help="Override user name (default: git config user.name, else $USER)")
     sync_cmd.add_argument("--email", default=None, help="Override user email (default: git config user.email)")
+    hook = commands.add_parser("hook-hermes", help="Hermes shell-hook entrypoint (reads JSON payload from stdin)")
+    hook.add_argument("--workspace", default=None, help="Workspace whose sessions to sync (default: payload cwd if enabled)")
+    ws = commands.add_parser("workspace", help="Manage khala-enabled workspaces")
+    ws_sub = ws.add_subparsers(dest="ws_action", required=True)
+    ws_add = ws_sub.add_parser("add", help="Enable a workspace for auto-sync")
+    ws_add.add_argument("path", type=Path)
+    ws_rm = ws_sub.add_parser("remove", help="Disable a workspace")
+    ws_rm.add_argument("path", type=Path)
+    ws_sub.add_parser("list")
+    compat = commands.add_parser("compat-check", help="Verify a vendor session landed with a canonical schema + user identity")
+    compat.add_argument("--adapter", required=True, help="Adapter name (hermes, codex)")
+    compat.add_argument("--session-id", required=True, help="Vendor session id")
     return root
 
 
@@ -81,6 +93,44 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 result = bulk_sync(store, adapter, user=user)
             output(result)
+        elif args.command == "hook-hermes":
+            from khala.adapters.hermes import HermesAdapter
+            from khala.config import is_enabled_workspace
+            from khala.sync import sync_session as sync_one
+
+            payload = json.loads(sys.stdin.read()) if not sys.stdin.isatty() else {}
+            cwd = str(payload.get("cwd") or "") if isinstance(payload, dict) else ""
+            session_id = str(payload.get("session_id") or "") if isinstance(payload, dict) else ""
+            workspace = args.workspace or cwd
+            if not is_enabled_workspace(workspace):
+                output({"status": "skipped", "reason": "workspace not enabled"})
+            elif not session_id:
+                output({"status": "skipped", "reason": "no session_id"})
+            else:
+                adapter = HermesAdapter()
+                result = sync_one(store, adapter, session_id, cwd=Path(cwd) if cwd else None)
+                output({"status": "synced", **result})
+        elif args.command == "workspace":
+            from khala.config import load_config, save_config
+
+            config_data = load_config()
+            if args.ws_action == "add":
+                path_str = str(args.path.resolve())
+                if path_str not in config_data["workspaces"]:
+                    config_data["workspaces"].append(path_str)
+                    save_config(config_data)
+                output({"ok": True, "workspace": path_str, "workspaces": config_data["workspaces"]})
+            elif args.ws_action == "remove":
+                path_str = str(args.path.resolve())
+                config_data["workspaces"] = [w for w in config_data["workspaces"] if w != path_str]
+                save_config(config_data)
+                output({"ok": True, "workspaces": config_data["workspaces"]})
+            elif args.ws_action == "list":
+                output({"workspaces": config_data["workspaces"]})
+        elif args.command == "compat-check":
+            from khala.compat import compat_check
+
+            output(compat_check(store, args.adapter, args.session_id))
         return 0
     except (ImportError, AttributeError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
         print(f"khala: {error}", file=sys.stderr)

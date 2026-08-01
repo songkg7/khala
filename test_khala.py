@@ -518,5 +518,30 @@ class KhalaIdentityTest(unittest.TestCase):
         self.assertIsNotNone(user.name)
 
 
+class KhalaConfigTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        # isolate ~/.khala config dir for the test
+        self.patcher = patch.dict(os.environ, {"KHALA_CONFIG_DIR": self.tmp.name}, clear=False)
+        self.patcher.start()
+        from khala import config as cfg
+
+        self.cfg = cfg
+
+    def tearDown(self):
+        self.patcher.stop()
+        self.tmp.cleanup()
+
+    def test_workspace_add_and_is_enabled(self):
+        self.cfg.save_config({"workspaces": ["/ws/a"]})
+        self.assertEqual(self.cfg.load_config()["workspaces"], ["/ws/a"])
+        self.assertTrue(self.cfg.is_enabled_workspace("/ws/a/sub/dir"))
+        self.assertFalse(self.cfg.is_enabled_workspace("/ws/b"))
+
+    def test_config_default_when_missing(self):
+        self.assertEqual(self.cfg.load_config(), {"workspaces": []})
+        self.assertFalse(self.cfg.is_enabled_workspace("/anywhere"))
+
+
 if __name__ == "__main__":
     unittest.main()
