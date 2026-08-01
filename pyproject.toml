@@ -9,10 +9,10 @@ description = "Local-first shared agent memory"
 requires-python = ">=3.9"
 
 [project.scripts]
-khala = "khala:main"
+khala = "khala.cli:main"
 
 [tool.setuptools]
-py-modules = ["khala"]
+packages = ["khala"]
 
 [tool.ruff]
 line-length = 100
