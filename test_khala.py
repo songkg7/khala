@@ -1,11 +1,52 @@
 import io
 import json
+import os
+import sqlite3
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from khala import Store, main, load_adapter, read_jsonl, redact
+from khala.hooks import sync_session, HERMES_STATE_DB
+
+
+def _make_hermes_state_db(path: Path) -> None:
+    """Build a minimal fake Hermes state.db in the same schema."""
+    db = sqlite3.connect(path)
+    db.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            started_at REAL,
+            cwd TEXT,
+            ended_at REAL
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT,
+            tool_calls TEXT,
+            tool_name TEXT,
+            timestamp REAL NOT NULL
+        );
+        """
+    )
+    db.execute("INSERT INTO sessions(id, started_at, cwd) VALUES ('sess-1', 1.0, '/ws')")
+    db.execute(
+        "INSERT INTO messages(session_id, role, content, timestamp) VALUES ('sess-1','user','hello',1.0)"
+    )
+    db.execute(
+        "INSERT INTO messages(session_id, role, content, tool_calls, timestamp) "
+        "VALUES ('sess-1','assistant','', '[{\"id\":\"c1\",\"function\":{\"name\":\"read_file\"}}]', 2.0)"
+    )
+    db.execute(
+        "INSERT INTO messages(session_id, role, content, tool_name, timestamp) "
+        "VALUES ('sess-1','tool','{\"ok\": true}', 'read_file', 3.0)"
+    )
+    db.commit()
+    db.close()
 
 
 class KhalaStoreTest(unittest.TestCase):
@@ -253,6 +294,45 @@ class KhalaCLIIntegrationTest(unittest.TestCase):
     def test_wrong_command_returns_2(self):
         code, _, err = self._run("nonexistent")
         self.assertEqual(code, 2)
+
+
+class KhalaSyncHookTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tmp.name) / "khala.db"
+        self.state_path = Path(self.tmp.name) / "state.db"
+        _make_hermes_state_db(self.state_path)
+        self.store = Store(self.db_path)
+
+    def tearDown(self):
+        self.store.db.close()
+        self.tmp.cleanup()
+
+    def test_sync_session_incremental(self):
+        first = sync_session(self.store, "sess-1", self.state_path)
+        self.assertEqual(first["added"], 3)  # user + assistant(tool_calls) + tool
+        self.assertEqual(first["events_total"], 3)
+
+        # idempotent: second sync adds nothing
+        second = sync_session(self.store, "sess-1", self.state_path)
+        self.assertEqual(second["added"], 0)
+
+        # new message appended → only the new one syncs
+        db = sqlite3.connect(self.state_path)
+        db.execute(
+            "INSERT INTO messages(session_id, role, content, timestamp) "
+            "VALUES ('sess-1','assistant','final answer',4.0)"
+        )
+        db.commit()
+        db.close()
+
+        third = sync_session(self.store, "sess-1", self.state_path)
+        self.assertEqual(third["added"], 1)
+        self.assertEqual(third["events_total"], 4)
+
+        # tool_calls got summarized, tool content preserved
+        replay = self.store.replay(first["khala_session"])
+        self.assertEqual(replay[1]["content"], "[tool_calls: read_file]")
 
 
 if __name__ == "__main__":

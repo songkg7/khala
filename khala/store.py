@@ -55,6 +55,12 @@ class Store:
                 count INTEGER NOT NULL DEFAULT 0,
                 last_recalled_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS sync_state (
+                agent TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                last_message_id INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (agent, external_id)
+            );
         """)
 
     def add_session(
@@ -68,6 +74,43 @@ class Store:
         )
         self.db.commit()
         return session_id
+
+    def get_session_id(self, agent: str, external_id: str) -> str | None:
+        """Look up an existing session by agent + external_id (used for incremental sync)."""
+        row = self.db.execute(
+            "SELECT id FROM sessions WHERE agent = ? AND external_id = ?",
+            (agent, external_id),
+        ).fetchone()
+        return str(row["id"]) if row else None
+
+    def get_events(self, session_id: str) -> list[dict[str, Any]]:
+        """Raw events for a session, used by the sync hook for dedup."""
+        return [
+            dict(row)
+            for row in self.db.execute(
+                "SELECT id, role, content, created_at, metadata FROM events "
+                "WHERE session_id = ?",
+                (session_id,),
+            )
+        ]
+
+    def get_watermark(self, agent: str, external_id: str) -> int:
+        """Last-synced Hermes message ID for a session (used for incremental sync)."""
+        row = self.db.execute(
+            "SELECT last_message_id FROM sync_state WHERE agent = ? AND external_id = ?",
+            (agent, external_id),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def set_watermark(self, agent: str, external_id: str, last_message_id: int) -> None:
+        self.db.execute(
+            """
+            INSERT INTO sync_state(agent, external_id, last_message_id) VALUES (?, ?, ?)
+            ON CONFLICT(agent, external_id) DO UPDATE SET last_message_id = excluded.last_message_id
+            """,
+            (agent, external_id, last_message_id),
+        )
+        self.db.commit()
 
     def add_event(
         self,

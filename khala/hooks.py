@@ -2,98 +2,150 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import time
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterator, Mapping
 
 from khala.store import Store
 
-HERMES_SESSION_DIR = Path.home() / ".hermes" / "sessions"
+HERMES_STATE_DB = Path(os.environ.get("HERMES_STATE_DB", Path.home() / ".hermes" / "state.db"))
 
 
-def _hermes_jsonl_paths() -> list[Path]:
-    """List Hermes session JSONL files sorted by modification time (oldest first)."""
-    paths = sorted(HERMES_SESSION_DIR.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
-    return paths
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def _session_id_from_path(path: Path) -> str:
-    """Extract Hermes session ID from filename (stem before first .jsonl)."""
-    return path.stem
+@contextmanager
+def _connections(state_db_path: Path) -> Iterator[sqlite3.Connection]:
+    """Open a read-only connection to Hermes' state.db."""
+    if not state_db_path.is_file():
+        raise FileNotFoundError(f"Hermes state DB not found: {state_db_path}")
+    db = sqlite3.connect(f"file:{state_db_path}?mode=ro", uri=True)
+    db.row_factory = sqlite3.Row
+    try:
+        yield db
+    finally:
+        db.close()
 
 
-def _hermes_jsonl_to_events(path: Path) -> Iterable[Mapping[str, Any]]:
-    """Parse a Hermes JSONL file into khala event dicts, skipping session_meta."""
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            record = json.loads(line)
-            role = record.get("role")
-            if role == "session_meta":
-                continue
-            content = record.get("content", "")
-            if not content and role == "assistant" and record.get("tool_calls"):
-                calls = record["tool_calls"]
-                names = [c.get("function", {}).get("name", "?") for c in calls]
-                content = f"[tool_calls: {', '.join(names)}]"
-            if not content:
-                continue
-
-            created_at = record.get("timestamp")
-            if isinstance(created_at, (int, float)):
-                created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(created_at))
-
-            yield {
-                "role": role,
-                "content": content,
-                "created_at": created_at,
-            }
+def _message_to_event(row: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    role = row["role"]
+    if role == "session_meta":
+        return None
+    content = row["content"] or ""
+    if not content and role == "assistant" and row["tool_calls"]:
+        try:
+            calls = json.loads(row["tool_calls"])
+            names = [c.get("function", {}).get("name", "?") for c in calls]
+        except (json.JSONDecodeError, TypeError):
+            names = ["?"]
+        content = f"[tool_calls: {', '.join(names)}]"
+    if not content:
+        return None
+    timestamp = row["timestamp"]
+    if isinstance(timestamp, (int, float)):
+        created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp))
+    else:
+        created_at = None
+    return {
+        "role": role,
+        "content": content,
+        "created_at": created_at,
+        "hermes_message_id": int(row["id"]) if row["id"] is not None else None,
+    }
 
 
-def _synced_external_ids(store: Store) -> set[str]:
-    """Return all external_ids already synced into this khala store."""
-    rows = store.db.execute(
-        "SELECT external_id FROM sessions WHERE agent = 'hermes' AND external_id IS NOT NULL"
+def _pending_messages(db, session_id: str, after_id: int) -> list[Mapping[str, Any]]:
+    rows = db.execute(
+        "SELECT id, role, content, tool_calls, timestamp FROM messages "
+        "WHERE session_id = ? AND id > ? ORDER BY id",
+        (session_id, after_id),
     ).fetchall()
-    return {str(row[0]) for row in rows}
+    return [dict(r) for r in rows]
 
 
-def sync(store: Store, hermes_dir: Path | None = None) -> dict[str, Any]:
-    """Sync new Hermes sessions into khala. Returns sync stats."""
-    hermes_dir = hermes_dir or HERMES_SESSION_DIR
-    if not hermes_dir.is_dir():
-        return {"synced": 0, "skipped": 0, "errors": 0, "message": f"not a directory: {hermes_dir}"}
+def _known_event_message_ids(store: Store, khala_session_id: str) -> set[int]:
+    """Hermes message IDs already stored under a khala session."""
+    ids: set[int] = set()
+    for event in store.get_events(khala_session_id):
+        try:
+            meta = json.loads(event.get("metadata") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            meta = {}
+        hmid = meta.get("hermes_message_id")
+        if isinstance(hmid, (int, float)):
+            ids.add(int(hmid))
+    return ids
 
-    synced = 0
+
+def sync_session(store: Store, session_id: str, state_db: Path = HERMES_STATE_DB) -> dict[str, Any]:
+    """Incrementally sync one Hermes session into khala (append new messages only)."""
+    agent = "hermes"
+    khala_sid = store.get_session_id(agent, session_id)
+    if khala_sid is None:
+        khala_sid = store.add_session(agent, session_id)
+
+    watermark = store.get_watermark(agent, session_id)
+    known = _known_event_message_ids(store, khala_sid)
+
+    with _connections(state_db) as db:
+        messages = _pending_messages(db, session_id, watermark)
+
+    added = 0
     skipped = 0
-    errors = 0
-    last_error = ""
-
-    already = _synced_external_ids(store)
-
-    for jsonl_path in _hermes_jsonl_paths():
-        sid = _session_id_from_path(jsonl_path)
-        if sid in already:
+    last_id = watermark
+    for msg in messages:
+        mid = int(msg["id"])
+        last_id = max(last_id, mid)
+        if mid in known:
             skipped += 1
             continue
+        event = _message_to_event(msg)
+        if event is None:
+            skipped += 1
+            continue
+        metadata = {"hermes_message_id": mid}
+        store.add_event(
+            khala_sid, str(event["role"]), str(event["content"]),
+            event["created_at"], metadata,
+        )
+        known.add(mid)
+        added += 1
 
-        try:
-            events = list(_hermes_jsonl_to_events(jsonl_path))
-            if not events:
-                skipped += 1
-                continue
-            store.import_events("hermes", events, external_id=sid)
-            already.add(sid)
-            synced += 1
-        except Exception as exc:
-            errors += 1
-            last_error = str(exc)
+    if last_id > watermark:
+        store.set_watermark(agent, session_id, last_id)
 
+    events_total = len(store.get_events(khala_sid))
     return {
-        "synced": synced,
+        "hermes_session": session_id,
+        "khala_session": khala_sid,
+        "added": added,
         "skipped": skipped,
-        "errors": errors,
-        "last_error": last_error,
+        "events_total": events_total,
     }
+
+
+def sync(store: Store, state_db: Path = HERMES_STATE_DB, max_sessions: int = 200) -> dict[str, Any]:
+    """Bulk sync: import recent sessions not yet known to khala, and catch up on known ones."""
+    if not state_db.is_file():
+        return {"synced": 0, "skipped": 0, "errors": 0, "last_error": f"not found: {state_db}"}
+    result = {"synced": 0, "skipped_sessions": 0, "errors": 0, "last_error": ""}
+    with _connections(state_db) as db:
+        rows = db.execute(
+            "SELECT id FROM sessions ORDER BY started_at DESC LIMIT ?",
+            (max_sessions,),
+        ).fetchall()
+        session_ids = [str(r["id"]) for r in rows]
+    for sid in session_ids:
+        try:
+            out = sync_session(store, sid, state_db)
+            result["synced"] += out["added"]
+            if out["added"] == 0:
+                result["skipped_sessions"] += 1
+        except Exception as exc:
+            result["errors"] += 1
+            result["last_error"] = f"{sid}: {exc}"
+    return result
