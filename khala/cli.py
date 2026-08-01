@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from khala.adapter import ingest_events
+from khala.hooks import sync as sync_hook
 from khala.store import Store
 
 DEFAULT_DB = Path(os.environ.get("KHALA_DB", "~/.khala/khala.db")).expanduser()
@@ -34,6 +35,8 @@ def parser() -> argparse.ArgumentParser:
     ingest.add_argument("--agent", required=True)
     ingest.add_argument("--adapter", help="MODULE:CALLABLE; stdin JSONL is the default")
     ingest.add_argument("source", nargs="?")
+    sync_cmd = commands.add_parser("sync", help="Sync Hermes sessions into khala")
+    sync_cmd.add_argument("--hermes-dir", type=Path, default=None, help="Hermes session directory (default: ~/.hermes/sessions)")
     return root
 
 
@@ -61,6 +64,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "ingest":
             events = ingest_events(args.adapter, args.source, sys.stdin)
             output({"session_id": store.import_events(args.agent, events)})
+        elif args.command == "sync":
+            result = sync_hook(store, args.hermes_dir)
+            output(result)
         return 0
     except (ImportError, AttributeError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
         print(f"khala: {error}", file=sys.stderr)

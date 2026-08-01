@@ -90,8 +90,11 @@ class Store:
         self.db.commit()
         return event_id
 
-    def import_events(self, agent: str, events: Iterable[Mapping[str, Any]]) -> str:
-        session_id = self.add_session(agent)
+    def import_events(
+        self, agent: str, events: Iterable[Mapping[str, Any]],
+        external_id: str | None = None,
+    ) -> str:
+        session_id = self.add_session(agent, external_id)
         try:
             for event in events:
                 self.add_event(
