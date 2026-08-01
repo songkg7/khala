@@ -155,6 +155,9 @@ class Store:
         return session_id
 
     def recall(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        # FTS5 treats `-`/`OR`/`*` as operators; quote when the user typed a bare hyphen
+        # so "cross-agent" → phrase, not `cross -agent` (NOT operator) which errors.
+        match_query = f'"{query.replace(chr(34), "")}"' if "-" in query else query
         rows = self.db.execute(
             """
             SELECT e.id, e.session_id, e.role, e.content, e.created_at, s.agent,
@@ -168,7 +171,7 @@ class Store:
             ORDER BY rank, e.created_at DESC
             LIMIT ?
             """,
-            (query, limit),
+            (match_query, limit),
         ).fetchall()
         recalled_at = _now()
         self.db.executemany(
