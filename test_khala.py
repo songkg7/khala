@@ -8,7 +8,8 @@ import unittest
 from pathlib import Path
 
 from khala import Store, main, load_adapter, read_jsonl, redact
-from khala.hooks import sync_session, HERMES_STATE_DB
+from khala.adapters import get_adapter
+from khala.sync import sync_session
 
 
 def _make_hermes_state_db(path: Path) -> None:
@@ -302,6 +303,9 @@ class KhalaSyncHookTest(unittest.TestCase):
         self.db_path = Path(self.tmp.name) / "khala.db"
         self.state_path = Path(self.tmp.name) / "state.db"
         _make_hermes_state_db(self.state_path)
+        from khala.adapters.hermes import HermesAdapter
+
+        self.adapter = HermesAdapter(self.state_path)
         self.store = Store(self.db_path)
 
     def tearDown(self):
@@ -309,12 +313,12 @@ class KhalaSyncHookTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_sync_session_incremental(self):
-        first = sync_session(self.store, "sess-1", self.state_path)
+        first = sync_session(self.store, self.adapter, "sess-1")
         self.assertEqual(first["added"], 3)  # user + assistant(tool_calls) + tool
         self.assertEqual(first["events_total"], 3)
 
         # idempotent: second sync adds nothing
-        second = sync_session(self.store, "sess-1", self.state_path)
+        second = sync_session(self.store, self.adapter, "sess-1")
         self.assertEqual(second["added"], 0)
 
         # new message appended → only the new one syncs
@@ -326,13 +330,21 @@ class KhalaSyncHookTest(unittest.TestCase):
         db.commit()
         db.close()
 
-        third = sync_session(self.store, "sess-1", self.state_path)
+        third = sync_session(self.store, self.adapter, "sess-1")
         self.assertEqual(third["added"], 1)
         self.assertEqual(third["events_total"], 4)
 
         # tool_calls got summarized, tool content preserved
         replay = self.store.replay(first["khala_session"])
         self.assertEqual(replay[1]["content"], "[tool_calls: read_file]")
+
+    def test_stored_events_have_no_vendor_fields(self):
+        out = sync_session(self.store, self.adapter, "sess-1")
+        replay = self.store.replay(out["khala_session"])
+        # canonical schema only: no hermes_message_id / vendor markers in metadata
+        for event in replay:
+            self.assertNotIn("hermes_message_id", event)
+            self.assertNotIn("tool_calls", event)
 
 
 if __name__ == "__main__":

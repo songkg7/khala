@@ -34,10 +34,9 @@ def parser() -> argparse.ArgumentParser:
     ingest.add_argument("--agent", required=True)
     ingest.add_argument("--adapter", help="MODULE:CALLABLE; stdin JSONL is the default")
     ingest.add_argument("source", nargs="?")
-    sync_cmd = commands.add_parser("sync", help="Sync Hermes sessions into khala")
-    sync_cmd.add_argument("--hermes-dir", type=Path, default=None, help="[legacy] Hermes session JSONL dir; removed")
-    sync_cmd.add_argument("--state-db", type=Path, default=None, help="Hermes state.db path (default: ~/.hermes/state.db)")
-    sync_cmd.add_argument("--session-id", default=None, help="Sync only this Hermes session (incremental)")
+    sync_cmd = commands.add_parser("sync", help="Sync agent sessions into khala")
+    sync_cmd.add_argument("--adapter", default="hermes", help="Agent adapter name (available: hermes; drop new adapters into khala/adapters/)")
+    sync_cmd.add_argument("--session-id", default=None, help="Sync only this session (incremental)")
     return root
 
 
@@ -66,13 +65,15 @@ def main(argv: list[str] | None = None) -> int:
             events = ingest_events(args.adapter, args.source, sys.stdin)
             output({"session_id": store.import_events(args.agent, events)})
         elif args.command == "sync":
-            from khala.hooks import HERMES_STATE_DB, sync as hook_sync, sync_session as hook_sync_session
+            from khala.adapters import get_adapter
+            from khala.sync import sync as bulk_sync
+            from khala.sync import sync_session as sync_one
 
-            state_db = args.state_db.expanduser() if args.state_db else HERMES_STATE_DB
+            adapter = get_adapter(args.adapter)
             if args.session_id:
-                result = hook_sync_session(store, args.session_id, state_db)
+                result = sync_one(store, adapter, args.session_id)
             else:
-                result = hook_sync(store, state_db)
+                result = bulk_sync(store, adapter)
             output(result)
         return 0
     except (ImportError, AttributeError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
