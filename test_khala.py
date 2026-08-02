@@ -662,6 +662,31 @@ class KhalaEmbeddingsTest(unittest.TestCase):
                 with self.assertRaises(self.emb.EmbeddingError):
                     self.emb.embed(["some text"])
 
+    def test_embed_truncates_overlong_text(self):
+        long_text = "x" * (self.emb.MAX_TEXT_LEN * 2)
+        sent = {}
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return json.dumps({"data": [{"embedding": [0.5] * 1536, "index": 0}]}).encode()
+
+        def fake_open(req, timeout=None):
+            body = json.loads(req.data.decode())
+            sent["shape"] = len(body["input"][0])
+            return Resp()
+
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-test-1234567890abcdef"}, clear=False):
+            with patch("urllib.request.urlopen", side_effect=fake_open):
+                out = self.emb.embed([long_text])
+        self.assertEqual(out[0][0], 0.5)
+        self.assertEqual(sent["shape"], self.emb.MAX_TEXT_LEN)
+
     def test_embed_empty_inputs(self):
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-test-1234567890abcdef"}, clear=False):
             with patch("urllib.request.urlopen", side_effect=AssertionError("no network call")):

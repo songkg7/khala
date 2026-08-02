@@ -97,6 +97,12 @@ def _request_batch(texts: list[str], api_key: str) -> list[list[float]]:
     return vectors
 
 
+# Max chars per embedded string. text-embedding-3-small caps at 8191 tokens;
+# truncating long events keeps batch calls under the token ceiling that
+# otherwise returns HTTP 400 for huge prompts (e.g. agent system prompts).
+MAX_TEXT_LEN = 8000
+
+
 def embed(texts: list[str]) -> list[list[float]]:
     """Embed a list of strings via OpenRouter. Raises EmbeddingError on failure.
 
@@ -108,8 +114,9 @@ def embed(texts: list[str]) -> list[list[float]]:
         raise EmbeddingError(
             f"{API_KEY_ENV} is not set — set it to enable semantic recall"
         )
-    # drop empties to avoid wasted/errored rows, keep index mapping
-    indexed = [(i, t) for i, t in enumerate(texts) if t]
+    # drop empties to avoid wasted/errored rows, keep index mapping; truncate
+    # overlong strings so batches stay under the model token limit.
+    indexed = [(i, t[:MAX_TEXT_LEN]) for i, t in enumerate(texts) if t]
     if not indexed:
         return []
     idx = [i for i, _ in indexed]
