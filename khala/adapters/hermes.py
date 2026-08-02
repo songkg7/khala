@@ -57,9 +57,27 @@ class HermesAdapter:
         self.state_db = state_db
 
     def handle_hook(self, payload: Mapping[str, Any]) -> tuple[str | None, str]:
-        """Extract (session_id, cwd) from a Hermes shell-hook JSON payload."""
+        """Extract (session_id, cwd) from a Hermes shell-hook JSON payload.
+
+        The payload `cwd` is the Hermes *process* cwd (whatever directory the
+        agent was launched from), which can differ from the workspace the
+        session actually started in.  Resolve the workspace from the session's
+        own `sessions.cwd` row in the Hermes state.db when available, falling
+        back to the payload value.  This makes recording follow the session's
+        workspace, not the agent's launch directory.
+        """
         session_id = str(payload.get("session_id") or "")
         cwd = str(payload.get("cwd") or "")
+        if session_id:
+            try:
+                with _connections(self.state_db) as db:
+                    row = db.execute(
+                        "SELECT cwd FROM sessions WHERE id = ?", (session_id,)
+                    ).fetchone()
+                if row and row["cwd"]:
+                    cwd = str(row["cwd"])
+            except (OSError, sqlite3.Error):
+                pass  # fall back to payload cwd
         return (session_id or None, cwd)
 
 
