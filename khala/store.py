@@ -299,14 +299,14 @@ class Store:
             )
         ]
 
-    def status(self) -> dict[str, Any]:
+    def status(self, mode: str = "nerazim") -> dict[str, Any]:
         sessions = self.db.execute("SELECT count(*) FROM sessions").fetchone()[0]
         events = self.db.execute("SELECT count(*) FROM events").fetchone()[0]
         pending = self.db.execute(
             "SELECT count(*) FROM remote_outbox WHERE next_attempt_at <= ?", (_now(),)
         ).fetchone()[0]
         return {
-            "mode": "nerazim",
+            "mode": mode,
             "database": str(self.path),
             "sessions": sessions,
             "events": events,

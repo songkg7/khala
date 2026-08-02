@@ -128,7 +128,8 @@ def main(argv: list[str] | None = None) -> int:
     store = Store(args.db.expanduser())
     try:
         if args.command == "status":
-            output(store.status())
+            mode = "khalai" if _remote_dsn() else "nerazim"
+            output(store.status(mode=mode))
         elif args.command == "start":
             output({"session_id": store.add_session(args.agent, args.external_id)})
         elif args.command == "record":
