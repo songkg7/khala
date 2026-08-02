@@ -390,11 +390,13 @@ class RemoteStore:
         return hits
 
     def graph(self, event_id: str, limit: int = 5) -> dict[str, Any]:
-        """Associative neighbors: same-session sequence + semantic nearest.
+        """Associative neighbors: same-session sequence.
 
-        Khalai recognizes related events by embedding similarity (already
-        computed) — no link table maintained, relationships are derived at
-        query time from event_embeddings.
+        Khalai graph shows the conversational flow around an event (structural
+        adjacency). Semantic relatedness is recall's job — `khala recall
+        --graph` attaches adjacent context to hits, and `--mode semantic` finds
+        meaning-similar events. No separate semantic pass here (it would just
+        duplicate recall_semantic).
         """
         with self._cursor() as cur:
             row = cur.execute(
@@ -410,15 +412,9 @@ class RemoteStore:
                 "WHERE e.session_id = %s AND e.id <> %s ORDER BY e.created_at LIMIT %s",
                 (sid, event_id, limit),
             ).fetchall()
-        related = []
-        try:
-            related = self.recall_semantic(str(row["content"]), limit=limit)
-        except ValueError:
-            pass  # no key / API — related stays empty
         return {
             "event_id": event_id,
             "found": True,
             "event": {"id": row["id"], "role": row["role"], "content": str(row["content"])[:200]},
             "same_session": [dict(r) for r in same],
-            "related": related,
         }

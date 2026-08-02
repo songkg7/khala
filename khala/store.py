@@ -332,7 +332,6 @@ class Store:
             "found": True,
             "event": {"id": row["id"], "role": row["role"], "content": str(row["content"])[:200]},
             "same_session": neighbors,
-            "related": [],
         }
 
     def attach_neighbors(
