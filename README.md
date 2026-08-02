@@ -11,6 +11,12 @@ uv sync                          # install into .venv
 uv tool install . --force        # install `khala` on PATH globally
 ```
 
+Run the test suite:
+
+```bash
+.venv/bin/python3 -m unittest discover -s tests
+```
+
 Enable a workspace for auto-sync:
 
 ```bash
