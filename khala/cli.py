@@ -37,9 +37,14 @@ def parser() -> argparse.ArgumentParser:
     connect = commands.add_parser("connect", help="Connect to a remote khala store (Khalai mode)")
     connect.add_argument("dsn", help="Postgres DSN, e.g. postgresql://khala:khala@localhost:5432/khala")
     disconnect_cmd = commands.add_parser("disconnect", help="Disconnect from remote; return to Nerazim (local) mode")
-    config_cmd = commands.add_parser("config", help="Show khala configuration")
+    config_cmd = commands.add_parser("config", help="Manage khala configuration")
     config_sub = config_cmd.add_subparsers(dest="config_action")
     config_sub.add_parser("show", help="Show config file contents")
+    config_set = config_sub.add_parser("set", help="Set a config key (dot-separated)")
+    config_set.add_argument("key", help="e.g. embedding.provider / workspaces[0]")
+    config_set.add_argument("value", help="JSON value or plain string")
+    config_get = config_sub.add_parser("get", help="Read a config key (dot-separated)")
+    config_get.add_argument("key", help="e.g. embedding.provider")
     embed_cmd = commands.add_parser("embed", help="Embedding commands (Khalai)")
     embed_sub = embed_cmd.add_subparsers(dest="embed_action", required=True)
     embed_sub.add_parser("pending", help="Enqueue missing embeddings for pushed events")
@@ -75,6 +80,54 @@ def _mask_dsn(dsn: str) -> str:
     import re
 
     return re.sub(r"(://[^:/]+:)[^@]+(@)", r"\1***\2", dsn, count=1)
+
+
+def _config_segments(key: str) -> list[str | int]:
+    """Split 'a.b[0].c' into ['a','b',0,'c'] for dict/list traversal."""
+    parts: list[str | int] = []
+    for token in key.split("."):
+        m = __import__("re").match(r"(.+?)\[(\d+)\]$", token)
+        if m:
+            parts.append(m.group(1))
+            parts.append(int(m.group(2)))
+        else:
+            parts.append(token)
+    return parts
+
+
+def _config_get(data: dict, key: str) -> Any:
+    cur: Any = data
+    for seg in _config_segments(key):
+        if isinstance(cur, dict) and isinstance(seg, str) and seg in cur:
+            cur = cur[seg]
+        elif isinstance(cur, list) and isinstance(seg, int) and 0 <= seg < len(cur):
+            cur = cur[seg]
+        else:
+            return None
+    return cur
+
+
+def _config_set(data: dict, key: str, value: Any) -> None:
+    segs = _config_segments(key)
+    cur: Any = data
+    for seg in segs[:-1]:
+        if isinstance(cur, dict):
+            nxt = cur.setdefault(seg, {})
+            if not isinstance(nxt, (dict, list)):
+                nxt = cur[seg] = {}  # upgrade scalar to container if needed
+            cur = nxt
+        elif isinstance(cur, list) and isinstance(seg, int):
+            while len(cur) <= seg:
+                cur.append({})
+            cur = cur[seg]
+    last = segs[-1]
+    if isinstance(cur, list):
+        n = int(last)  # list index
+        while len(cur) <= n:
+            cur.append(None)
+        cur[n] = value
+    else:
+        cur[last] = value  # type: ignore[index]
 
 
 def _recall_remote(remote: Any, args: Any, mode: str) -> list[dict]:
@@ -235,11 +288,12 @@ def main(argv: list[str] | None = None) -> int:
             save_config(config_data)
             output({"mode": "nerazim", "disconnected": remote})
         elif args.command == "config":
-            from khala.config import load_config
+            from khala.config import load_config, save_config
             from khala.embeddings import api_key_set
 
             config_data = load_config()
-            if args.config_action == "show":
+            action = getattr(args, "config_action", "show")
+            if action == "show":
                 shown: dict[str, Any] = {"mode": "khalai" if config_data.get("remote") else "nerazim"}
                 shown["workspaces"] = config_data.get("workspaces", [])
                 shown["embedding"] = {
@@ -252,6 +306,17 @@ def main(argv: list[str] | None = None) -> int:
                 if config_data.get("remote"):
                     shown["remote"] = _mask_dsn(str(config_data["remote"]))
                 output(shown)
+            elif action == "set":
+                value: Any = args.value
+                try:
+                    value = json.loads(args.value)
+                except json.JSONDecodeError:
+                    pass  # keep as plain string
+                _config_set(config_data, args.key, value)
+                save_config(config_data)
+                output({"ok": True, "key": args.key, "value": value})
+            elif action == "get":
+                output(_config_get(config_data, args.key))
             else:
                 output({"mode": "khalai" if config_data.get("remote") else "nerazim", **config_data})
         elif args.command == "remote-worker":

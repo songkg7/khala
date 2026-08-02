@@ -554,9 +554,40 @@ class KhalaConfigTest(unittest.TestCase):
     def test_remote_dsn_roundtrip(self):
         self.assertEqual(self.cfg.get_remote_dsn(), None)
         self.assertFalse(self.cfg.is_connected())
-        self.cfg.save_config({"workspaces": [], "remote": "postgresql://u:p@h:5432/db"})
-        self.assertEqual(self.cfg.get_remote_dsn(), "postgresql://u:p@h:5432/db")
+        self.cfg.save_config({"workspaces": [], "remote": "postgresql://u:***@h:5432/db"})
+        self.assertEqual(self.cfg.get_remote_dsn(), "postgresql://u:***@h:5432/db")
         self.assertTrue(self.cfg.is_connected())
+
+
+class KhalaConfigSetGetTest(unittest.TestCase):
+    """dot-path config get/set helpers (parsed by test_khala.cli)."""
+
+    def setUp(self):
+        import khala.cli as cli
+
+        self.cli = cli
+
+    def test_set_and_get_scalar(self):
+        d = {"workspaces": []}
+        self.cli._config_set(d, "embedding.model", "openai/text-embedding-3-small")
+        self.assertEqual(
+            self.cli._config_get(d, "embedding.model"), "openai/text-embedding-3-small"
+        )
+
+    def test_set_list_index_and_get(self):
+        d = {"workspaces": []}
+        self.cli._config_set(d, "workspaces[0]", "/a")
+        self.cli._config_set(d, "workspaces[1]", "/b")
+        self.assertEqual(d["workspaces"], ["/a", "/b"])
+        self.assertEqual(self.cli._config_get(d, "workspaces[1]"), "/b")
+
+    def test_get_missing_returns_none(self):
+        self.assertIsNone(self.cli._config_get({"a": {"b": 1}}, "a.c"))
+
+    def test_set_json_value_via_get(self):
+        d = {"embedding": {}}
+        self.cli._config_set(d, "embedding.provider", "openrouter")
+        self.assertEqual(self.cli._config_get(d, "embedding.provider"), "openrouter")
 
 
 class KhalaHookDispatchTest(unittest.TestCase):
