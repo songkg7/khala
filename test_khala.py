@@ -624,19 +624,43 @@ class KhalaEmbeddingsTest(unittest.TestCase):
         self.emb = emb
 
     def test_api_key_set_respects_env(self):
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(self.emb.api_key_set())
-        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-test-1234567890abcdef"}, clear=False):
-            self.assertTrue(self.emb.api_key_set())
+        with patch.object(self.emb, "_load_dotenv", return_value=None):
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertFalse(self.emb.api_key_set())
+            with patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-test-1234567890abcdef"}, clear=False):
+                self.assertTrue(self.emb.api_key_set())
+
+    def test_dotenv_supplies_key_when_env_absent(self):
+        import tempfile
+        from pathlib import Path as P
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = P(tmp) / ".env"
+            env_file.write_text("OPENROUTER_API_KEY=sk-test-dotenv-1234567890\nOTHER=x\n")
+            with patch.dict(os.environ, {}, clear=True):
+                self.emb._load_dotenv(env_file)
+                self.assertTrue(self.emb.api_key_set())
+
+    def test_env_wins_over_dotenv(self):
+        import tempfile
+        from pathlib import Path as P
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = P(tmp) / ".env"
+            env_file.write_text("OPENROUTER_API_KEY=sk-test-dotenv-1234567890\n")
+            with patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-test-env-1234567890"}, clear=False):
+                self.emb._load_dotenv(env_file)
+                self.assertEqual(os.environ["OPENROUTER_API_KEY"], "sk-test-env-1234567890")
 
     def test_content_hash_stable(self):
         self.assertEqual(self.emb.content_hash("hello"), self.emb.content_hash("hello"))
         self.assertNotEqual(self.emb.content_hash("hello"), self.emb.content_hash("world"))
 
     def test_embed_no_key_raises(self):
-        with patch.dict(os.environ, {}, clear=True):
-            with self.assertRaises(self.emb.EmbeddingError):
-                self.emb.embed(["some text"])
+        with patch.object(self.emb, "_load_dotenv", return_value=None):
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(self.emb.EmbeddingError):
+                    self.emb.embed(["some text"])
 
     def test_embed_empty_inputs(self):
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-test-1234567890abcdef"}, clear=False):

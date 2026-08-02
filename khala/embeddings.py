@@ -5,6 +5,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 # ponytail: stdlib urllib; a batched HTTP client (httpx) only when we need
@@ -26,7 +27,27 @@ class EmbeddingError(Exception):
     """Embedding generation failure (retryable) — never contains secrets."""
 
 
+def _load_dotenv(path: Path | None = None) -> None:
+    """Load OPENROUTER_API_KEY (and other KEY=VALUE lines) from a .env file.
+
+    Env var wins over the file. Parsing is deliberately sparse — no quoting/
+    interpolation; a real dotenv lib only when the file grows complex.
+    """
+    candidates = [path, Path.cwd() / ".env"] if path else [Path.cwd() / ".env"]
+    for candidate in candidates:
+        if not candidate or not candidate.is_file():
+            continue
+        for line in candidate.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip())
+        return
+
+
 def _api_key() -> str | None:
+    _load_dotenv()
     return os.environ.get(API_KEY_ENV) or None
 
 
