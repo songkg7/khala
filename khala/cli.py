@@ -34,6 +34,9 @@ def parser() -> argparse.ArgumentParser:
     )
     replay = commands.add_parser("replay")
     replay.add_argument("session_id")
+    graph = commands.add_parser("graph", help="Show an event's associative neighbors")
+    graph.add_argument("event_id")
+    graph.add_argument("--limit", type=int, default=5)
     connect = commands.add_parser("connect", help="Connect to a remote khala store (Khalai mode)")
     connect.add_argument("dsn", help="Postgres DSN, e.g. postgresql://khala:khala@localhost:5432/khala")
     disconnect_cmd = commands.add_parser("disconnect", help="Disconnect from remote; return to Nerazim (local) mode")
@@ -112,6 +115,14 @@ def main(argv: list[str] | None = None) -> int:
                 output(store.recall(args.query, args.limit))
         elif args.command == "replay":
             output(store.replay(args.session_id))
+        elif args.command == "graph":
+            dsn = _remote_dsn()
+            if dsn:
+                from khala.remote import RemoteStore
+
+                output(RemoteStore(dsn).graph(args.event_id, args.limit))
+            else:
+                output(store.graph(args.event_id, args.limit))
         elif args.command == "ingest":
             events = ingest_events(args.adapter, args.source, sys.stdin)
             output({"session_id": store.import_events(args.agent, events)})

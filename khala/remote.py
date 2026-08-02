@@ -346,3 +346,37 @@ class RemoteStore:
             row["rank"] = 1.0 / (60 + lr) + 1.0 / (60 + sr)
         ordered = sorted(merged.values(), key=lambda r: (-r["rank"], r["created_at"]))
         return ordered[:limit]
+
+    def graph(self, event_id: str, limit: int = 5) -> dict[str, Any]:
+        """Associative neighbors: same-session sequence + semantic nearest.
+
+        Khalai recognizes related events by embedding similarity (already
+        computed) — no link table maintained, relationships are derived at
+        query time from event_embeddings.
+        """
+        with self._cursor() as cur:
+            row = cur.execute(
+                "SELECT e.id, e.session_id, e.role, e.content, e.created_at, s.agent "
+                "FROM events e JOIN sessions s ON s.id = e.session_id WHERE e.id = %s",
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                return {"event_id": event_id, "found": False, "neighbors": []}
+            sid = row["session_id"]
+            same = cur.execute(
+                "SELECT e.id, e.role, e.content FROM events e "
+                "WHERE e.session_id = %s AND e.id <> %s ORDER BY e.created_at LIMIT %s",
+                (sid, event_id, limit),
+            ).fetchall()
+        related = []
+        try:
+            related = self.recall_semantic(str(row["content"]), limit=limit)
+        except ValueError:
+            pass  # no key / API — related stays empty
+        return {
+            "event_id": event_id,
+            "found": True,
+            "event": {"id": row["id"], "role": row["role"], "content": str(row["content"])[:200]},
+            "same_session": [dict(r) for r in same],
+            "related": related,
+        }

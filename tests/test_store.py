@@ -68,6 +68,20 @@ class KhalaStoreTest(unittest.TestCase):
         session = self.store.add_session("test")
         self.assertEqual(self.store.replay(session), [])
 
+    def test_graph_finds_same_session_neighbors(self):
+        session = self.store.add_session("test")
+        e1 = self.store.add_event(session, "user", "needle in haystack")
+        e2 = self.store.add_event(session, "assistant", "response about a thing")
+        g = self.store.graph(e1)
+        self.assertTrue(g["found"])
+        self.assertEqual(g["event"]["id"], e1)
+        ids = [n["id"] for n in g["same_session"]]
+        self.assertIn(e2, ids)
+
+    def test_graph_missing_event(self):
+        g = self.store.graph("no-such-event")
+        self.assertFalse(g["found"])
+
     def test_import_events_valid(self):
         events = [
             {"role": "user", "content": "first", "created_at": "1", "metadata": {"k": "v"}},

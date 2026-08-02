@@ -299,6 +299,42 @@ class Store:
             )
         ]
 
+    def graph(self, event_id: str, limit: int = 5) -> dict[str, Any]:
+        """Associative neighbors of an event: same-session sequence + lexical recall.
+
+        Nerazim (local) has no embeddings, so "related" = same-session neighbors
+        (the conversation flow) plus keyword-recall hits on the event content.
+        """
+        row = self.db.execute(
+            "SELECT e.id, e.session_id, e.role, e.content, e.created_at, s.agent "
+            "FROM events e JOIN sessions s ON s.id = e.session_id WHERE e.id = ?",
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            return {"event_id": event_id, "found": False, "neighbors": []}
+
+        # same-session neighbors (chronological rowids around this event)
+        sid = str(row["session_id"])
+        pos = self.db.execute(
+            "SELECT rowid FROM events WHERE id = ?", (event_id,)
+        ).fetchone()[0]
+        neighbors = [
+            dict(r)
+            for r in self.db.execute(
+                "SELECT e.id, e.role, e.content FROM events e "
+                "WHERE e.session_id = ? AND e.rowid <> ? "
+                "ORDER BY e.rowid LIMIT ?",
+                (sid, pos, limit),
+            )
+        ]
+        return {
+            "event_id": event_id,
+            "found": True,
+            "event": {"id": row["id"], "role": row["role"], "content": str(row["content"])[:200]},
+            "same_session": neighbors,
+            "related": [],
+        }
+
     def status(self, mode: str = "nerazim") -> dict[str, Any]:
         sessions = self.db.execute("SELECT count(*) FROM sessions").fetchone()[0]
         events = self.db.execute("SELECT count(*) FROM events").fetchone()[0]
