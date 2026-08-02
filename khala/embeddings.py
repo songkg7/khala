@@ -72,6 +72,8 @@ def _request_batch(texts: list[str], api_key: str) -> list[list[float]]:
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/songkg7/khala",
+            "X-Title": "khala",
         },
         method="POST",
     )

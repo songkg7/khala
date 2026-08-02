@@ -691,6 +691,7 @@ class KhalaEmbeddingsTest(unittest.TestCase):
 
         def fake_open(req, timeout=None):
             sent["timeout"] = timeout
+            sent["headers"] = {k: v for k, v in req.headers.items()}
             body = json.loads(req.data.decode())
             sent["body"] = body
             return Resp()
@@ -705,7 +706,11 @@ class KhalaEmbeddingsTest(unittest.TestCase):
         self.assertEqual(sent["body"]["model"], "openai/text-embedding-3-small")
         self.assertEqual(sent["body"]["dimensions"], 1536)
         self.assertNotIn("sk-test", json.dumps(sent["body"]))
-        # Authorization differs from body; verify via a header-capable assert below
+        # app attribution headers so OpenRouter shows this as `khala`
+        headers_lc = {k.lower(): v for k, v in sent["headers"].items()}
+        self.assertEqual(headers_lc.get("x-title"), "khala")
+        self.assertEqual(headers_lc.get("http-referer"), "https://github.com/songkg7/khala")
+        self.assertTrue(headers_lc["authorization"].startswith("Bearer "))
 
 
 class KhalaOutboxTest(unittest.TestCase):
