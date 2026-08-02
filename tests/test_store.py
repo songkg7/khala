@@ -82,15 +82,28 @@ class KhalaStoreTest(unittest.TestCase):
         g = self.store.graph("no-such-event")
         self.assertFalse(g["found"])
 
-    def test_attach_neighbors_enriches_hits(self):
+    def test_attach_neighbors_excludes_hit_and_centers_window(self):
         session = self.store.add_session("test")
-        e1 = self.store.add_event(session, "user", "alpha")
-        e2 = self.store.add_event(session, "assistant", "alpha response")
-        hits = [{"id": e1, "session_id": session, "role": "user", "content": "alpha"}]
-        enriched = self.store.attach_neighbors(hits)
-        self.assertIn("adjacent", enriched[0])
-        adj = enriched[0]["adjacent"]
-        self.assertTrue(any(a["content"] == "alpha response" for a in adj))
+        self.store.add_event(session, "system", "before-a")
+        self.store.add_event(session, "user", "before-b")
+        hit_id = self.store.add_event(session, "user", "alpha")
+        self.store.add_event(session, "assistant", "after-a")
+        self.store.add_event(session, "assistant", "after-b")
+        hits = [{"id": hit_id, "session_id": session, "role": "user", "content": "alpha"}]
+
+        # Contiguous window centered on the hit, hit itself excluded.
+        adj = self.store.attach_neighbors(hits)[0]["adjacent"]
+        self.assertEqual([a["content"] for a in adj], ["before-b", "after-a", "after-b"])
+        self.assertNotIn("alpha", [a["content"] for a in adj])
+
+        # A larger window still excludes the hit.
+        wide = self.store.attach_neighbors(hits, per_hit=4)[0]["adjacent"]
+        self.assertNotIn("alpha", [a["content"] for a in wide])
+        self.assertEqual(len(wide), 4)
+
+    def test_attach_neighbors_handles_missing_session(self):
+        hits = [{"id": "x", "role": "user", "content": "alpha"}]
+        self.assertEqual(self.store.attach_neighbors(hits)[0]["adjacent"], [])
 
     def test_import_events_valid(self):
         events = [

@@ -338,7 +338,14 @@ class Store:
     def attach_neighbors(
         self, hits: list[dict[str, Any]], per_hit: int = 3
     ) -> list[dict[str, Any]]:
-        """Enrich recall hits with same-session adjacent context (Nerazim)."""
+        """Enrich recall hits with same-session adjacent context (Nerazim).
+
+        For each hit, `adjacent` is a contiguous conversational window around
+        the hit in the same session (hit itself excluded), in stable rowid
+        order. `before`/`after` split keeps the window centered on the hit.
+        """
+        before = per_hit // 2
+        after = per_hit - before
         for hit in hits:
             sid = hit.get("session_id")
             if not sid:
@@ -347,9 +354,13 @@ class Store:
             hit["adjacent"] = [
                 {"role": r["role"], "content": str(r["content"])[:500]}
                 for r in self.db.execute(
-                    "SELECT role, content FROM events WHERE session_id = ? "
-                    "ORDER BY created_at, rowid LIMIT ?",
-                    (sid, per_hit),
+                    "SELECT role, content FROM events e "
+                    "WHERE e.session_id = ? AND e.id <> ? "
+                    "AND e.rowid BETWEEN "
+                    "(SELECT rowid FROM events WHERE id = ?) - ? "
+                    "AND (SELECT rowid FROM events WHERE id = ?) + ? "
+                    "ORDER BY e.rowid",
+                    (sid, hit.get("id"), hit.get("id"), before, hit.get("id"), after),
                 )
             ]
         return hits

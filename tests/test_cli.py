@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -12,6 +13,9 @@ class KhalaCLIIntegrationTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.db = str(Path(self.tmp.name) / "khala.db")
+        # Isolate from any ambient remote (Khalai) connection so recall always
+        # uses the local store instead of hitting a real shared DB.
+        os.environ["KHALA_CONFIG_DIR"] = self.tmp.name
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -65,6 +69,27 @@ class KhalaCLIIntegrationTest(unittest.TestCase):
         code, _, err = self._run("recall", "x", "--limit", "-1")
         self.assertEqual(code, 2)
         self.assertIn("limit must be positive", err)
+
+    def test_recall_graph_attaches_adjacent_context(self):
+        code, out, _ = self._run("start", "--agent", "hermes")
+        session = json.loads(out)["session_id"]
+        self._run("record", session, "user", "before note")
+        self._run("record", session, "assistant", "deploy beta")
+        self._run("record", session, "assistant", "deploy done")
+        self._run("record", session, "user", "after note")
+
+        # Query only the middle hit so results[0] is deterministic.
+        code, out, _ = self._run("recall", "beta", "--graph", "--limit", "5")
+        self.assertEqual(code, 0)
+        results = json.loads(out)
+        self.assertGreaterEqual(len(results), 1)
+        self.assertEqual(results[0]["content"], "deploy beta")
+        # Graph mode enriches each hit with same-session adjacent context.
+        self.assertIn("adjacent", results[0])
+        contents = [a["content"] for a in results[0]["adjacent"]]
+        self.assertEqual(contents, ["before note", "deploy done", "after note"])
+        # The hit itself is not repeated inside its own adjacent context.
+        self.assertNotIn("deploy beta", contents)
 
     def test_ingest_with_stdin(self):
         jsonl = json.dumps({"role": "user", "content": "via stdin", "created_at": "1"}) + "\n"

@@ -352,30 +352,41 @@ class RemoteStore:
     ) -> list[dict[str, Any]]:
         """Enrich recall hits with same-session adjacent context (RAG-style).
 
-        For each hit, add `adjacent`: the neighbouring events in the same
-        session (conversation flow around the match). Batch by session to
-        avoid N+1. This lets an LLM consumer see the surrounding thread in
-        one recall call, not a separate graph query.
+        For each hit, add `adjacent`: a contiguous conversational window around
+        the hit in the same session (hit itself excluded), in stable
+        (created_at, id) order. All hit sessions are fetched in one batched
+        query and grouped in Python to avoid N+1. This lets an LLM consumer
+        see the surrounding thread in one recall call, not a separate graph
+        query.
         """
         if not hits:
             return hits
         session_ids = sorted({str(h.get("session_id")) for h in hits if h.get("session_id")})
         by_session: dict[str, list[dict[str, Any]]] = {}
         with self._cursor() as cur:
-            for sid in session_ids:
-                rows = cur.execute(
-                    "SELECT e.role, e.content FROM events e "
-                    "WHERE e.session_id = %s ORDER BY e.created_at LIMIT %s",
-                    (sid, per_hit * 4),
-                ).fetchall()
-                by_session[sid] = [
-                    {"role": r["role"], "content": str(r["content"])[:500]}
-                    for r in rows
-                ]
+            rows = cur.execute(
+                "SELECT e.id, e.session_id, e.role, e.content "
+                "FROM events e WHERE e.session_id = ANY(%s) "
+                "ORDER BY e.session_id, e.created_at, e.id",
+                (session_ids,),
+            ).fetchall()
+            for row in rows:
+                by_session.setdefault(str(row["session_id"]), []).append(dict(row))
+
+        before = per_hit // 2
+        after = per_hit - before
         for hit in hits:
-            sid = hit.get("session_id")
-            neighbors = by_session.get(str(sid) if sid else "", [])
-            hit["adjacent"] = neighbors[:per_hit]
+            sid = str(hit.get("session_id") or "")
+            events = by_session.get(sid, [])
+            index = next((i for i, e in enumerate(events) if e["id"] == hit.get("id")), None)
+            if index is None:
+                hit["adjacent"] = []
+                continue
+            window = events[max(0, index - before):index] + events[index + 1:index + 1 + after]
+            hit["adjacent"] = [
+                {"role": e["role"], "content": str(e["content"])[:500]}
+                for e in window
+            ]
         return hits
 
     def graph(self, event_id: str, limit: int = 5) -> dict[str, Any]:
