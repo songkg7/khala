@@ -15,6 +15,12 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _add_seconds(seconds: int) -> str:
+    from datetime import timedelta
+
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+
+
 class Store:
     """SQLite-backed local-first storage for sessions, events, and recall weights."""
 
@@ -63,6 +69,13 @@ class Store:
                 external_id TEXT NOT NULL,
                 last_message_id INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (agent, external_id)
+            );
+            CREATE TABLE IF NOT EXISTS remote_outbox (
+                event_id TEXT PRIMARY KEY REFERENCES events(id),
+                queued_at TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at TEXT NOT NULL,
+                last_error TEXT
             );
             """
         )
@@ -154,6 +167,10 @@ class Store:
                 "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)",
                 (event_id, session_id, role, redact(content), created_at or _now(), json.dumps(metadata or {})),
             )
+            self.db.execute(
+                "INSERT INTO remote_outbox(event_id, queued_at, next_attempt_at) VALUES (?, ?, ?)",
+                (event_id, _now(), _now()),
+            )
         except sqlite3.IntegrityError as error:
             raise ValueError(f"unknown session: {session_id}") from error
         self.db.commit()
@@ -174,6 +191,10 @@ class Store:
                     event.get("metadata") if isinstance(event.get("metadata"), Mapping) else None,
                 )
         except Exception:
+            self.db.execute(
+                "DELETE FROM remote_outbox WHERE event_id IN (SELECT id FROM events WHERE session_id = ?)",
+                (session_id,),
+            )
             self.db.execute("DELETE FROM events WHERE session_id = ?", (session_id,))
             self.db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             self.db.commit()
@@ -212,6 +233,61 @@ class Store:
         self.db.commit()
         return [dict(row) for row in rows]
 
+    def enqueue_backlog(self, limit: int = 100000) -> int:
+        """Enqueue every existing event not yet in the outbox (used on connect)."""
+        inserted = self.db.execute(
+            """
+            INSERT INTO remote_outbox(event_id, queued_at, next_attempt_at)
+            SELECT e.id, e.created_at, e.created_at
+            FROM events e
+            LEFT JOIN remote_outbox o ON o.event_id = e.id
+            WHERE o.event_id IS NULL
+            ORDER BY e.created_at
+            LIMIT ?
+            """,
+            (limit,),
+        ).rowcount
+        self.db.commit()
+        return inserted
+
+    def pending_remote(self, limit: int = 200, now: str | None = None) -> list[str]:
+        """Outbox event ids due for push (next_attempt_at <= now), oldest first."""
+        rows = self.db.execute(
+            """
+            SELECT event_id FROM remote_outbox
+            WHERE next_attempt_at <= ?
+            ORDER BY queued_at
+            LIMIT ?
+            """,
+            (now or _now(), limit),
+        ).fetchall()
+        return [str(r["event_id"]) for r in rows]
+
+    def mark_remote_sent(self, event_ids: Iterable[str]) -> None:
+        for eid in event_ids:
+            self.db.execute("DELETE FROM remote_outbox WHERE event_id = ?", (eid,))
+        self.db.commit()
+
+    def mark_remote_error(self, event_id: str, error: str) -> None:
+        """Bump attempt count and back off: 30s * 2^attempts, capped at 1h."""
+        attempt = self.db.execute(
+            "SELECT attempt_count FROM remote_outbox WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        attempt = int(attempt[0]) if attempt else 0
+        delay = min(30 * (2 ** attempt), 3600)
+        try:
+            self.db.execute(
+                """
+                UPDATE remote_outbox
+                SET attempt_count = ?, next_attempt_at = ?, last_error = ?
+                WHERE event_id = ?
+                """,
+                (attempt + 1, _add_seconds(delay), error[:500], event_id),
+            )
+            self.db.commit()
+        except sqlite3.OperationalError:
+            pass
+
     def replay(self, session_id: str) -> list[dict[str, Any]]:
         return [
             dict(row)
@@ -226,7 +302,17 @@ class Store:
     def status(self) -> dict[str, Any]:
         sessions = self.db.execute("SELECT count(*) FROM sessions").fetchone()[0]
         events = self.db.execute("SELECT count(*) FROM events").fetchone()[0]
-        return {"mode": "nerazim", "database": str(self.path), "sessions": sessions, "events": events}
+        pending = self.db.execute(
+            "SELECT count(*) FROM remote_outbox WHERE next_attempt_at <= ?", (_now(),)
+        ).fetchone()[0]
+        return {
+            "mode": "nerazim",
+            "database": str(self.path),
+            "sessions": sessions,
+            "events": events,
+            "pending_push": pending,
+            "pending_embedding": 0,
+        }
 
     def close(self) -> None:
         self.db.close()

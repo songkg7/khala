@@ -20,15 +20,18 @@ khala workspace add /path/to/workspace
 ## CLI
 
 ```
-khala status                     # store stats
+khala status                     # store stats (+ pending_push/pending_embedding)
 khala start --agent <name>       # start a session, returns session_id
 khala record <sid> <role> [txt]  # add a user/assistant/system/tool event
-khala recall <query> [--limit]   # ranked search (FTS5 + recall weighting)
+khala recall <query> [--limit] [--mode lexical|semantic|hybrid]
 khala replay <sid>               # dump a session's events
 khala ingest --agent <a> [--adapter M:C]   # bulk import (stdin JSONL by default)
 khala sync [--adapter hermes|codex] [--session-id X] [--name/--email]
 khala hook <adapter>             # vendor hook entrypoint (reads stdin JSON)
 khala workspace add|remove|list  # manage auto-sync workspaces
+khala connect <postgres dsn>     # Khalai: connect to a shared store (pgvector)
+khala disconnect                 # back to Nerazim (local-only)
+khala embed status|pending       # embedding backlog / backfill jobs
 khala compat-check --adapter X --session-id Y   # canonical-schema gate
 ```
 
@@ -37,6 +40,39 @@ khala compat-check --adapter X --session-id Y   # canonical-schema gate
 Sessions are tagged with `user_name`/`user_email` resolved from
 `git config user.name`/`user.email` (global config included); falls back to
 `$USER` when no git identity exists. Override per sync with `--name`/`--email`.
+
+### Semantic & hybrid recall (Khalai)
+
+When connected to a remote, `khala recall` supports three modes:
+
+```
+khala recall "how do I sync agent sessions" --mode lexical    # keyword only
+khala recall "how do I sync agent sessions" --mode semantic   # embedding similarity
+khala recall "how do I sync agent sessions" --mode hybrid     # RRF fusion (default)
+```
+
+- Events with `user`/`assistant` roles are embedded with
+  `openai/text-embedding-3-small` (1536-dim, via OpenRouter) and stored in the
+  remote store (`event_embeddings`).
+- `hybrid` fuses lexical + semantic top candidates with Reciprocal Rank
+  Fusion, so an exact identifier (e.g. `cross-agent`) and a paraphrase both
+  surface. It silently falls back to lexical-only when the embedding API is
+  unavailable.
+- Embedding generation runs in the background `remote-worker` (spawned by
+  `khala connect` / `khala hook`), never blocking the CLI.
+
+### OpenRouter API key
+
+Set the key as an environment variable — it is never persisted to disk, the
+DB, or logs:
+
+```bash
+export OPENROUTER_API_KEY='***'
+```
+
+`khala config show` only reports whether the key is set (`api_key_set`), and
+masks any DSN password. Only user/assistant event *content* is sent to
+OpenRouter for embedding; tool/system output stays local.
 
 ### Canonical schema
 
