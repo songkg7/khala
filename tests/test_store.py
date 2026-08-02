@@ -82,6 +82,16 @@ class KhalaStoreTest(unittest.TestCase):
         g = self.store.graph("no-such-event")
         self.assertFalse(g["found"])
 
+    def test_attach_neighbors_enriches_hits(self):
+        session = self.store.add_session("test")
+        e1 = self.store.add_event(session, "user", "alpha")
+        e2 = self.store.add_event(session, "assistant", "alpha response")
+        hits = [{"id": e1, "session_id": session, "role": "user", "content": "alpha"}]
+        enriched = self.store.attach_neighbors(hits)
+        self.assertIn("adjacent", enriched[0])
+        adj = enriched[0]["adjacent"]
+        self.assertTrue(any(a["content"] == "alpha response" for a in adj))
+
     def test_import_events_valid(self):
         events = [
             {"role": "user", "content": "first", "created_at": "1", "metadata": {"k": "v"}},

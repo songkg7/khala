@@ -347,6 +347,37 @@ class RemoteStore:
         ordered = sorted(merged.values(), key=lambda r: (-r["rank"], r["created_at"]))
         return ordered[:limit]
 
+    def attach_neighbors(
+        self, hits: list[dict[str, Any]], per_hit: int = 3
+    ) -> list[dict[str, Any]]:
+        """Enrich recall hits with same-session adjacent context (RAG-style).
+
+        For each hit, add `adjacent`: the neighbouring events in the same
+        session (conversation flow around the match). Batch by session to
+        avoid N+1. This lets an LLM consumer see the surrounding thread in
+        one recall call, not a separate graph query.
+        """
+        if not hits:
+            return hits
+        session_ids = sorted({str(h.get("session_id")) for h in hits if h.get("session_id")})
+        by_session: dict[str, list[dict[str, Any]]] = {}
+        with self._cursor() as cur:
+            for sid in session_ids:
+                rows = cur.execute(
+                    "SELECT e.role, e.content FROM events e "
+                    "WHERE e.session_id = %s ORDER BY e.created_at LIMIT %s",
+                    (sid, per_hit * 4),
+                ).fetchall()
+                by_session[sid] = [
+                    {"role": r["role"], "content": str(r["content"])[:500]}
+                    for r in rows
+                ]
+        for hit in hits:
+            sid = hit.get("session_id")
+            neighbors = by_session.get(str(sid) if sid else "", [])
+            hit["adjacent"] = neighbors[:per_hit]
+        return hits
+
     def graph(self, event_id: str, limit: int = 5) -> dict[str, Any]:
         """Associative neighbors: same-session sequence + semantic nearest.
 

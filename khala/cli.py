@@ -32,6 +32,10 @@ def parser() -> argparse.ArgumentParser:
         "--mode", choices=("lexical", "semantic", "hybrid"), default="hybrid",
         help="Search mode (default: hybrid = lexical + semantic when possible)",
     )
+    recall.add_argument(
+        "--graph", action="store_true",
+        help="Attach same-session adjacent context to each hit (RAG-style)",
+    )
     replay = commands.add_parser("replay")
     replay.add_argument("session_id")
     graph = commands.add_parser("graph", help="Show an event's associative neighbors")
@@ -110,9 +114,14 @@ def main(argv: list[str] | None = None) -> int:
             if dsn:
                 from khala.remote import RemoteStore, recall_by_mode
 
-                output(recall_by_mode(RemoteStore(dsn), args.query, mode=args.mode, limit=args.limit))
+                results = recall_by_mode(RemoteStore(dsn), args.query, mode=args.mode, limit=args.limit)
+                if args.graph:
+                    results = RemoteStore(dsn).attach_neighbors(results)
             else:
-                output(store.recall(args.query, args.limit))
+                results = store.recall(args.query, args.limit)
+                if args.graph:
+                    results = store.attach_neighbors(results)
+            output(results)
         elif args.command == "replay":
             output(store.replay(args.session_id))
         elif args.command == "graph":

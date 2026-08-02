@@ -335,6 +335,25 @@ class Store:
             "related": [],
         }
 
+    def attach_neighbors(
+        self, hits: list[dict[str, Any]], per_hit: int = 3
+    ) -> list[dict[str, Any]]:
+        """Enrich recall hits with same-session adjacent context (Nerazim)."""
+        for hit in hits:
+            sid = hit.get("session_id")
+            if not sid:
+                hit["adjacent"] = []
+                continue
+            hit["adjacent"] = [
+                {"role": r["role"], "content": str(r["content"])[:500]}
+                for r in self.db.execute(
+                    "SELECT role, content FROM events WHERE session_id = ? "
+                    "ORDER BY created_at, rowid LIMIT ?",
+                    (sid, per_hit),
+                )
+            ]
+        return hits
+
     def status(self, mode: str = "nerazim") -> dict[str, Any]:
         sessions = self.db.execute("SELECT count(*) FROM sessions").fetchone()[0]
         events = self.db.execute("SELECT count(*) FROM events").fetchone()[0]
