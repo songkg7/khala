@@ -75,70 +75,6 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-def _mask_dsn(dsn: str) -> str:
-    """Mask the password portion of a postgres:// DSN (never print secrets)."""
-    import re
-
-    return re.sub(r"(://[^:/]+:)[^@]+(@)", r"\1***\2", dsn, count=1)
-
-
-def _config_segments(key: str) -> list[str | int]:
-    """Split 'a.b[0].c' into ['a','b',0,'c'] for dict/list traversal."""
-    parts: list[str | int] = []
-    for token in key.split("."):
-        m = __import__("re").match(r"(.+?)\[(\d+)\]$", token)
-        if m:
-            parts.append(m.group(1))
-            parts.append(int(m.group(2)))
-        else:
-            parts.append(token)
-    return parts
-
-
-def _config_get(data: dict, key: str) -> Any:
-    cur: Any = data
-    for seg in _config_segments(key):
-        if isinstance(cur, dict) and isinstance(seg, str) and seg in cur:
-            cur = cur[seg]
-        elif isinstance(cur, list) and isinstance(seg, int) and 0 <= seg < len(cur):
-            cur = cur[seg]
-        else:
-            return None
-    return cur
-
-
-def _config_set(data: dict, key: str, value: Any) -> None:
-    segs = _config_segments(key)
-    cur: Any = data
-    for seg in segs[:-1]:
-        if isinstance(cur, dict):
-            nxt = cur.setdefault(seg, {})
-            if not isinstance(nxt, (dict, list)):
-                nxt = cur[seg] = {}  # upgrade scalar to container if needed
-            cur = nxt
-        elif isinstance(cur, list) and isinstance(seg, int):
-            while len(cur) <= seg:
-                cur.append({})
-            cur = cur[seg]
-    last = segs[-1]
-    if isinstance(cur, list):
-        n = int(last)  # list index
-        while len(cur) <= n:
-            cur.append(None)
-        cur[n] = value
-    else:
-        cur[last] = value  # type: ignore[index]
-
-
-def _recall_remote(remote: Any, args: Any, mode: str) -> list[dict]:
-    """Dispatch remote recall by mode; hybrid falls back to lexical automatically."""
-    if mode == "semantic":
-        return remote.recall_semantic(args.query, args.limit)
-    if mode == "lexical":
-        return remote.recall_lexical(args.query, args.limit)
-    return remote.recall_hybrid(args.query, args.limit)
-
-
 def _remote_dsn() -> str | None:
     """Remote DSN if connected (Khalai mode), else None."""
     from khala.config import get_remote_dsn
@@ -148,32 +84,6 @@ def _remote_dsn() -> str | None:
 
 def output(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2))
-
-
-def _spawn_worker(args_dsn: str | None = None) -> None:
-    """Launch a detached remote-worker so the CLI returns immediately.
-
-    A daemon thread dies with the hook process; a detached subprocess (new
-    session, stdio closed) outlives it and does the durable push+embedding.
-    """
-    import subprocess
-
-    from khala.config import get_remote_dsn
-
-    dsn = args_dsn or get_remote_dsn()
-    if not dsn:
-        return
-    try:
-        subprocess.Popen(
-            [sys.executable, "-m", "khala", "remote-worker"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
-        )
-    except OSError:
-        pass  # best-effort; worker re-runs on next hook/connect
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -195,9 +105,9 @@ def main(argv: list[str] | None = None) -> int:
 
             dsn = get_remote_dsn()
             if dsn:
-                from khala.remote import RemoteStore
+                from khala.remote import RemoteStore, recall_by_mode
 
-                output(_recall_remote(RemoteStore(dsn), args, mode=args.mode))
+                output(recall_by_mode(RemoteStore(dsn), args.query, mode=args.mode, limit=args.limit))
             else:
                 output(store.recall(args.query, args.limit))
         elif args.command == "replay":
@@ -221,7 +131,9 @@ def main(argv: list[str] | None = None) -> int:
                 result = bulk_sync(store, adapter, user=user)
             dsn = _remote_dsn()
             if dsn:
-                _spawn_worker(dsn)
+                from khala.worker import spawn_worker
+
+                spawn_worker(dsn)
             output(result)
         elif args.command == "hook":
             from khala.adapters import get_adapter
@@ -246,7 +158,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             dsn = _remote_dsn()
             if dsn:
-                _spawn_worker(dsn)
+                from khala.worker import spawn_worker
+
+                spawn_worker(dsn)
             output({"status": "synced", **result})
         elif args.command == "workspace":
             from khala.config import load_config, save_config
@@ -278,8 +192,12 @@ def main(argv: list[str] | None = None) -> int:
             config_data = load_config()
             config_data["remote"] = args.dsn
             save_config(config_data)
-            _spawn_worker(args.dsn)
-            output({"mode": "khalai", "remote": _mask_dsn(args.dsn), "queued": queued})
+            from khala.worker import spawn_worker
+
+            spawn_worker(args.dsn)
+            from khala.config import mask_dsn
+
+            output({"mode": "khalai", "remote": mask_dsn(args.dsn), "queued": queued})
         elif args.command == "disconnect":
             from khala.config import load_config, save_config
 
@@ -288,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
             save_config(config_data)
             output({"mode": "nerazim", "disconnected": remote})
         elif args.command == "config":
-            from khala.config import load_config, save_config
+            from khala.config import config_get, config_set, load_config, mask_dsn, save_config
             from khala.embeddings import api_key_set
 
             config_data = load_config()
@@ -304,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
                     "api_key_set": api_key_set(),
                 }
                 if config_data.get("remote"):
-                    shown["remote"] = _mask_dsn(str(config_data["remote"]))
+                    shown["remote"] = mask_dsn(str(config_data["remote"]))
                 output(shown)
             elif action == "set":
                 value: Any = args.value
@@ -312,11 +230,11 @@ def main(argv: list[str] | None = None) -> int:
                     value = json.loads(args.value)
                 except json.JSONDecodeError:
                     pass  # keep as plain string
-                _config_set(config_data, args.key, value)
+                config_set(config_data, args.key, value)
                 save_config(config_data)
                 output({"ok": True, "key": args.key, "value": value})
             elif action == "get":
-                output(_config_get(config_data, args.key))
+                output(config_get(config_data, args.key))
             else:
                 output({"mode": "khalai" if config_data.get("remote") else "nerazim", **config_data})
         elif args.command == "remote-worker":
@@ -346,7 +264,9 @@ def main(argv: list[str] | None = None) -> int:
                     return 0
                 # backfill: enqueue jobs for embeddable roles missing embeddings
                 jobs = remote.enqueue_missing_embed_jobs()
-                _spawn_worker(dsn)
+                from khala.worker import spawn_worker
+
+                spawn_worker(dsn)
                 output({"enqueued": jobs, "hint": "worker running in background"})
         return 0
     except (ImportError, AttributeError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:

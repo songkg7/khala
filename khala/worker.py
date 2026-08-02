@@ -138,6 +138,33 @@ def _fmt(vector) -> str:
     return "[" + ",".join(f"{x:.6f}" for x in vector) + "]"
 
 
+def spawn_worker(args_dsn: str | None = None) -> None:
+    """Launch a detached remote-worker so the CLI returns immediately.
+
+    A daemon thread dies with the hook process; a detached subprocess (new
+    session, stdio closed) outlives it and does the durable push+embedding.
+    """
+    import subprocess
+    import sys
+
+    from khala.config import get_remote_dsn
+
+    dsn = args_dsn or get_remote_dsn()
+    if not dsn:
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "khala", "remote-worker"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError:
+        pass  # best-effort; worker re-runs on next hook/connect
+
+
 def run_worker(db_path: Path, dsn: str, max_passes: int = 1) -> dict[str, Any]:
     """One detached worker pass: push outbox, then embed pending jobs.
 

@@ -53,3 +53,60 @@ def is_enabled_workspace(cwd: str) -> bool:
         if cwd_path == ws or ws in cwd_path.parents:
             return True
     return False
+
+
+def mask_dsn(dsn: str) -> str:
+    """Mask the password portion of a postgres:// DSN (never print secrets)."""
+    import re
+
+    return re.sub(r"(://[^:/]+:)[^@]+(@)", r"\1***\2", dsn, count=1)
+
+
+def config_segments(key: str) -> list[str | int]:
+    """Split 'a.b[0].c' into ['a','b',0,'c'] for dict/list traversal."""
+    import re
+
+    parts: list[str | int] = []
+    for token in key.split("."):
+        m = re.match(r"(.+?)\[(\d+)\]$", token)
+        if m:
+            parts.append(m.group(1))
+            parts.append(int(m.group(2)))
+        else:
+            parts.append(token)
+    return parts
+
+
+def config_get(data: dict, key: str) -> Any:
+    cur: Any = data
+    for seg in config_segments(key):
+        if isinstance(cur, dict) and isinstance(seg, str) and seg in cur:
+            cur = cur[seg]
+        elif isinstance(cur, list) and isinstance(seg, int) and 0 <= seg < len(cur):
+            cur = cur[seg]
+        else:
+            return None
+    return cur
+
+
+def config_set(data: dict, key: str, value: Any) -> None:
+    segs = config_segments(key)
+    cur: Any = data
+    for seg in segs[:-1]:
+        if isinstance(cur, dict):
+            nxt = cur.setdefault(seg, {})
+            if not isinstance(nxt, (dict, list)):
+                nxt = cur[seg] = {}  # upgrade scalar to container if needed
+            cur = nxt
+        elif isinstance(cur, list) and isinstance(seg, int):
+            while len(cur) <= seg:
+                cur.append({})
+            cur = cur[seg]
+    last = segs[-1]
+    if isinstance(cur, list):
+        n = int(last)  # list index
+        while len(cur) <= n:
+            cur.append(None)
+        cur[n] = value
+    else:
+        cur[last] = value  # type: ignore[index]

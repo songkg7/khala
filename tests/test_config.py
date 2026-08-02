@@ -47,31 +47,31 @@ class KhalaConfigSetGetTest(unittest.TestCase):
     """dot-path config get/set helpers."""
 
     def setUp(self):
-        import khala.cli as cli
+        import khala.config as cfg
 
-        self.cli = cli
+        self.cli = cfg
 
     def test_set_and_get_scalar(self):
         d = {"workspaces": []}
-        self.cli._config_set(d, "embedding.model", "openai/text-embedding-3-small")
+        self.cli.config_set(d, "embedding.model", "openai/text-embedding-3-small")
         self.assertEqual(
-            self.cli._config_get(d, "embedding.model"), "openai/text-embedding-3-small"
+            self.cli.config_get(d, "embedding.model"), "openai/text-embedding-3-small"
         )
 
     def test_set_list_index_and_get(self):
         d = {"workspaces": []}
-        self.cli._config_set(d, "workspaces[0]", "/a")
-        self.cli._config_set(d, "workspaces[1]", "/b")
+        self.cli.config_set(d, "workspaces[0]", "/a")
+        self.cli.config_set(d, "workspaces[1]", "/b")
         self.assertEqual(d["workspaces"], ["/a", "/b"])
-        self.assertEqual(self.cli._config_get(d, "workspaces[1]"), "/b")
+        self.assertEqual(self.cli.config_get(d, "workspaces[1]"), "/b")
 
     def test_get_missing_returns_none(self):
-        self.assertIsNone(self.cli._config_get({"a": {"b": 1}}, "a.c"))
+        self.assertIsNone(self.cli.config_get({"a": {"b": 1}}, "a.c"))
 
     def test_set_json_value_via_get(self):
         d = {"embedding": {}}
-        self.cli._config_set(d, "embedding.provider", "openrouter")
-        self.assertEqual(self.cli._config_get(d, "embedding.provider"), "openrouter")
+        self.cli.config_set(d, "embedding.provider", "openrouter")
+        self.assertEqual(self.cli.config_get(d, "embedding.provider"), "openrouter")
 
 
 class KhalaIdentityTest(unittest.TestCase):

@@ -67,6 +67,15 @@ def _fmt(vector) -> str:
     return "[" + ",".join(f"{x:.6f}" for x in vector) + "]"
 
 
+def recall_by_mode(remote: Any, query: str, mode: str, limit: int = 5) -> list[dict]:
+    """Dispatch remote recall by mode; hybrid falls back to lexical automatically."""
+    if mode == "semantic":
+        return remote.recall_semantic(query, limit)
+    if mode == "lexical":
+        return remote.recall_lexical(query, limit)
+    return remote.recall_hybrid(query, limit)
+
+
 class RemoteStore:
     """Append-only shared store on Postgres (Khalai mode).
 
