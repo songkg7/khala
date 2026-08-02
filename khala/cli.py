@@ -30,6 +30,12 @@ def parser() -> argparse.ArgumentParser:
     recall.add_argument("--limit", type=int, default=5)
     replay = commands.add_parser("replay")
     replay.add_argument("session_id")
+    connect = commands.add_parser("connect", help="Connect to a remote khala store (Khalai mode)")
+    connect.add_argument("dsn", help="Postgres DSN, e.g. postgresql://khala:khala@localhost:5432/khala")
+    disconnect_cmd = commands.add_parser("disconnect", help="Disconnect from remote; return to Nerazim (local) mode")
+    config_cmd = commands.add_parser("config", help="Show khala configuration")
+    config_sub = config_cmd.add_subparsers(dest="config_action")
+    config_sub.add_parser("show", help="Show config file contents")
     ingest = commands.add_parser("ingest")
     ingest.add_argument("--agent", required=True)
     ingest.add_argument("--adapter", help="MODULE:CALLABLE; stdin JSONL is the default")
@@ -55,8 +61,43 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
+def _remote_dsn() -> str | None:
+    """Remote DSN if connected (Khalai mode), else None."""
+    from khala.config import get_remote_dsn
+
+    return get_remote_dsn()
+
+
 def output(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def _background_push(db_path: Path, remote_dsn: str, session_id: str | None = None) -> None:
+    """Push local events to remote on a daemon thread (never blocks the CLI).
+
+    Re-opens the local Store on the thread (sqlite connections are not
+    shareable across threads). Fails silently — remote push is best-effort
+    and re-pushed on the next connect/sync.
+    """
+    import threading
+
+    from khala.remote import RemoteStore
+    from khala.sync import push_pending, push_session
+
+    def _run() -> None:
+        try:
+            store = Store(db_path)
+            remote = RemoteStore(remote_dsn)
+            if session_id:
+                sid = store.get_session_id("hermes", session_id) or session_id
+                push_session(store, remote, sid)
+            else:
+                push_pending(store, remote)
+            store.db.close()
+        except Exception:
+            pass  # best-effort; re-pushed later
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -73,7 +114,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "recall":
             if args.limit < 1:
                 raise ValueError("limit must be positive")
-            output(store.recall(args.query, args.limit))
+            from khala.config import get_remote_dsn
+            from khala.remote import RemoteStore
+
+            dsn = get_remote_dsn()
+            if dsn:
+                output(RemoteStore(dsn).recall(args.query, args.limit))
+            else:
+                output(store.recall(args.query, args.limit))
         elif args.command == "replay":
             output(store.replay(args.session_id))
         elif args.command == "ingest":
@@ -93,6 +141,9 @@ def main(argv: list[str] | None = None) -> int:
                 result = sync_one(store, adapter, args.session_id, user=user, cwd=Path.cwd())
             else:
                 result = bulk_sync(store, adapter, user=user)
+            dsn = _remote_dsn()
+            if dsn:
+                _background_push(args.db.expanduser(), dsn, args.session_id)
             output(result)
         elif args.command == "hook":
             from khala.adapters import get_adapter
@@ -107,14 +158,18 @@ def main(argv: list[str] | None = None) -> int:
             workspace = args.workspace or cwd
             if not is_enabled_workspace(workspace):
                 output({"status": "skipped", "reason": "workspace not enabled"})
-            elif not session_id:
+                return 0
+            if not session_id:
                 output({"status": "skipped", "reason": "no session_id"})
-            else:
-                result = sync_one(
-                    store, adapter, session_id,
-                    cwd=Path(cwd) if cwd else None,
-                )
-                output({"status": "synced", **result})
+                return 0
+            result = sync_one(
+                store, adapter, session_id,
+                cwd=Path(cwd) if cwd else None,
+            )
+            dsn = _remote_dsn()
+            if dsn:
+                _background_push(args.db.expanduser(), dsn, session_id)
+            output({"status": "synced", **result})
         elif args.command == "workspace":
             from khala.config import load_config, save_config
 
@@ -136,6 +191,33 @@ def main(argv: list[str] | None = None) -> int:
             from khala.compat import compat_check
 
             output(compat_check(store, args.adapter, args.session_id))
+        elif args.command == "connect":
+            from khala.config import load_config, save_config
+            from khala.remote import RemoteStore
+
+            RemoteStore(args.dsn).ensure_schema()
+            config_data = load_config()
+            config_data["remote"] = args.dsn
+            save_config(config_data)
+            from khala.sync import push_pending
+
+            pushed = push_pending(store, RemoteStore(args.dsn), limit=10000)["pushed"]
+            output({"mode": "khalai", "remote": args.dsn, "pushed": pushed})
+        elif args.command == "disconnect":
+            from khala.config import load_config, save_config
+
+            config_data = load_config()
+            remote = config_data.pop("remote", None)
+            save_config(config_data)
+            output({"mode": "nerazim", "disconnected": remote})
+        elif args.command == "config":
+            from khala.config import load_config
+
+            config_data = load_config()
+            if args.config_action == "show":
+                output(config_data)
+            else:
+                output({"mode": "khalai" if config_data.get("remote") else "nerazim", **config_data})
         return 0
     except (ImportError, AttributeError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
         print(f"khala: {error}", file=sys.stderr)

@@ -521,26 +521,36 @@ class KhalaIdentityTest(unittest.TestCase):
 class KhalaConfigTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        # isolate ~/.khala config dir for the test
-        self.patcher = patch.dict(os.environ, {"KHALA_CONFIG_DIR": self.tmp.name}, clear=False)
-        self.patcher.start()
         from khala import config as cfg
 
+        # CONFIG_DIR/CONFIG_FILE are resolved at import; patch both constants.
+        self.patcher = patch.object(cfg, "CONFIG_DIR", Path(self.tmp.name))
+        self.patcher.start()
+        self.file_patcher = patch.object(cfg, "CONFIG_FILE", Path(self.tmp.name) / "config.json")
+        self.file_patcher.start()
         self.cfg = cfg
 
     def tearDown(self):
+        self.file_patcher.stop()
         self.patcher.stop()
         self.tmp.cleanup()
 
     def test_workspace_add_and_is_enabled(self):
-        self.cfg.save_config({"workspaces": ["/ws/a"]})
+        self.cfg.save_config({"workspaces": ["/ws/a"], "remote": None})
         self.assertEqual(self.cfg.load_config()["workspaces"], ["/ws/a"])
         self.assertTrue(self.cfg.is_enabled_workspace("/ws/a/sub/dir"))
         self.assertFalse(self.cfg.is_enabled_workspace("/ws/b"))
 
     def test_config_default_when_missing(self):
-        self.assertEqual(self.cfg.load_config(), {"workspaces": []})
+        self.assertEqual(self.cfg.load_config(), {"workspaces": [], "remote": None})
         self.assertFalse(self.cfg.is_enabled_workspace("/anywhere"))
+
+    def test_remote_dsn_roundtrip(self):
+        self.assertEqual(self.cfg.get_remote_dsn(), None)
+        self.assertFalse(self.cfg.is_connected())
+        self.cfg.save_config({"workspaces": [], "remote": "postgresql://u:p@h:5432/db"})
+        self.assertEqual(self.cfg.get_remote_dsn(), "postgresql://u:p@h:5432/db")
+        self.assertTrue(self.cfg.is_connected())
 
 
 class KhalaHookDispatchTest(unittest.TestCase):

@@ -7,6 +7,9 @@ name = "khala"
 version = "0.1.0"
 description = "Local-first shared agent memory"
 requires-python = ">=3.9"
+dependencies = [
+    "psycopg[binary]>=3.2.13",
+]
 
 [project.scripts]
 khala = "khala.cli:main"

@@ -73,3 +73,60 @@ def sync(store: Store, adapter: Any, user: User | None = None, max_sessions: int
             result["errors"] += 1
             result["last_error"] = f"{sid}: {exc}"
     return result
+
+
+def push_session(store: Store, remote: Any, khala_session_id: str) -> dict[str, Any]:
+    """Mirror one local khala session (events + session row) to the remote store.
+
+    Idempotent — remote upserts are ON CONFLICT DO NOTHING, so re-pushing is safe.
+    Called from the background sync path when connected (Khalai mode).
+    """
+    session_row = store.db.execute(
+        "SELECT id, agent, external_id, created_at, metadata, user_name, user_email "
+        "FROM sessions WHERE id = ?",
+        (khala_session_id,),
+    ).fetchone()
+    if session_row is None:
+        return {"pushed": 0, "error": "session not found"}
+
+    session = {
+        "id": session_row["id"],
+        "agent": session_row["agent"],
+        "external_id": session_row["external_id"],
+        "created_at": session_row["created_at"],
+        "metadata": session_row["metadata"],
+        "user_name": session_row["user_name"],
+        "user_email": session_row["user_email"],
+    }
+    events = [
+        {
+            "id": e["id"],
+            "session_id": session["id"],
+            "role": e["role"],
+            "content": e["content"],
+            "created_at": e["created_at"],
+            "metadata": e["metadata"],
+        }
+        for e in store.get_events(khala_session_id)
+    ]
+
+    remote.ensure_schema()
+    remote.upsert_session(session)
+    remote.upsert_events(events)
+    return {"pushed": len(events)}
+
+
+def push_pending(store: Store, remote: Any, limit: int = 100) -> dict[str, Any]:
+    """Push all local sessions to remote (used on connect to sync the backlog)."""
+    rows = store.db.execute(
+        "SELECT id FROM sessions ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    total = 0
+    last_error = ""
+    for row in rows:
+        try:
+            total += push_session(store, remote, str(row["id"]))["pushed"]
+        except Exception as exc:
+            last_error = f"{row['id']}: {exc}"
+    return {"pushed": total, "last_error": last_error}

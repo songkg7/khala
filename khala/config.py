@@ -8,7 +8,7 @@ from typing import Any
 CONFIG_DIR = Path(os.environ.get("KHALA_CONFIG_DIR", Path.home() / ".khala"))
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
-_DEFAULT = {"workspaces": []}
+_DEFAULT = {"workspaces": [], "remote": None}
 
 
 def load_config() -> dict[str, Any]:
@@ -24,7 +24,18 @@ def load_config() -> dict[str, Any]:
     if not isinstance(workspaces, list):
         workspaces = []
     data["workspaces"] = [str(w) for w in workspaces]
+    data["remote"] = data.get("remote")
     return data
+
+
+def get_remote_dsn() -> str | None:
+    """Configured remote Postgres DSN, if connected (Khalai mode)."""
+    remote = load_config().get("remote")
+    return str(remote) if remote else None
+
+
+def is_connected() -> bool:
+    return bool(get_remote_dsn())
 
 
 def save_config(data: dict[str, Any]) -> None:
