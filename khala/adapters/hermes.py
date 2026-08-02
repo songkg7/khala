@@ -33,10 +33,31 @@ def _canonical_event(row: Mapping[str, Any]) -> Mapping[str, Any] | None:
     if not content and role == "assistant" and row["tool_calls"]:
         try:
             calls = json.loads(row["tool_calls"])
-            names = [c.get("function", {}).get("name", "?") for c in calls]
         except (json.JSONDecodeError, TypeError):
-            names = ["?"]
-        content = f"[tool_calls: {', '.join(names)}]"
+            calls = []
+        parts = []
+        for c in calls:
+            fn = c.get("function", {})
+            name = fn.get("name", "?")
+            parts.append(name)
+            # attach referenced file paths so identifier-graph recall can trace
+            # which files an agent touched (patch/read_file/search_files/...)
+            args = fn.get("arguments") or {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            if isinstance(args, dict):
+                for key in ("path", "file_path", "urls", "files"):
+                    val = args.get(key)
+                    if isinstance(val, (str, list)) and val:
+                        if isinstance(val, list):
+                            parts.extend(str(v) for v in val)
+                        else:
+                            parts.append(str(val))
+                        break
+        content = f"[tool_calls: {', '.join(parts)}]"
     if not content:
         return None
     timestamp = row["timestamp"]

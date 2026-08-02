@@ -57,6 +57,33 @@ class KhalaSyncHookTest(unittest.TestCase):
             self.assertNotIn("hermes_message_id", event)
             self.assertNotIn("tool_calls", event)
 
+    def test_tool_calls_summarize_referenced_file_paths(self):
+        """patch/read_file args carry the file path so identifier-graph recall
+        can trace which files an agent touched."""
+        import json as _json
+        import sqlite3 as _sqlite3
+        from khala.adapters.hermes import _canonical_event
+
+        row = {
+            "role": "assistant",
+            "content": None,
+            "timestamp": 1.0,
+            "tool_calls": _json.dumps(
+                [
+                    {
+                        "function": {
+                            "name": "patch",
+                            "arguments": _json.dumps({"path": "khala/remote.py"}),
+                        }
+                    }
+                ]
+            ),
+        }
+        ev = _canonical_event(row)
+        assert ev is not None
+        self.assertIn("khala/remote.py", ev["content"])
+        self.assertIn("patch", ev["content"])
+
 
 class KhalaCodexAdapterTest(unittest.TestCase):
     def setUp(self):
