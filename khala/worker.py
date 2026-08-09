@@ -8,7 +8,7 @@ from typing import Any, Protocol, TextIO
 
 import psycopg
 
-from khala.embeddings import DIMENSIONS, EMBED_ROLES, embed
+from khala.embeddings import DIMENSIONS, EMBED_ROLES, MODEL, PROVIDER, embed
 from khala.errors import public_error_message
 from khala.outbox import OutboxClaim
 from khala.redact import redact
@@ -145,8 +145,8 @@ def push_outbox(
             jobs.append(
                 {
                     "event_id": event_id,
-                    "provider": "openrouter",
-                    "model": "openai/text-embedding-3-small",
+                    "provider": PROVIDER,
+                    "model": MODEL,
                     "content_hash": _hash(str(row["content"])),
                 }
             )

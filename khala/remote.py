@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import psycopg
 from psycopg.rows import dict_row
 
+from khala.embeddings import MODEL, PROVIDER
 from khala.redact import redact
 from khala.retry import DEFAULT_RETRY_POLICY, RetryPolicy
 
@@ -71,17 +72,72 @@ _ORPHAN_EMBED_JOB_ERROR = "orphan embedding job: local event was never committed
 WORKER_LOCK_KEY = 884_221_001
 
 
-def _fmt(vector) -> str:
+def _fmt(vector: Sequence[float]) -> str:
     return "[" + ",".join(f"{x:.6f}" for x in vector) + "]"
 
 
-def recall_by_mode(remote: Any, query: str, mode: str, limit: int = 5) -> list[dict]:
+def _literal_ilike_pattern(query: str) -> str:
+    escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def recall_by_mode(
+    remote: Any, query: str, mode: str, limit: int = 5
+) -> list[dict[str, Any]]:
     """Dispatch remote recall by mode; hybrid falls back to lexical automatically."""
     if mode == "semantic":
         return remote.recall_semantic(query, limit)
     if mode == "lexical":
         return remote.recall_lexical(query, limit)
-    return remote.recall_hybrid(query, limit)
+    if mode == "hybrid":
+        return remote.recall_hybrid(query, limit)
+    raise ValueError(f"unsupported recall mode: {mode}")
+
+
+def search_by_mode(
+    remote: Any, query: str, mode: str, limit: int = 5
+) -> list[dict[str, Any]]:
+    """Dispatch read-only remote search without usage-stat mutations."""
+    if mode == "semantic":
+        return remote.search_semantic(query, limit)
+    if mode == "lexical":
+        return remote.search_lexical(query, limit)
+    if mode == "hybrid":
+        return remote.search_hybrid(query, limit)
+    raise ValueError(f"unsupported recall mode: {mode}")
+
+
+def _fuse_hybrid_results(
+    lexical: list[dict[str, Any]],
+    semantic: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for rank, source in enumerate(lexical, start=1):
+        event_id = str(source["id"])
+        if event_id in merged:
+            merged[event_id].setdefault("lexical_rank", rank)
+            continue
+        row = dict(source)
+        row["lexical_rank"] = rank
+        merged[event_id] = row
+    for rank, source in enumerate(semantic, start=1):
+        event_id = str(source["id"])
+        if event_id in merged:
+            merged[event_id].setdefault("semantic_rank", rank)
+        else:
+            row = dict(source)
+            row["semantic_rank"] = rank
+            merged[event_id] = row
+    for row in merged.values():
+        lexical_rank = row.get("lexical_rank") or 1_000_000
+        semantic_rank = row.get("semantic_rank") or 1_000_000
+        row["rank"] = 1.0 / (60 + lexical_rank) + 1.0 / (60 + semantic_rank)
+    ordered = sorted(
+        merged.values(),
+        key=lambda row: (-row["rank"], row["created_at"], str(row["id"])),
+    )
+    return ordered[:limit]
 
 
 class RemoteStore:
@@ -104,6 +160,20 @@ class RemoteStore:
             conn.commit()
         finally:
             conn.close()
+
+    @contextlib.contextmanager
+    def _read_cursor(self) -> Iterator[Any]:
+        """Own a PostgreSQL transaction that cannot perform accidental writes."""
+        conn = psycopg.connect(self.dsn)
+        try:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SET TRANSACTION READ ONLY")
+                yield cur
+        finally:
+            try:
+                conn.rollback()
+            finally:
+                conn.close()
 
     def ensure_schema(self) -> None:
         with self._cursor() as cur:
@@ -258,7 +328,7 @@ class RemoteStore:
             return cur.rowcount
 
     def enqueue_missing_embed_jobs(
-        self, provider: str = "openrouter", model: str = "openai/text-embedding-3-small"
+        self, provider: str = PROVIDER, model: str = MODEL
     ) -> int:
         """Backfill: enqueue jobs for user/assistant events that have no
         embedding yet (idempotent — conflicts are skipped)."""
@@ -289,8 +359,8 @@ class RemoteStore:
     def pending_embed_jobs(
         self,
         limit: int = 100,
-        provider: str = "openrouter",
-        model: str = "openai/text-embedding-3-small",
+        provider: str = PROVIDER,
+        model: str = MODEL,
     ) -> list[dict[str, Any]]:
         """Due embedding jobs joined with event content (redacted already at ingest)."""
         with self._cursor() as cur:
@@ -475,16 +545,70 @@ class RemoteStore:
 
     # --- recall ----------------------------------------------------------
 
-    def recall(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+    def ping(self) -> None:
+        with self._read_cursor() as cur:
+            cur.execute("SELECT 1")
+
+    def sample_events(
+        self, limit: int = 20, mode: str = "lexical"
+    ) -> list[dict[str, Any]]:
+        if limit < 1:
+            raise ValueError("sample limit must be positive")
+        if mode not in {"lexical", "semantic", "hybrid"}:
+            raise ValueError(f"unsupported recall mode: {mode}")
+        embedding_join = ""
+        parameters: dict[str, Any] = {"limit": limit}
+        if mode in {"semantic", "hybrid"}:
+            embedding_join = (
+                "JOIN event_embeddings ee ON ee.event_id = e.id "
+                "AND ee.provider = %(provider)s AND ee.model = %(model)s"
+            )
+            parameters["provider"] = PROVIDER
+            parameters["model"] = MODEL
+        with self._read_cursor() as cur:
+            rows = cur.execute(
+                f"""
+                SELECT DISTINCT e.id, e.content, e.created_at
+                FROM events e
+                {embedding_join}
+                WHERE e.role IN ('user', 'assistant') AND length(e.content) > 30
+                ORDER BY e.created_at DESC, e.id
+                LIMIT %(limit)s
+                """,
+                parameters,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _record_recalls(self, event_ids: list[str]) -> None:
+        if not event_ids:
+            return
+        with self._cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO recalls(event_id, count, last_recalled_at)
+                VALUES (%(event_id)s, 1, now())
+                ON CONFLICT(event_id) DO UPDATE SET
+                    count = recalls.count + 1,
+                    last_recalled_at = now()
+                """,
+                [{"event_id": event_id} for event_id in dict.fromkeys(event_ids)],
+            )
+
+    def search(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         """Full-text search over the shared store, ordered by recency.
 
         ponytail: simple ILIKE matches (no PG FTS setup needed for Phase 2).
         Upgrade to tsvector/to_tsquery when recall volume or ranking matters.
         """
-        return self.recall_lexical(query, limit=limit)
+        return self.search_lexical(query, limit=limit)
 
-    def recall_lexical(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
-        with self._cursor() as cur:
+    def recall(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        rows = self.search(query, limit)
+        self._record_recalls([str(row["id"]) for row in rows])
+        return rows
+
+    def search_lexical(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        with self._read_cursor() as cur:
             rows = cur.execute(
                 """
                 SELECT e.id, e.session_id, e.role, e.content, e.created_at,
@@ -495,70 +619,83 @@ class RemoteStore:
                 FROM events e
                 JOIN sessions s ON s.id = e.session_id
                 LEFT JOIN recalls r ON r.event_id = e.id
-                WHERE e.content ILIKE %(pattern)s
-                ORDER BY e.created_at DESC
+                WHERE e.content ILIKE %(pattern)s ESCAPE E'\\\\'
+                ORDER BY e.created_at DESC, e.id
                 LIMIT %(limit)s
                 """,
-                {"pattern": f"%{query}%", "limit": limit},
+                {"pattern": _literal_ilike_pattern(query), "limit": limit},
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def recall_semantic(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+    def recall_lexical(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        rows = self.search_lexical(query, limit)
+        self._record_recalls([str(row["id"]) for row in rows])
+        return rows
+
+    def search_semantic(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         """Embed the query and return nearest events by cosine distance."""
-        from khala.embeddings import MODEL, embed
+        from khala.embeddings import embed
 
         try:
             vectors = embed([query])
         except Exception as exc:
             raise ValueError(f"semantic recall unavailable: {exc}") from exc
         vec = _fmt(vectors[0])
-        with self._cursor() as cur:
+        with self._read_cursor() as cur:
             rows = cur.execute(
                 """
+                WITH canonical_embeddings AS (
+                    SELECT DISTINCT ON (ee.event_id)
+                           ee.event_id, ee.embedding
+                    FROM event_embeddings ee
+                    WHERE ee.provider = %(provider)s AND ee.model = %(model)s
+                    ORDER BY ee.event_id, ee.created_at DESC, ee.content_hash DESC
+                )
                 SELECT e.id, e.session_id, e.role, e.content, e.created_at,
                        s.agent, s.user_name, s.user_email,
                        COALESCE(r.count, 0) AS recall_count,
                        0 AS lexical_rank,
                        row_number() OVER (
-                           ORDER BY (ee.embedding <=> %(vec)s::vector)
+                           ORDER BY (ee.embedding <=> %(vec)s::vector), e.id
                        ) AS semantic_rank,
                        0 AS rank
-                FROM event_embeddings ee
+                FROM canonical_embeddings ee
                 JOIN events e ON e.id = ee.event_id
                 JOIN sessions s ON s.id = e.session_id
                 LEFT JOIN recalls r ON r.event_id = e.id
-                WHERE ee.model = %(model)s
-                ORDER BY ee.embedding <=> %(vec)s::vector
+                ORDER BY ee.embedding <=> %(vec)s::vector, e.id
                 LIMIT %(limit)s
                 """,
-                {"vec": vec, "model": MODEL, "limit": limit},
+                {
+                    "vec": vec,
+                    "provider": PROVIDER,
+                    "model": MODEL,
+                    "limit": limit,
+                },
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def recall_semantic(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        rows = self.search_semantic(query, limit)
+        self._record_recalls([str(row["id"]) for row in rows])
+        return rows
+
+    def search_hybrid(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        """Strict RRF fusion for evaluation; semantic failure is surfaced."""
+        lex = self.search_lexical(query, limit=limit * 2)
+        sem = self.search_semantic(query, limit=limit * 2)
+        return _fuse_hybrid_results(lex, sem, limit)
+
     def recall_hybrid(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
-        """RRF-fuse lexical + semantic top-N; falls back to lexical-only if
-        semantic is unavailable (no key / API error)."""
-        lex = self.recall_lexical(query, limit=limit * 2)
+        lex = self.search_lexical(query, limit=limit * 2)
         try:
-            sem = self.recall_semantic(query, limit=limit * 2)
+            sem = self.search_semantic(query, limit=limit * 2)
         except ValueError:
-            return lex[:limit]
-        merged: dict[str, dict[str, Any]] = {}
-        for i, row in enumerate(lex, start=1):
-            row["lexical_rank"] = i
-            merged[row["id"]] = row
-        for i, row in enumerate(sem, start=1):
-            row["semantic_rank"] = i
-            if row["id"] in merged:
-                merged[row["id"]]["semantic_rank"] = i
-            else:
-                merged[row["id"]] = row
-        for row in merged.values():
-            lr = row.get("lexical_rank") or 1000000
-            sr = row.get("semantic_rank") or 1000000
-            row["rank"] = 1.0 / (60 + lr) + 1.0 / (60 + sr)
-        ordered = sorted(merged.values(), key=lambda r: (-r["rank"], r["created_at"]))
-        return ordered[:limit]
+            rows = lex[:limit]
+        else:
+            rows = _fuse_hybrid_results(lex, sem, limit)
+        self._record_recalls([str(row["id"]) for row in rows])
+        return rows
 
     def attach_neighbors(
         self, hits: list[dict[str, Any]], per_hit: int = 3

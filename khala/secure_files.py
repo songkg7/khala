@@ -89,9 +89,11 @@ def tighten_private_file(path: Path) -> None:
         _tighten_mode(path, PRIVATE_FILE_MODE, directory=False)
 
 
-def atomic_write_private_text(path: Path, content: str) -> None:
+def atomic_write_private_text(
+    path: Path, content: str, *, tighten_parent: bool = True
+) -> None:
     """Atomically replace a text file while keeping every on-disk copy private."""
-    ensure_private_directory(path.parent)
+    ensure_private_directory(path.parent, tighten_existing=tighten_parent)
     tighten_private_file(path)
     descriptor, temporary_name = tempfile.mkstemp(
         dir=path.parent,

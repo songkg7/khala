@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from khala.identity import User
+from khala.local_search import lexical_search, sample_events
 from khala.models import SyncEvent
 from khala.outbox import OutboxClaim, OutboxRepository, migrate_outbox
 from khala.redact import redact
@@ -519,26 +520,14 @@ class Store:
                 raise ValueError(f"unsupported role: {event.role}")
             previous_source_id = event.source_id
 
-    def recall(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
-        # FTS5 treats `-`/`OR`/`*` as operators; quote when the user typed a bare hyphen
-        # so "cross-agent" → phrase, not `cross -agent` (NOT operator) which errors.
-        match_query = f'"{query.replace(chr(34), "")}"' if "-" in query else query
-        rows = self.db.execute(
-            """
-            SELECT e.id, e.session_id, e.role, e.content, e.created_at, s.agent,
-                   s.user_name, s.user_email,
-                   COALESCE(r.count, 0) AS recall_count,
-                   bm25(events_fts) - COALESCE(r.count, 0) * 0.1 AS rank
-            FROM events_fts
-            JOIN events e ON e.rowid = events_fts.rowid
-            JOIN sessions s ON s.id = e.session_id
-            LEFT JOIN recalls r ON r.event_id = e.id
-            WHERE events_fts MATCH ? AND s.archived_at IS NULL
-            ORDER BY rank, e.created_at DESC
-            LIMIT ?
-            """,
-            (match_query, limit),
-        ).fetchall()
+    def search(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        """Read-only lexical search used by evaluation and recall."""
+        return lexical_search(self.db, query, limit)
+
+    def _record_recalls(self, event_ids: Iterable[str]) -> None:
+        ids = tuple(dict.fromkeys(event_ids))
+        if not ids:
+            return
         recalled_at = _now()
         with self.transaction():
             self.db.executemany(
@@ -547,9 +536,18 @@ class Store:
                 ON CONFLICT(event_id) DO UPDATE SET
                     count = count + 1, last_recalled_at = excluded.last_recalled_at
                 """,
-                ((row["id"], recalled_at) for row in rows),
+                ((event_id, recalled_at) for event_id in ids),
             )
-        return [dict(row) for row in rows]
+
+    def recall(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        """Search and record returned events as real product usage."""
+        rows = self.search(query, limit)
+        self._record_recalls(str(row["id"]) for row in rows)
+        return rows
+
+    def sample_events(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Read-only deterministic sample for opt-in eval-set generation."""
+        return sample_events(self.db, limit)
 
     def enqueue_backlog(self, limit: int = 100000) -> int:
         """Enqueue every existing event not yet in the outbox (used on connect)."""

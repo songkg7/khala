@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -97,6 +98,9 @@ def parser() -> argparse.ArgumentParser:
         help="One detached push+embedding pass (internal — spawned by hook/connect)",
     )
     remote_worker.add_argument("--run-id", help=argparse.SUPPRESS)
+    from khala.eval_cli import add_eval_parser
+
+    add_eval_parser(commands)
     return root
 
 
@@ -113,11 +117,36 @@ def output(value: Any) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    database_path = args.db.expanduser()
+    if args.command == "eval":
+        from khala.eval_cli import run_eval_command
+
+        try:
+            dsn = _remote_dsn() if args.backend == "remote" and not args.baseline else None
+            result, exit_code = run_eval_command(
+                args, database=database_path, dsn=dsn
+            )
+            output(result)
+            return exit_code
+        except psycopg.Error as error:
+            print(f"khala: {public_error_message(error)}", file=sys.stderr)
+            return 2
+        except (
+            ImportError,
+            AttributeError,
+            OSError,
+            RuntimeError,
+            sqlite3.Error,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as error:
+            print(f"khala: {error}", file=sys.stderr)
+            return 2
     from khala.config import ensure_config_directory
     from khala.secure_files import ensure_private_directory
 
     ensure_config_directory()
-    database_path = args.db.expanduser()
     if database_path.absolute() == CANONICAL_DB.absolute():
         ensure_private_directory(database_path.parent)
     store = Store(database_path)
@@ -360,7 +389,15 @@ def main(argv: list[str] | None = None) -> int:
     except psycopg.Error as error:
         print(f"khala: {public_error_message(error)}", file=sys.stderr)
         return 2
-    except (ImportError, AttributeError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+    except (
+        ImportError,
+        AttributeError,
+        OSError,
+        sqlite3.Error,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as error:
         print(f"khala: {error}", file=sys.stderr)
         return 2
     finally:

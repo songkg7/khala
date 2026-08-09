@@ -91,8 +91,8 @@ class KhalaStoreTest(unittest.TestCase):
         self.assertEqual(r2[0]["recall_count"], 2)
         self.assertEqual(r2[0]["id"], e1)
 
-    def test_recall_hyphen_query_quoted(self):
-        """FTS5 treats `-` as NOT; ensure a hyphenated user query works as a phrase."""
+    def test_recall_hyphen_query_is_tokenized_as_literal_text(self):
+        """FTS5 syntax characters in natural-language queries stay literal."""
         session = self.store.add_session("test")
         self.store.add_event(session, "assistant", "cross-agent recall target")
         hits = self.store.recall("cross-agent")

@@ -52,6 +52,7 @@ khala disconnect                 # back to Nerazim (local-only)
 khala embed status|pending|retry-dead  # embedding backlog / recovery
 khala outbox dead|retry-dead     # inspect / requeue local push dead letters
 khala compat-check --adapter X --session-id Y   # canonical-schema gate
+khala eval --baseline            # deterministic Phase 3 recall quality gate
 ```
 
 ### User identity
@@ -108,6 +109,35 @@ stored; the vendor's internal id is used only as a sync watermark.
 
 `khala compat-check` verifies an imported session carries the canonical schema
 and a resolvable user identity.
+
+### Recall evaluation
+
+Evaluation uses read-only search APIs and does not increment recall counts or
+change ranking state. The checked-in lexical gold gate is deterministic and
+does not open the configured database, remote, or network:
+
+```bash
+khala eval --baseline
+```
+
+The gate exits `0` on success, `1` on a quality regression, and `2` for an
+invalid fixture or invocation.
+
+Evaluate a curated database-specific JSONL set (`{"query": "...", "gold":
+["<event-id>"]}`) with a read-only SQLite connection:
+
+```bash
+khala --db ~/.khala/khala.db eval --dataset eval.jsonl --backend local --mode lexical
+```
+
+Remote semantic/hybrid evaluation requires an explicit `--backend remote`; it
+fails if that backend or semantic search is unavailable instead of silently
+downgrading the measured mode. `--generate` and `--judge` are opt-in OpenRouter
+operations that may send sampled event content. Generated datasets written with
+`--output` use private file permissions. To fail before an unexpectedly large
+network or output workload, judging is capped at 1,000 possible results,
+`--read` at 10,000 results, and remote semantic/hybrid evaluation at 1,000
+queries per run.
 
 ## Hermes hook (auto record every turn)
 

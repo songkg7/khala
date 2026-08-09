@@ -6,12 +6,12 @@ import os
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
 
 # ponytail: stdlib urllib; a batched HTTP client (httpx) only when we need
 # concurrency or streaming. OpenRouter's embeddings endpoint is POST-only.
 
 EMBEDDINGS_URL = "https://openrouter.ai/api/v1/embeddings"
+PROVIDER = "openrouter"
 MODEL = "openai/text-embedding-3-small"
 DIMENSIONS = 1536
 API_KEY_ENV = "OPENROUTER_API_KEY"

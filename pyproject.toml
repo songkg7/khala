@@ -18,7 +18,11 @@ khala = "khala.cli:main"
 packages = [
     "khala",
     "khala.adapters",
+    "khala.evaluation",
 ]
+
+[tool.setuptools.package-data]
+"khala.evaluation" = ["*.json"]
 
 [tool.ruff]
 line-length = 100
