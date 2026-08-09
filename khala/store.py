@@ -9,6 +9,7 @@ from typing import Any, Iterable, Mapping
 
 from khala.identity import User
 from khala.redact import redact
+from khala.secure_files import prepare_private_file
 
 
 def _now() -> str:
@@ -26,7 +27,8 @@ class Store:
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        path.parent.mkdir(parents=True, exist_ok=True)
+        if str(path) != ":memory:":
+            prepare_private_file(path)
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self._init_schema()

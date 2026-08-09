@@ -1,4 +1,8 @@
+import os
+import stat
+import tempfile
 import unittest
+from pathlib import Path
 
 from khala import Store, load_adapter, read_jsonl, redact
 
@@ -25,6 +29,27 @@ class KhalaStoreTest(unittest.TestCase):
         self.assertEqual(len(self.store.replay(session)), 2)
         self.assertEqual(self.store.status()["sessions"], 1)
         self.assertEqual(self.store.status()["events"], 2)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission bits required")
+    def test_database_file_is_private(self):
+        self.assertEqual(stat.S_IMODE(self.db.stat().st_mode), 0o600)
+
+    def test_memory_store_does_not_create_filesystem_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            previous_cwd = Path.cwd()
+            os.chdir(directory)
+            try:
+                memory_store = Store(Path(":memory:"))
+                self.addCleanup(memory_store.close)
+                self.assertFalse(Path(":memory:").exists())
+            finally:
+                os.chdir(previous_cwd)
+
+        self.store.close()
+        self.db.chmod(0o644)
+        self.store = Store(self.db)
+
+        self.assertEqual(stat.S_IMODE(self.db.stat().st_mode), 0o600)
 
     def test_add_event_invalid_session(self):
         with self.assertRaises(ValueError, msg="unknown session"):

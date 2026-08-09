@@ -5,15 +5,31 @@ import os
 from pathlib import Path
 from typing import Any
 
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+from khala.secure_files import (
+    atomic_write_private_text,
+    ensure_private_directory,
+    tighten_private_file,
+)
+
 CONFIG_DIR = Path(os.environ.get("KHALA_CONFIG_DIR", Path.home() / ".khala"))
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 _DEFAULT = {"workspaces": [], "remote": None}
 
 
+def ensure_config_directory() -> None:
+    """Create or tighten Khala's state directory before any CLI operation."""
+    ensure_private_directory(CONFIG_DIR)
+
+
 def load_config() -> dict[str, Any]:
+    ensure_config_directory()
     if not CONFIG_FILE.is_file():
         return dict(_DEFAULT)
+    ensure_private_directory(CONFIG_FILE.parent)
+    tighten_private_file(CONFIG_FILE)
     try:
         data = json.loads(CONFIG_FILE.read_text())
         if not isinstance(data, dict):
@@ -39,8 +55,11 @@ def is_connected() -> bool:
 
 
 def save_config(data: dict[str, Any]) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    ensure_private_directory(CONFIG_DIR)
+    atomic_write_private_text(
+        CONFIG_FILE,
+        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+    )
 
 
 def is_enabled_workspace(cwd: str) -> bool:
@@ -56,10 +75,63 @@ def is_enabled_workspace(cwd: str) -> bool:
 
 
 def mask_dsn(dsn: str) -> str:
-    """Mask the password portion of a postgres:// DSN (never print secrets)."""
-    import re
+    """Return a display-safe Postgres conninfo string without its password."""
+    try:
+        parameters = conninfo_to_dict(dsn)
+        for key in _CONNINFO_SECRET_KEYS & parameters.keys():
+            parameters[key] = "***"
+        return make_conninfo(**parameters)
+    except Exception:
+        return "[invalid PostgreSQL DSN]"
 
-    return re.sub(r"(://[^:/]+:)[^@]+(@)", r"\1***\2", dsn, count=1)
+
+_CONNINFO_SECRET_KEYS = frozenset(
+    {
+        "oauth_client_secret",
+        "password",
+        "scram_client_key",
+        "scram_server_key",
+        "sslpassword",
+    }
+)
+
+
+_SENSITIVE_CONFIG_KEYS = frozenset(
+    {
+        "api_key",
+        "access_token",
+        "dsn",
+        "oauth_client_secret",
+        "password",
+        "passwd",
+        "scram_client_key",
+        "scram_server_key",
+        "secret",
+        "sslpassword",
+        "token",
+    }
+)
+
+
+def public_config_value(key: str, value: Any) -> Any:
+    """Sanitize a config value before it is written to stdout."""
+    if value is None:
+        return None
+    if key == "remote" and isinstance(value, str):
+        return mask_dsn(value)
+    segments = [segment for segment in config_segments(key) if isinstance(segment, str)]
+    if any(segment.lower() in _SENSITIVE_CONFIG_KEYS for segment in segments):
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {
+            child_key: public_config_value(
+                f"{key}.{child_key}" if key else str(child_key), child_value
+            )
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, list):
+        return [public_config_value(key, child_value) for child_value in value]
+    return value
 
 
 def config_segments(key: str) -> list[str | int]:

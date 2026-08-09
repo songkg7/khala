@@ -7,6 +7,7 @@ from typing import Any
 import psycopg
 
 from khala.embeddings import EMBED_ROLES, embed
+from khala.errors import public_error_message
 from khala.remote import WORKER_LOCK_KEY, RemoteStore
 from khala.store import Store
 
@@ -188,7 +189,8 @@ def run_worker(db_path: Path, dsn: str, max_passes: int = 1) -> dict[str, Any]:
             store.db.close()
         return out
     except Exception as exc:
-        sys.stderr.write(f"khala worker error: {exc}\n")
-        return {"status": "error", "reason": str(exc)[:500]}
+        reason = public_error_message(exc)[:500]
+        sys.stderr.write(f"khala worker error: {reason}\n")
+        return {"status": "error", "reason": reason}
     finally:
         lock.close()

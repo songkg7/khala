@@ -7,10 +7,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import psycopg
+
 from khala.adapter import ingest_events
+from khala.errors import public_error_message
 from khala.store import Store
 
-DEFAULT_DB = Path(os.environ.get("KHALA_DB", "~/.khala/khala.db")).expanduser()
+CANONICAL_DB = Path("~/.khala/khala.db").expanduser()
+DEFAULT_DB = Path(os.environ.get("KHALA_DB", str(CANONICAL_DB))).expanduser()
 
 
 def parser() -> argparse.ArgumentParser:
@@ -42,7 +46,10 @@ def parser() -> argparse.ArgumentParser:
     graph.add_argument("event_id")
     graph.add_argument("--limit", type=int, default=5)
     connect = commands.add_parser("connect", help="Connect to a remote khala store (Khalai mode)")
-    connect.add_argument("dsn", help="Postgres DSN, e.g. postgresql://khala:khala@localhost:5432/khala")
+    connect.add_argument(
+        "dsn",
+        help="Postgres DSN, e.g. postgresql://khala:<password>@localhost:5432/khala",
+    )
     disconnect_cmd = commands.add_parser("disconnect", help="Disconnect from remote; return to Nerazim (local) mode")
     config_cmd = commands.add_parser("config", help="Manage khala configuration")
     config_sub = config_cmd.add_subparsers(dest="config_action")
@@ -95,7 +102,14 @@ def output(value: Any) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    store = Store(args.db.expanduser())
+    from khala.config import ensure_config_directory
+    from khala.secure_files import ensure_private_directory
+
+    ensure_config_directory()
+    database_path = args.db.expanduser()
+    if database_path.absolute() == CANONICAL_DB.absolute():
+        ensure_private_directory(database_path.parent)
+    store = Store(database_path)
     try:
         if args.command == "status":
             mode = "khalai" if _remote_dsn() else "nerazim"
@@ -219,18 +233,26 @@ def main(argv: list[str] | None = None) -> int:
 
             output({"mode": "khalai", "remote": mask_dsn(args.dsn), "queued": queued})
         elif args.command == "disconnect":
-            from khala.config import load_config, save_config
+            from khala.config import load_config, mask_dsn, save_config
 
             config_data = load_config()
             remote = config_data.pop("remote", None)
             save_config(config_data)
-            output({"mode": "nerazim", "disconnected": remote})
+            disconnected = mask_dsn(str(remote)) if remote else None
+            output({"mode": "nerazim", "disconnected": disconnected})
         elif args.command == "config":
-            from khala.config import config_get, config_set, load_config, mask_dsn, save_config
+            from khala.config import (
+                config_get,
+                config_set,
+                load_config,
+                mask_dsn,
+                public_config_value,
+                save_config,
+            )
             from khala.embeddings import api_key_set
 
             config_data = load_config()
-            action = getattr(args, "config_action", "show")
+            action = getattr(args, "config_action", None) or "show"
             if action == "show":
                 shown: dict[str, Any] = {"mode": "khalai" if config_data.get("remote") else "nerazim"}
                 shown["workspaces"] = config_data.get("workspaces", [])
@@ -252,11 +274,18 @@ def main(argv: list[str] | None = None) -> int:
                     pass  # keep as plain string
                 config_set(config_data, args.key, value)
                 save_config(config_data)
-                output({"ok": True, "key": args.key, "value": value})
+                output(
+                    {
+                        "ok": True,
+                        "key": args.key,
+                        "value": public_config_value(args.key, value),
+                    }
+                )
             elif action == "get":
-                output(config_get(config_data, args.key))
+                value = config_get(config_data, args.key)
+                output(public_config_value(args.key, value))
             else:
-                output({"mode": "khalai" if config_data.get("remote") else "nerazim", **config_data})
+                raise ValueError(f"unsupported config action: {action}")
         elif args.command == "remote-worker":
             from khala.config import get_remote_dsn
             from khala.worker import run_worker
@@ -289,6 +318,9 @@ def main(argv: list[str] | None = None) -> int:
                 spawn_worker(dsn)
                 output({"enqueued": jobs, "hint": "worker running in background"})
         return 0
+    except psycopg.Error as error:
+        print(f"khala: {public_error_message(error)}", file=sys.stderr)
+        return 2
     except (ImportError, AttributeError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
         print(f"khala: {error}", file=sys.stderr)
         return 2

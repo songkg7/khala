@@ -17,6 +17,18 @@ Run the test suite:
 .venv/bin/python3 -m unittest discover -s tests
 ```
 
+Start the local Khalai database with an explicit development password. The
+port is bound to localhost only:
+
+```bash
+export KHALA_POSTGRES_PASSWORD='choose-a-local-password'
+docker compose up -d postgres
+```
+
+An existing `khala_pgdata` volume keeps the password from its first database
+initialization; changing the environment variable does not rotate that role's
+password automatically.
+
 Enable a workspace for auto-sync:
 
 ```bash

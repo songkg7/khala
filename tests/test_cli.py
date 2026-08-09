@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from khala import main
 
@@ -16,8 +17,19 @@ class KhalaCLIIntegrationTest(unittest.TestCase):
         # Isolate from any ambient remote (Khalai) connection so recall always
         # uses the local store instead of hitting a real shared DB.
         os.environ["KHALA_CONFIG_DIR"] = self.tmp.name
+        from khala import config as cfg
+
+        self.config_dir_patcher = patch.object(cfg, "CONFIG_DIR", Path(self.tmp.name))
+        self.config_file_patcher = patch.object(
+            cfg, "CONFIG_FILE", Path(self.tmp.name) / "config.json"
+        )
+        self.config_dir_patcher.start()
+        self.config_file_patcher.start()
+        self.config = cfg
 
     def tearDown(self):
+        self.config_file_patcher.stop()
+        self.config_dir_patcher.stop()
         self.tmp.cleanup()
 
     def _run(self, *args, stdin=""):
@@ -118,6 +130,65 @@ class KhalaCLIIntegrationTest(unittest.TestCase):
         _, replay_out, _ = self._run("replay", session)
         events = json.loads(replay_out)
         self.assertIn("stdin content", events[0]["content"])
+
+    def test_config_and_disconnect_never_print_raw_dsn(self):
+        secret = "not-for-stdout"
+        dsn = f"postgresql://alice:{secret}@db.example:5432/khala"
+        self.config.save_config({"workspaces": [], "remote": dsn})
+
+        for command in (("config",), ("config", "get", "remote"), ("disconnect",)):
+            with self.subTest(command=command):
+                if command == ("disconnect",):
+                    self.config.save_config({"workspaces": [], "remote": dsn})
+                code, out, err = self._run(*command)
+                self.assertEqual(code, 0, err)
+                self.assertNotIn(secret, out)
+                self.assertIn("***", out)
+
+    def test_config_set_masks_sensitive_value_in_response(self):
+        secret = "not-for-stdout"
+        dsn = f"host=db.example user=alice password={secret} dbname=khala"
+
+        code, out, err = self._run("config", "set", "remote", dsn)
+
+        self.assertEqual(code, 0, err)
+        self.assertNotIn(secret, out)
+        self.assertIn("***", out)
+        self.assertEqual(self.config.get_remote_dsn(), dsn)
+
+    def test_connect_error_does_not_print_malformed_dsn_secret(self):
+        secret = "bad%XXnot-for-stderr"
+        dsn = f"postgresql://alice:{secret}@db.example/khala"
+
+        code, out, err = self._run("connect", dsn)
+
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertNotIn(secret, err)
+        self.assertIn("PostgreSQL ProgrammingError", err)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission bits required")
+    def test_canonical_database_directory_is_private_with_custom_config_dir(self):
+        import stat
+
+        from khala import cli
+
+        canonical_parent = Path(self.tmp.name) / ".khala"
+        canonical_parent.mkdir(mode=0o755)
+        canonical_parent.chmod(0o755)
+        canonical_db = canonical_parent / "khala.db"
+
+        with patch.object(cli, "CANONICAL_DB", canonical_db), patch.object(
+            cli, "DEFAULT_DB", canonical_db
+        ):
+            previous_db, self.db = self.db, str(canonical_db)
+            try:
+                code, _, err = self._run("status")
+            finally:
+                self.db = previous_db
+
+        self.assertEqual(code, 0, err)
+        self.assertEqual(stat.S_IMODE(canonical_parent.stat().st_mode), 0o700)
 
     def test_wrong_command_returns_2(self):
         code, _, err = self._run("nonexistent")
