@@ -18,7 +18,7 @@ from unittest import mock
 from khala import eval_cli as eval_cli_module
 from khala.evaluation import dataset as dataset_module
 from khala.evaluation import llm as llm_module
-from khala.evaluation.backends import LocalEvalBackend, select_backend
+from khala.evaluation.backends import LocalEvalBackend, RemoteEvalBackend, select_backend
 from khala.evaluation.baseline import BASELINE_RESOURCE, run_baseline
 from khala.evaluation.dataset import load_jsonl, write_jsonl
 from khala.evaluation.metrics import (
@@ -32,6 +32,7 @@ from khala.evaluation.metrics import (
 from khala.evaluation.models import EvalCase, Judgment
 from khala.evaluation.runner import evaluate_queries
 from khala.local_search import build_match_query
+from khala.models import ArchivedSession
 from khala.store import Store
 
 
@@ -858,6 +859,182 @@ class LocalEvaluationBackendTest(unittest.TestCase):
         self.addCleanup(store.close)
         with self.assertRaisesRegex(ValueError, "sample limit must be positive"):
             store.sample_events(0)
+
+
+class RemoteEvaluationBackendTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.database = Path(self.temporary_directory.name) / "khala.db"
+
+    def test_initialization_reads_then_pings_and_checks_archive_convergence(self) -> None:
+        calls = mock.Mock()
+        remote = mock.MagicMock()
+        tombstones: list[ArchivedSession] = [
+            {
+                "id": "archived-session",
+                "archived_at": "2026-01-01T00:00:00Z",
+                "duplicate_of": "canonical-session",
+            }
+        ]
+        remote.ping.side_effect = lambda: calls.ping()
+        remote.archives_converged.side_effect = (
+            lambda value: calls.archives_converged(value) or True
+        )
+
+        def read_tombstones(database: Path) -> list[ArchivedSession]:
+            calls.read_tombstones(database)
+            return tombstones
+
+        def create_remote(dsn: str) -> mock.MagicMock:
+            calls.create_remote(dsn)
+            return remote
+
+        with (
+            mock.patch(
+                "khala.remote.RemoteStore",
+                side_effect=create_remote,
+            ) as remote_store,
+            mock.patch(
+                "khala.archive_convergence.read_local_archive_tombstones",
+                side_effect=read_tombstones,
+            ) as reader,
+        ):
+            backend = RemoteEvalBackend(
+                "postgresql://example/khala",
+                "hybrid",
+                self.database,
+            )
+
+        remote_store.assert_called_once_with("postgresql://example/khala")
+        reader.assert_called_once_with(self.database)
+        self.assertEqual(backend.mode, "hybrid")
+        self.assertEqual(
+            calls.mock_calls,
+            [
+                mock.call.read_tombstones(self.database),
+                mock.call.create_remote("postgresql://example/khala"),
+                mock.call.ping(),
+                mock.call.archives_converged(tombstones),
+            ],
+        )
+
+    def test_legacy_duplicate_fails_before_remote_search_without_mutating_sqlite(
+        self,
+    ) -> None:
+        with sqlite3.connect(self.database) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    agent TEXT NOT NULL,
+                    external_id TEXT
+                );
+                INSERT INTO sessions(id, agent, external_id) VALUES
+                    ('older', 'codex', 'duplicate'),
+                    ('newer', 'codex', 'duplicate');
+                """
+            )
+        before = self.database.read_bytes()
+        real_connect = sqlite3.connect
+        remote = mock.MagicMock()
+
+        with (
+            mock.patch("khala.remote.RemoteStore", return_value=remote) as remote_store,
+            mock.patch("khala.remote.search_by_mode") as search,
+            mock.patch(
+                "khala.archive_convergence.sqlite3.connect",
+                wraps=real_connect,
+            ) as connect,
+            self.assertRaisesRegex(RuntimeError, "local archive migration is required"),
+        ):
+            RemoteEvalBackend(
+                "postgresql://example/khala",
+                "lexical",
+                self.database,
+            )
+
+        remote_store.assert_not_called()
+        remote.ping.assert_not_called()
+        remote.archives_converged.assert_not_called()
+        remote.sample_events.assert_not_called()
+        search.assert_not_called()
+        connect.assert_called_once_with(
+            f"{self.database.resolve().as_uri()}?mode=ro",
+            uri=True,
+        )
+        self.assertEqual(self.database.read_bytes(), before)
+
+    def test_remote_archive_mismatch_fails_before_search_or_sampling(self) -> None:
+        remote = mock.MagicMock()
+        remote.archives_converged.return_value = False
+        tombstones: list[ArchivedSession] = [
+            {
+                "id": "archived-session",
+                "archived_at": "2026-01-01T00:00:00Z",
+                "duplicate_of": None,
+            }
+        ]
+
+        with (
+            mock.patch("khala.remote.RemoteStore", return_value=remote),
+            mock.patch(
+                "khala.archive_convergence.read_local_archive_tombstones",
+                return_value=tombstones,
+            ),
+            mock.patch("khala.remote.search_by_mode") as search,
+            self.assertRaisesRegex(RuntimeError, "remote archive state is not converged"),
+        ):
+            RemoteEvalBackend(
+                "postgresql://example/khala",
+                "semantic",
+                self.database,
+            )
+
+        remote.ping.assert_called_once_with()
+        remote.archives_converged.assert_called_once_with(tombstones)
+        remote.sample_events.assert_not_called()
+        search.assert_not_called()
+
+    def test_matching_and_empty_tombstones_allow_search_and_sampling(self) -> None:
+        cases: list[list[ArchivedSession]] = [
+            [],
+            [
+                {
+                    "id": "archived-session",
+                    "archived_at": "2026-01-01T00:00:00Z",
+                    "duplicate_of": "canonical-session",
+                }
+            ],
+        ]
+        for tombstones in cases:
+            with self.subTest(tombstones=tombstones):
+                remote = mock.MagicMock()
+                remote.archives_converged.return_value = True
+                remote.sample_events.return_value = [{"id": "sample"}]
+                expected_search = [{"id": "match"}]
+                with (
+                    mock.patch("khala.remote.RemoteStore", return_value=remote),
+                    mock.patch(
+                        "khala.archive_convergence.read_local_archive_tombstones",
+                        return_value=tombstones,
+                    ),
+                    mock.patch(
+                        "khala.remote.search_by_mode",
+                        return_value=expected_search,
+                    ) as search,
+                ):
+                    backend = RemoteEvalBackend(
+                        "postgresql://example/khala",
+                        "hybrid",
+                        self.database,
+                    )
+                    self.assertEqual(backend.search("needle", 5), expected_search)
+                    self.assertEqual(backend.sample_events(3), [{"id": "sample"}])
+
+                remote.archives_converged.assert_called_once_with(tombstones)
+                search.assert_called_once_with(remote, "needle", "hybrid", 5)
+                remote.sample_events.assert_called_once_with(3, mode="hybrid")
 
 
 if __name__ == "__main__":

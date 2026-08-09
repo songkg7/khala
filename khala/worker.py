@@ -10,6 +10,7 @@ import psycopg
 
 from khala.embeddings import DIMENSIONS, EMBED_ROLES, MODEL, PROVIDER, embed
 from khala.errors import public_error_message
+from khala.models import ArchivedSession
 from khala.outbox import OutboxClaim
 from khala.redact import redact
 from khala.remote import WORKER_LOCK_KEY, RemoteStore
@@ -22,6 +23,8 @@ from khala.store import Store
 
 
 class RemoteWorkerStore(Protocol):
+    def archive_sessions(self, sessions: list[ArchivedSession]) -> None: ...
+
     def push_batch(
         self,
         sessions: list[dict[str, Any]],
@@ -299,11 +302,14 @@ def run_worker(
 
         remote = RemoteStore(dsn)
         remote.ensure_schema()
+        archived_sessions = store.archived_sessions()
+        remote.archive_sessions(archived_sessions)
         result: dict[str, Any] = {
             "status": "ok",
             "run_id": active_run_id,
             "pushed": [],
             "embedded": [],
+            "archived_sessions_synced": len(archived_sessions),
         }
         for _ in range(max(1, max_passes)):
             if active_claim is None:

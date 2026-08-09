@@ -44,12 +44,18 @@ class LocalEvalBackend:
 class RemoteEvalBackend:
     name = "remote"
 
-    def __init__(self, dsn: str, mode: str) -> None:
+    def __init__(self, dsn: str, mode: str, database: Path) -> None:
+        from khala.archive_convergence import read_local_archive_tombstones
         from khala.remote import RemoteStore
 
+        tombstones = read_local_archive_tombstones(database)
         self.remote = RemoteStore(dsn)
         self.mode = mode
         self.remote.ping()
+        if not self.remote.archives_converged(tombstones):
+            raise RuntimeError(
+                "remote archive state is not converged; run `khala remote-worker`"
+            )
 
     def search(self, query: str, limit: int) -> list[dict[str, Any]]:
         from khala.remote import search_by_mode
@@ -91,4 +97,4 @@ def select_backend(
         return LocalEvalBackend(database)
     if dsn is None:
         raise RuntimeError("validated remote eval DSN is missing")
-    return RemoteEvalBackend(dsn, mode)
+    return RemoteEvalBackend(dsn, mode, database)

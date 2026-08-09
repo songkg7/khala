@@ -6,10 +6,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import psycopg
+from psycopg import sql
 from psycopg.rows import dict_row
 
+from khala.adjacency import validate_neighbor_limit
 from khala.embeddings import MODEL, PROVIDER
+from khala.models import ArchivedSession
 from khala.redact import redact
+from khala.remote_adjacency import load_remote_event_neighbors
 from khala.retry import DEFAULT_RETRY_POLICY, RetryPolicy
 
 _SCHEMA_SESSIONS = """
@@ -20,7 +24,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at TEXT NOT NULL,
     metadata TEXT NOT NULL DEFAULT '{}',
     user_name TEXT DEFAULT NULL,
-    user_email TEXT DEFAULT NULL
+    user_email TEXT DEFAULT NULL,
+    archived_at TEXT DEFAULT NULL,
+    duplicate_of TEXT DEFAULT NULL
 )
 """
 _SCHEMA_EVENTS = """
@@ -70,6 +76,23 @@ _ORPHAN_EMBED_JOB_ERROR = "orphan embedding job: local event was never committed
 
 # worker advisory-lock key — serializes all remote-worker instances
 WORKER_LOCK_KEY = 884_221_001
+SCHEMA_MIGRATION_LOCK_KEY = 884_221_002
+_EVENT_INDEXES = (
+    (
+        "events_session_created",
+        sql.SQL(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS events_session_created "
+            "ON events(session_id, created_at)"
+        ),
+    ),
+    (
+        "events_session_created_id",
+        sql.SQL(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS events_session_created_id "
+            "ON events(session_id, created_at, id)"
+        ),
+    ),
+)
 
 
 def _fmt(vector: Sequence[float]) -> str:
@@ -167,7 +190,9 @@ class RemoteStore:
         conn = psycopg.connect(self.dsn)
         try:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute("SET TRANSACTION READ ONLY")
+                cur.execute(
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+                )
                 yield cur
         finally:
             try:
@@ -178,15 +203,58 @@ class RemoteStore:
     def ensure_schema(self) -> None:
         with self._cursor() as cur:
             self._ensure_schema(cur)
+        self._ensure_event_indexes()
+
+    def _ensure_event_indexes(self) -> None:
+        """Build upgrade indexes without blocking writes to the events table."""
+        conn = psycopg.connect(
+            self.dsn,
+            autocommit=True,
+            application_name="khala-schema-migration",
+        )
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_advisory_lock(%s)",
+                    (SCHEMA_MIGRATION_LOCK_KEY,),
+                )
+                try:
+                    for index_name, create_statement in _EVENT_INDEXES:
+                        row = cur.execute(
+                            """
+                            SELECT index_row.indisvalid
+                            FROM pg_index index_row
+                            WHERE index_row.indexrelid = to_regclass(%s)
+                            """,
+                            (index_name,),
+                        ).fetchone()
+                        if row is not None and not bool(row[0]):
+                            cur.execute(
+                                sql.SQL("DROP INDEX CONCURRENTLY IF EXISTS {}").format(
+                                    sql.Identifier(index_name)
+                                )
+                            )
+                        cur.execute(create_statement)
+                finally:
+                    with contextlib.suppress(psycopg.Error):
+                        cur.execute(
+                            "SELECT pg_advisory_unlock(%s)",
+                            (SCHEMA_MIGRATION_LOCK_KEY,),
+                        )
+        finally:
+            conn.close()
 
     @staticmethod
     def _ensure_schema(cur: Any) -> None:
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
         cur.execute(_SCHEMA_SESSIONS)
-        cur.execute(_SCHEMA_EVENTS)
         cur.execute(
-            "CREATE INDEX IF NOT EXISTS events_session_created ON events(session_id, created_at)"
+            "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS archived_at TEXT DEFAULT NULL"
         )
+        cur.execute(
+            "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS duplicate_of TEXT DEFAULT NULL"
+        )
+        cur.execute(_SCHEMA_EVENTS)
         cur.execute(_SCHEMA_RECALLS)
         cur.execute(_SCHEMA_EMBEDDINGS)
         cur.execute(_SCHEMA_EMBED_JOBS)
@@ -208,15 +276,45 @@ class RemoteStore:
             {"orphan_error": _ORPHAN_EMBED_JOB_ERROR},
         )
 
+    def archive_sessions(self, sessions: Sequence[ArchivedSession]) -> None:
+        """Converge monotonic local archive tombstones without sending content."""
+        if not sessions:
+            return
+        with self._cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO sessions(
+                    id, agent, external_id, created_at, metadata,
+                    user_name, user_email, archived_at, duplicate_of
+                )
+                VALUES (
+                    %(id)s, 'khala-archive-tombstone', NULL, %(archived_at)s,
+                    '{}', NULL, NULL, %(archived_at)s, %(duplicate_of)s
+                )
+                ON CONFLICT (id) DO UPDATE SET
+                    archived_at = excluded.archived_at,
+                    duplicate_of = excluded.duplicate_of
+                """,
+                sessions,
+            )
+            cur.executemany(
+                """
+                DELETE FROM embedding_jobs job
+                USING events event
+                WHERE job.event_id = event.id
+                  AND event.session_id = %(id)s
+                """,
+                sessions,
+            )
+
     def push_batch(
         self,
         sessions: list[dict[str, Any]],
         events: list[dict[str, Any]],
         embedding_jobs: list[dict[str, Any]],
     ) -> None:
-        """Atomically initialize schema and mirror one idempotent outbox batch."""
+        """Atomically mirror one batch after ``ensure_schema`` succeeds."""
         with self._cursor() as cur:
-            self._ensure_schema(cur)
             if sessions:
                 cur.executemany(
                     """
@@ -247,7 +345,11 @@ class RemoteStore:
                 cur.executemany(
                     """
                     INSERT INTO embedding_jobs (event_id, provider, model, content_hash)
-                    VALUES (%(event_id)s, %(provider)s, %(model)s, %(content_hash)s)
+                    SELECT %(event_id)s, %(provider)s, %(model)s, %(content_hash)s
+                    FROM events event
+                    JOIN sessions session ON session.id = event.session_id
+                    WHERE event.id = %(event_id)s
+                      AND (to_jsonb(session)->>'archived_at') IS NULL
                     ON CONFLICT (event_id, provider, model, content_hash) DO UPDATE
                     SET attempt_count = 0,
                         next_attempt_at = now(),
@@ -320,7 +422,11 @@ class RemoteStore:
             cur.executemany(
                 """
                 INSERT INTO embedding_jobs (event_id, provider, model, content_hash)
-                VALUES (%(event_id)s, %(provider)s, %(model)s, %(content_hash)s)
+                SELECT %(event_id)s, %(provider)s, %(model)s, %(content_hash)s
+                FROM events event
+                JOIN sessions session ON session.id = event.session_id
+                WHERE event.id = %(event_id)s
+                  AND (to_jsonb(session)->>'archived_at') IS NULL
                 ON CONFLICT (event_id, provider, model, content_hash) DO NOTHING
                 """,
                 rows,
@@ -338,7 +444,9 @@ class RemoteStore:
                 INSERT INTO embedding_jobs (event_id, provider, model, content_hash)
                 SELECT e.id, %(provider)s, %(model)s, md5(e.content)
                 FROM events e
+                JOIN sessions s ON s.id = e.session_id
                 WHERE e.role IN ('user', 'assistant')
+                  AND (to_jsonb(s)->>'archived_at') IS NULL
                   AND NOT EXISTS (
                       SELECT 1 FROM event_embeddings ee
                       WHERE ee.event_id = e.id
@@ -370,8 +478,10 @@ class RemoteStore:
                        e.role, e.content
                 FROM embedding_jobs j
                 JOIN events e ON e.id = j.event_id
+                JOIN sessions s ON s.id = e.session_id
                 WHERE j.provider = %(provider)s
                   AND j.model = %(model)s
+                  AND (to_jsonb(s)->>'archived_at') IS NULL
                   AND j.dead_lettered_at IS NULL
                   AND j.next_attempt_at <= now()
                 ORDER BY j.next_attempt_at
@@ -491,26 +601,51 @@ class RemoteStore:
 
     def embedding_status(self) -> dict[str, Any]:
         with self._cursor() as cur:
-            done = cur.execute("SELECT count(*) FROM event_embeddings").fetchone()
+            done = cur.execute(
+                """
+                SELECT count(DISTINCT embedding.event_id)
+                FROM event_embeddings embedding
+                JOIN events event ON event.id = embedding.event_id
+                JOIN sessions session ON session.id = event.session_id
+                WHERE (to_jsonb(session)->>'archived_at') IS NULL
+                """
+            ).fetchone()
             due = cur.execute(
                 "SELECT count(*) FROM embedding_jobs job "
                 "WHERE dead_lettered_at IS NULL AND next_attempt_at <= now() "
-                "AND EXISTS (SELECT 1 FROM events event WHERE event.id = job.event_id)"
+                "AND EXISTS (SELECT 1 FROM events event "
+                "JOIN sessions session ON session.id = event.session_id "
+                "WHERE event.id = job.event_id "
+                "AND (to_jsonb(session)->>'archived_at') IS NULL)"
             ).fetchone()
             retry = cur.execute(
                 "SELECT count(*) FROM embedding_jobs job "
                 "WHERE dead_lettered_at IS NULL AND next_attempt_at > now() "
-                "AND EXISTS (SELECT 1 FROM events event WHERE event.id = job.event_id)"
+                "AND EXISTS (SELECT 1 FROM events event "
+                "JOIN sessions session ON session.id = event.session_id "
+                "WHERE event.id = job.event_id "
+                "AND (to_jsonb(session)->>'archived_at') IS NULL)"
             ).fetchone()
             dead = cur.execute(
-                "SELECT count(*) FROM embedding_jobs WHERE dead_lettered_at IS NOT NULL"
+                "SELECT count(*) FROM embedding_jobs job "
+                "WHERE dead_lettered_at IS NOT NULL "
+                "AND EXISTS (SELECT 1 FROM events event "
+                "JOIN sessions session ON session.id = event.session_id "
+                "WHERE event.id = job.event_id "
+                "AND (to_jsonb(session)->>'archived_at') IS NULL)"
             ).fetchone()
             failure = cur.execute(
                 """
-                SELECT event_id, last_error, last_attempt_at
-                FROM embedding_jobs
-                WHERE last_error IS NOT NULL
-                ORDER BY last_attempt_at DESC NULLS LAST
+                SELECT job.event_id, job.last_error, job.last_attempt_at
+                FROM embedding_jobs job
+                WHERE job.last_error IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM events event
+                      JOIN sessions session ON session.id = event.session_id
+                      WHERE event.id = job.event_id
+                        AND (to_jsonb(session)->>'archived_at') IS NULL
+                  )
+                ORDER BY job.last_attempt_at DESC NULLS LAST
                 LIMIT 1
                 """
             ).fetchone()
@@ -537,7 +672,10 @@ class RemoteStore:
                     dead_lettered_at = NULL
                 WHERE dead_lettered_at IS NOT NULL
                   AND EXISTS (
-                      SELECT 1 FROM events event WHERE event.id = job.event_id
+                      SELECT 1 FROM events event
+                      JOIN sessions session ON session.id = event.session_id
+                      WHERE event.id = job.event_id
+                        AND (to_jsonb(session)->>'archived_at') IS NULL
                   )
                 """
             )
@@ -548,6 +686,38 @@ class RemoteStore:
     def ping(self) -> None:
         with self._read_cursor() as cur:
             cur.execute("SELECT 1")
+
+    def archives_converged(self, sessions: Sequence[ArchivedSession]) -> bool:
+        """Check local tombstones against remote state without mutating either store."""
+        if not sessions:
+            return True
+        with self._read_cursor() as cur:
+            row = cur.execute(
+                """
+                WITH requested AS (
+                    SELECT *
+                    FROM unnest(
+                        %(session_ids)s::text[],
+                        %(archived_at)s::text[],
+                        %(duplicate_of)s::text[]
+                    ) AS request(session_id, archived_at, duplicate_of)
+                )
+                SELECT count(*) = 0 AS converged
+                FROM requested request
+                LEFT JOIN sessions session ON session.id = request.session_id
+                WHERE session.id IS NULL
+                   OR (to_jsonb(session)->>'archived_at')
+                        IS DISTINCT FROM request.archived_at
+                   OR (to_jsonb(session)->>'duplicate_of')
+                        IS DISTINCT FROM request.duplicate_of
+                """,
+                {
+                    "session_ids": [session["id"] for session in sessions],
+                    "archived_at": [session["archived_at"] for session in sessions],
+                    "duplicate_of": [session["duplicate_of"] for session in sessions],
+                },
+            ).fetchone()
+        return bool(row and row["converged"])
 
     def sample_events(
         self, limit: int = 20, mode: str = "lexical"
@@ -570,8 +740,10 @@ class RemoteStore:
                 f"""
                 SELECT DISTINCT e.id, e.content, e.created_at
                 FROM events e
+                JOIN sessions s ON s.id = e.session_id
                 {embedding_join}
                 WHERE e.role IN ('user', 'assistant') AND length(e.content) > 30
+                  AND (to_jsonb(s)->>'archived_at') IS NULL
                 ORDER BY e.created_at DESC, e.id
                 LIMIT %(limit)s
                 """,
@@ -620,6 +792,7 @@ class RemoteStore:
                 JOIN sessions s ON s.id = e.session_id
                 LEFT JOIN recalls r ON r.event_id = e.id
                 WHERE e.content ILIKE %(pattern)s ESCAPE E'\\\\'
+                  AND (to_jsonb(s)->>'archived_at') IS NULL
                 ORDER BY e.created_at DESC, e.id
                 LIMIT %(limit)s
                 """,
@@ -663,6 +836,7 @@ class RemoteStore:
                 JOIN events e ON e.id = ee.event_id
                 JOIN sessions s ON s.id = e.session_id
                 LEFT JOIN recalls r ON r.event_id = e.id
+                WHERE (to_jsonb(s)->>'archived_at') IS NULL
                 ORDER BY ee.embedding <=> %(vec)s::vector, e.id
                 LIMIT %(limit)s
                 """,
@@ -704,39 +878,33 @@ class RemoteStore:
 
         For each hit, add `adjacent`: a contiguous conversational window around
         the hit in the same session (hit itself excluded), in stable
-        (created_at, id) order. All hit sessions are fetched in one batched
-        query and grouped in Python to avoid N+1. This lets an LLM consumer
-        see the surrounding thread in one recall call, not a separate graph
-        query.
+        `(created_at, id)` order. Candidate reads are bounded per hit and share
+        one read-only snapshot. Session edges backfill from the available side.
         """
+        validate_neighbor_limit(per_hit)
         if not hits:
             return hits
-        session_ids = sorted({str(h.get("session_id")) for h in hits if h.get("session_id")})
-        by_session: dict[str, list[dict[str, Any]]] = {}
-        with self._cursor() as cur:
-            rows = cur.execute(
-                "SELECT e.id, e.session_id, e.role, e.content "
-                "FROM events e WHERE e.session_id = ANY(%s) "
-                "ORDER BY e.session_id, e.created_at, e.id",
-                (session_ids,),
-            ).fetchall()
-            for row in rows:
-                by_session.setdefault(str(row["session_id"]), []).append(dict(row))
-
-        before = per_hit // 2
-        after = per_hit - before
-        for hit in hits:
-            sid = str(hit.get("session_id") or "")
-            events = by_session.get(sid, [])
-            index = next((i for i, e in enumerate(events) if e["id"] == hit.get("id")), None)
-            if index is None:
-                hit["adjacent"] = []
+        requests = [
+            (str(hit.get("id") or ""), str(hit.get("session_id") or ""))
+            for hit in hits
+        ]
+        with self._read_cursor() as cur:
+            results = load_remote_event_neighbors(cur, requests, per_hit)
+        adjacent_by_hit: list[list[dict[str, Any]]] = []
+        for request_index in range(len(hits)):
+            result = results.get(request_index)
+            if result is None:
+                adjacent_by_hit.append([])
                 continue
-            window = events[max(0, index - before):index] + events[index + 1:index + 1 + after]
-            hit["adjacent"] = [
-                {"role": e["role"], "content": str(e["content"])[:500]}
-                for e in window
-            ]
+            _, neighbors = result
+            adjacent_by_hit.append(
+                [
+                    {"role": row["role"], "content": str(row["content"])[:500]}
+                    for row in neighbors
+                ]
+            )
+        for hit, adjacent in zip(hits, adjacent_by_hit):
+            hit["adjacent"] = adjacent
         return hits
 
     def graph(self, event_id: str, limit: int = 5) -> dict[str, Any]:
@@ -748,23 +916,19 @@ class RemoteStore:
         meaning-similar events. No separate semantic pass here (it would just
         duplicate recall_semantic).
         """
-        with self._cursor() as cur:
-            row = cur.execute(
-                "SELECT e.id, e.session_id, e.role, e.content, e.created_at, s.agent "
-                "FROM events e JOIN sessions s ON s.id = e.session_id WHERE e.id = %s",
-                (event_id,),
-            ).fetchone()
-            if row is None:
-                return {"event_id": event_id, "found": False, "neighbors": []}
-            sid = row["session_id"]
-            same = cur.execute(
-                "SELECT e.id, e.role, e.content FROM events e "
-                "WHERE e.session_id = %s AND e.id <> %s ORDER BY e.created_at LIMIT %s",
-                (sid, event_id, limit),
-            ).fetchall()
+        validate_neighbor_limit(limit)
+        with self._read_cursor() as cur:
+            result = load_remote_event_neighbors(cur, [(event_id, None)], limit).get(0)
+        if result is None:
+            return {"event_id": event_id, "found": False, "same_session": []}
+        event, neighbors = result
         return {
             "event_id": event_id,
             "found": True,
-            "event": {"id": row["id"], "role": row["role"], "content": str(row["content"])[:200]},
-            "same_session": [dict(r) for r in same],
+            "event": {
+                "id": event["id"],
+                "role": event["role"],
+                "content": str(event["content"])[:200],
+            },
+            "same_session": neighbors,
         }

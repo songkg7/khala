@@ -63,6 +63,7 @@ khala status                     # backlog/retry/dead-letter + worker health
 khala start --agent <name>       # start a session, returns session_id
 khala record <sid> <role> [txt]  # add a user/assistant/system/tool event
 khala recall <query> [--limit] [--mode lexical|semantic|hybrid]
+khala graph <event-id> [--limit]  # centered same-session context
 khala replay <sid>               # dump a session's events
 khala ingest --agent <a> [--adapter M:C]   # bulk import (stdin JSONL by default)
 khala sync [--adapter hermes|codex] [--session-id X] [--name/--email]
@@ -107,6 +108,10 @@ khala recall "how do I sync agent sessions" --mode hybrid     # RRF fusion (defa
   detached-worker state. Early detached-process failures are captured in the
   private `.khala-worker.log` beside the local DB. `khala remote-worker` exits
   nonzero on worker failure.
+- `khala graph` and `khala recall --graph` order context canonically by
+  `(created_at, id)`, center it around each hit, and backfill at session edges.
+  Neighbor snippets are capped at 500 characters. Remote graph reads use one
+  repeatable-read, read-only snapshot and batch all recall hits in one query.
 
 ### OpenRouter API key
 
@@ -127,6 +132,12 @@ Vendor data is converted by adapters (`khala/adapters/<vendor>.py`) into a
 vendor-neutral form — `{role, content, created_at}` plus session-level
 user identity. No vendor-specific message IDs or raw content-block JSON are
 stored; the vendor's internal id is used only as a sync watermark.
+
+Legacy duplicate sessions are quarantined locally. The worker mirrors only a
+content-free archive tombstone (`session id`, archive time, canonical id), and
+remote recall, graph, sampling, and embedding work exclude those sessions.
+Upgrade indexes on existing remote event tables are built concurrently so the
+first upgraded worker does not block normal event writes.
 
 `khala compat-check` verifies an imported session carries the canonical schema
 and a resolvable user identity.

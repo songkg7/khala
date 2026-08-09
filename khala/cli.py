@@ -139,6 +139,16 @@ def _remote_dsn() -> str | None:
     return get_remote_dsn()
 
 
+def _converged_remote(store: Store, dsn: str) -> Any:
+    """Migrate remote schema and mirror local tombstones before product reads."""
+    from khala.remote import RemoteStore
+
+    remote = RemoteStore(dsn)
+    remote.ensure_schema()
+    remote.archive_sessions(store.archived_sessions())
+    return remote
+
+
 def output(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2))
 
@@ -194,13 +204,14 @@ def main(argv: list[str] | None = None) -> int:
 
             dsn = get_remote_dsn()
             if dsn:
-                from khala.remote import RemoteStore, recall_by_mode
+                from khala.remote import recall_by_mode
 
+                remote = _converged_remote(store, dsn)
                 results = recall_by_mode(
-                    RemoteStore(dsn), args.query, mode=args.mode, limit=args.limit
+                    remote, args.query, mode=args.mode, limit=args.limit
                 )
                 if args.graph:
-                    results = RemoteStore(dsn).attach_neighbors(results)
+                    results = remote.attach_neighbors(results)
             else:
                 results = store.recall(args.query, args.limit)
                 if args.graph:
@@ -209,11 +220,11 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "replay":
             output(store.replay(args.session_id))
         elif args.command == "graph":
+            if args.limit < 1:
+                raise ValueError("limit must be positive")
             dsn = _remote_dsn()
             if dsn:
-                from khala.remote import RemoteStore
-
-                output(RemoteStore(dsn).graph(args.event_id, args.limit))
+                output(_converged_remote(store, dsn).graph(args.event_id, args.limit))
             else:
                 output(store.graph(args.event_id, args.limit))
         elif args.command == "ingest":
@@ -377,14 +388,12 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "embed":
             from khala.config import get_remote_dsn
             from khala.embeddings import api_key_set
-            from khala.remote import RemoteStore
 
             dsn = get_remote_dsn()
             if not dsn:
                 output({"error": "not connected — connect to a remote first"})
                 return 0
-            remote = RemoteStore(dsn)
-            remote.ensure_schema()
+            remote = _converged_remote(store, dsn)
             if args.embed_action == "status":
                 output(remote.embedding_status())
             elif args.embed_action == "pending":
@@ -425,6 +434,7 @@ def main(argv: list[str] | None = None) -> int:
         ImportError,
         AttributeError,
         OSError,
+        RuntimeError,
         sqlite3.Error,
         TypeError,
         ValueError,

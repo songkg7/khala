@@ -49,6 +49,21 @@ class KhalaCLIIntegrationTest(unittest.TestCase):
             sys.stdout = prev_out
             sys.stderr = prev_err
 
+    def _seed_archived_session(self):
+        from khala.store import Store
+
+        store = Store(Path(self.db))
+        try:
+            session_id = store.add_session("legacy")
+            store.db.execute(
+                "UPDATE sessions SET archived_at = ?, duplicate_of = ? WHERE id = ?",
+                ("2026-01-01T00:00:00+00:00", "canonical", session_id),
+            )
+            store.db.commit()
+            return store.archived_sessions()
+        finally:
+            store.close()
+
     def test_status_empty(self):
         code, out, _ = self._run("status")
         self.assertEqual(code, 0)
@@ -81,6 +96,102 @@ class KhalaCLIIntegrationTest(unittest.TestCase):
         code, _, err = self._run("recall", "x", "--limit", "-1")
         self.assertEqual(code, 2)
         self.assertIn("limit must be positive", err)
+
+    def test_graph_with_negative_limit(self):
+        code, _, err = self._run("graph", "event", "--limit", "-1")
+        self.assertEqual(code, 2)
+        self.assertIn("limit must be positive", err)
+
+    def test_remote_recall_and_graph_converge_archives_before_same_instance_read(self):
+        tombstones = self._seed_archived_session()
+        self.config.save_config(
+            {"workspaces": [], "remote": "postgresql://example.invalid/khala"}
+        )
+
+        for command in (("recall", "needle"), ("graph", "event-1")):
+            with self.subTest(command=command):
+                calls = []
+                with patch("khala.remote.RemoteStore") as remote_store, patch(
+                    "khala.remote.recall_by_mode"
+                ) as recall_by_mode:
+                    remote = remote_store.return_value
+                    remote.ensure_schema.side_effect = lambda: calls.append("schema")
+                    remote.archive_sessions.side_effect = (
+                        lambda sessions: calls.append(("archive", sessions))
+                    )
+                    recall_by_mode.side_effect = lambda *args, **kwargs: (
+                        calls.append(("recall", args[0])) or []
+                    )
+                    remote.graph.side_effect = lambda *args, **kwargs: (
+                        calls.append(("graph", remote)) or {"found": False}
+                    )
+
+                    code, _, error = self._run(*command)
+
+                self.assertEqual(code, 0, error)
+                self.assertEqual(calls[0], "schema")
+                self.assertEqual(calls[1], ("archive", tombstones))
+                self.assertEqual(calls[2][0], command[0])
+                self.assertIs(calls[2][1], remote)
+                remote_store.assert_called_once_with(
+                    "postgresql://example.invalid/khala"
+                )
+
+    def test_remote_read_stops_when_archive_convergence_fails(self):
+        self._seed_archived_session()
+        self.config.save_config(
+            {"workspaces": [], "remote": "postgresql://example.invalid/khala"}
+        )
+
+        for command in (("recall", "needle"), ("graph", "event-1")):
+            with self.subTest(command=command), patch(
+                "khala.remote.RemoteStore"
+            ) as remote_store, patch("khala.remote.recall_by_mode") as recall_by_mode:
+                remote = remote_store.return_value
+                remote.archive_sessions.side_effect = RuntimeError(
+                    "archive convergence failed"
+                )
+
+                code, output_text, error = self._run(*command)
+
+                self.assertEqual(code, 2)
+                self.assertEqual(output_text, "")
+                self.assertIn("archive convergence failed", error)
+                recall_by_mode.assert_not_called()
+                remote.graph.assert_not_called()
+
+    def test_embedding_commands_converge_archives_before_remote_work(self):
+        tombstones = self._seed_archived_session()
+        self.config.save_config(
+            {"workspaces": [], "remote": "postgresql://example.invalid/khala"}
+        )
+
+        cases = (
+            ("status", "embedding_status", {}),
+            ("pending", "enqueue_missing_embed_jobs", 1),
+            ("retry-dead", "requeue_dead_embed_jobs", 1),
+        )
+        for action, method_name, result in cases:
+            with self.subTest(action=action):
+                calls = []
+                with patch("khala.remote.RemoteStore") as remote_store, patch(
+                    "khala.embeddings.api_key_set", return_value=True
+                ), patch("khala.worker.spawn_worker"):
+                    remote = remote_store.return_value
+                    remote.ensure_schema.side_effect = lambda: calls.append("schema")
+                    remote.archive_sessions.side_effect = (
+                        lambda sessions: calls.append(("archive", sessions))
+                    )
+                    getattr(remote, method_name).side_effect = lambda: (
+                        calls.append(("work", remote)) or result
+                    )
+
+                    code, _, error = self._run("embed", action)
+
+                self.assertEqual(code, 0, error)
+                self.assertEqual(calls[:2], ["schema", ("archive", tombstones)])
+                self.assertEqual(calls[2][0], "work")
+                self.assertIs(calls[2][1], remote)
 
     def test_recall_graph_attaches_adjacent_context(self):
         code, out, _ = self._run("start", "--agent", "hermes")

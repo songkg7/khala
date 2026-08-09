@@ -117,6 +117,18 @@ class KhalaStoreTest(unittest.TestCase):
         g = self.store.graph("no-such-event")
         self.assertFalse(g["found"])
 
+    def test_graph_and_attach_bound_neighbor_content(self):
+        session = self.store.add_session("test")
+        hit_id = self.store.add_event(session, "user", "h" * 600)
+        self.store.add_event(session, "assistant", "n" * 600)
+
+        graph = self.store.graph(hit_id, limit=1)
+        attached = self.store.attach_neighbors([{"id": hit_id, "session_id": session}], per_hit=1)
+
+        self.assertEqual(len(graph["event"]["content"]), 200)
+        self.assertEqual(len(graph["same_session"][0]["content"]), 500)
+        self.assertEqual(len(attached[0]["adjacent"][0]["content"]), 500)
+
     def test_attach_neighbors_excludes_hit_and_centers_window(self):
         session = self.store.add_session("test")
         self.store.add_event(session, "system", "before-a")
@@ -139,6 +151,183 @@ class KhalaStoreTest(unittest.TestCase):
     def test_attach_neighbors_handles_missing_session(self):
         hits = [{"id": "x", "role": "user", "content": "alpha"}]
         self.assertEqual(self.store.attach_neighbors(hits)[0]["adjacent"], [])
+
+    def test_graph_and_attach_use_canonical_order_with_interleaved_rowids(self):
+        target_session = self.store.add_session("target")
+        other_session = self.store.add_session("other")
+        rows = [
+            ("target-z", target_session, "assistant", "tie-after", "2026-01-01T00:00:02Z"),
+            ("other-1", other_session, "user", "other one", "2026-01-01T00:00:00Z"),
+            ("target-before", target_session, "user", "before", "2026-01-01T00:00:01Z"),
+            ("target-after", target_session, "assistant", "after", "2026-01-01T00:00:03Z"),
+            ("other-2", other_session, "user", "other two", "2026-01-01T00:00:01Z"),
+            ("target-m", target_session, "user", "hit", "2026-01-01T00:00:02Z"),
+            ("other-3", other_session, "user", "other three", "2026-01-01T00:00:02Z"),
+            ("target-a", target_session, "assistant", "tie-before", "2026-01-01T00:00:02Z"),
+        ]
+        self.store.db.executemany(
+            """
+            INSERT INTO events(id, session_id, role, content, created_at, metadata)
+            VALUES (?, ?, ?, ?, ?, '{}')
+            """,
+            rows,
+        )
+        self.store.db.commit()
+
+        graph = self.store.graph("target-m", limit=4)
+        attached = self.store.attach_neighbors(
+            [{"id": "target-m", "session_id": target_session}], per_hit=4
+        )
+
+        expected_ids = ["target-before", "target-a", "target-z", "target-after"]
+        expected_content = ["before", "tie-before", "tie-after", "after"]
+        self.assertEqual([row["id"] for row in graph["same_session"]], expected_ids)
+        self.assertEqual([row["content"] for row in attached[0]["adjacent"]], expected_content)
+
+    def test_adjacency_keyset_queries_use_composite_index(self):
+        session = self.store.add_session("test")
+        event_ids = [
+            self.store.add_event(
+                session,
+                "user",
+                f"event-{index}",
+                created_at=f"2026-01-01T00:00:0{index}Z",
+            )
+            for index in range(3)
+        ]
+        statements: list[str] = []
+        self.store.db.set_trace_callback(statements.append)
+        try:
+            self.store.graph(event_ids[1], limit=2)
+        finally:
+            self.store.db.set_trace_callback(None)
+
+        keyset_queries = [
+            statement for statement in statements if "(event.created_at, event.id)" in statement
+        ]
+        self.assertEqual(len(keyset_queries), 2)
+        self.assertEqual(sum(" < " in query for query in keyset_queries), 1)
+        self.assertEqual(sum(" > " in query for query in keyset_queries), 1)
+        for query in keyset_queries:
+            with self.subTest(query=query):
+                plan = " ".join(
+                    str(row[3])
+                    for row in self.store.db.execute(f"EXPLAIN QUERY PLAN {query}").fetchall()
+                )
+                self.assertIn("USING INDEX events_session_created_id", plan)
+                self.assertIn("created_at", plan)
+
+    def test_graph_and_attach_backfill_boundaries_to_exact_limit(self):
+        session = self.store.add_session("test")
+        event_ids = [
+            self.store.add_event(
+                session,
+                "user",
+                f"event-{index}",
+                created_at=f"2026-01-01T00:00:0{index}Z",
+            )
+            for index in range(5)
+        ]
+        content_by_id = {event_id: f"event-{index}" for index, event_id in enumerate(event_ids)}
+        cases = (
+            (event_ids[0], event_ids[1:4]),
+            (event_ids[-1], event_ids[1:4]),
+        )
+
+        for hit_id, expected_ids in cases:
+            with self.subTest(hit_id=hit_id):
+                graph = self.store.graph(hit_id, limit=3)
+                attached = self.store.attach_neighbors(
+                    [{"id": hit_id, "session_id": session}], per_hit=3
+                )
+                graph_ids = [row["id"] for row in graph["same_session"]]
+                attached_content = [row["content"] for row in attached[0]["adjacent"]]
+
+                self.assertEqual(graph_ids, expected_ids)
+                self.assertEqual(len(attached_content), 3)
+                self.assertEqual(
+                    attached_content,
+                    [content_by_id[event_id] for event_id in expected_ids],
+                )
+
+    def test_attach_neighbors_rejects_spoofed_session_id(self):
+        actual_session = self.store.add_session("actual")
+        spoofed_session = self.store.add_session("spoofed")
+        hit_id = self.store.add_event(actual_session, "user", "private hit")
+        self.store.add_event(spoofed_session, "user", "spoofed before")
+        self.store.add_event(spoofed_session, "assistant", "spoofed after")
+
+        attached = self.store.attach_neighbors(
+            [{"id": hit_id, "session_id": spoofed_session}], per_hit=3
+        )
+
+        self.assertEqual(attached[0]["adjacent"], [])
+
+    def test_graph_and_attach_exclude_archived_sessions(self):
+        session = self.store.add_session("archived")
+        hit_id = self.store.add_event(session, "user", "private hit")
+        self.store.add_event(session, "assistant", "private neighbor")
+        self.store.db.execute(
+            "UPDATE sessions SET archived_at = ? WHERE id = ?",
+            ("2026-01-01T00:00:00Z", session),
+        )
+        self.store.db.commit()
+
+        graph = self.store.graph(hit_id)
+        attached = self.store.attach_neighbors([{"id": hit_id, "session_id": session}])
+
+        self.assertFalse(graph["found"])
+        self.assertEqual(attached[0]["adjacent"], [])
+
+    def test_archived_sessions_returns_sorted_content_free_tombstones(self):
+        active = self.store.add_session("active")
+        duplicate = self.store.add_session("duplicate")
+        archived = self.store.add_session("archived")
+        self.store.db.executemany(
+            """
+            UPDATE sessions
+            SET archived_at = ?, duplicate_of = ?
+            WHERE id = ?
+            """,
+            [
+                ("2026-01-02T00:00:00+00:00", active, duplicate),
+                ("2026-01-01T00:00:00+00:00", None, archived),
+            ],
+        )
+        self.store.db.commit()
+
+        tombstones = self.store.archived_sessions()
+
+        self.assertEqual(
+            tombstones,
+            sorted(
+                [
+                    {
+                        "id": duplicate,
+                        "archived_at": "2026-01-02T00:00:00+00:00",
+                        "duplicate_of": active,
+                    },
+                    {
+                        "id": archived,
+                        "archived_at": "2026-01-01T00:00:00+00:00",
+                        "duplicate_of": None,
+                    },
+                ],
+                key=lambda row: row["id"],
+            ),
+        )
+        self.assertTrue(
+            all(set(row) == {"id", "archived_at", "duplicate_of"} for row in tombstones)
+        )
+
+    def test_graph_and_attach_reject_nonpositive_limits_before_lookup(self):
+        for limit in (0, -1):
+            with self.subTest(limit=limit, operation="graph"):
+                with self.assertRaises(ValueError):
+                    self.store.graph("no-such-event", limit=limit)
+            with self.subTest(limit=limit, operation="attach"):
+                with self.assertRaises(ValueError):
+                    self.store.attach_neighbors([], per_hit=limit)
 
     def test_import_events_valid(self):
         events = [
@@ -301,12 +490,9 @@ class KhalaStoreTest(unittest.TestCase):
         migrated = Store(legacy_path)
         try:
             columns = {
-                str(row[1])
-                for row in migrated.db.execute("PRAGMA table_info(remote_outbox)")
+                str(row[1]) for row in migrated.db.execute("PRAGMA table_info(remote_outbox)")
             }
-            self.assertTrue(
-                {"last_attempt_at", "dead_lettered_at", "lease_owner"} <= columns
-            )
+            self.assertTrue({"last_attempt_at", "dead_lettered_at", "lease_owner"} <= columns)
             self.assertIsNotNone(
                 migrated.db.execute(
                     """
@@ -355,7 +541,9 @@ class KhalaRedactTest(unittest.TestCase):
         self.assertIn("password=[REDACTED]", result)
 
     def test_no_false_positive_on_url(self):
-        self.assertEqual(redact("https://example.com/api_key=test"), redact("https://example.com/api_key=test"))
+        self.assertEqual(
+            redact("https://example.com/api_key=test"), redact("https://example.com/api_key=test")
+        )
 
     def test_uri_password(self):
         result = redact("failed postgresql://alice:uri-secret@db.example/khala")

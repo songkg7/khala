@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, call, patch
 from khala.embeddings import MODEL, PROVIDER
 from khala.remote import RemoteStore, recall_by_mode, search_by_mode
 
+READ_ONLY_TRANSACTION = "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+
 
 class RemoteSearchTest(unittest.TestCase):
     @staticmethod
@@ -18,6 +20,35 @@ class RemoteSearchTest(unittest.TestCase):
         connection.cursor.return_value.__enter__.return_value = cursor
         cursor.execute.return_value.fetchall.return_value = list(rows or [])
         return connection, cursor
+
+    @staticmethod
+    def _neighbor_query_row(
+        *,
+        request_index: int = 1,
+        anchor_id: str,
+        anchor_session_id: str = "session-1",
+        anchor_content: str,
+        anchor_created_at: str,
+        neighbor_id: str,
+        neighbor_content: str,
+        neighbor_created_at: str,
+        side: str,
+        neighbor_role: str = "user",
+    ) -> dict[str, object]:
+        return {
+            "request_index": request_index,
+            "anchor_id": anchor_id,
+            "anchor_session_id": anchor_session_id,
+            "anchor_role": "user",
+            "anchor_content": anchor_content,
+            "anchor_created_at": anchor_created_at,
+            "anchor_agent": "test",
+            "neighbor_id": neighbor_id,
+            "neighbor_role": neighbor_role,
+            "neighbor_content": neighbor_content,
+            "neighbor_created_at": neighbor_created_at,
+            "neighbor_side": side,
+        }
 
     def test_lexical_search_uses_read_only_transaction_without_recording(self) -> None:
         row = {
@@ -35,9 +66,12 @@ class RemoteSearchTest(unittest.TestCase):
             result = store.search_lexical("deploy", limit=3)
 
         self.assertEqual(result, [row])
-        self.assertEqual(cursor.execute.call_args_list[0], call("SET TRANSACTION READ ONLY"))
+        self.assertEqual(cursor.execute.call_args_list[0], call(READ_ONLY_TRANSACTION))
         select_call = cursor.execute.call_args_list[1]
-        self.assertIn("FROM events e", str(select_call.args[0]))
+        statement = str(select_call.args[0])
+        self.assertIn("FROM events e", statement)
+        self.assertIn("JOIN sessions s ON s.id = e.session_id", statement)
+        self.assertIn("(to_jsonb(s)->>'archived_at') IS NULL", statement)
         self.assertEqual(select_call.args[1], {"pattern": "%deploy%", "limit": 3})
         record_recalls.assert_not_called()
         connection.rollback.assert_called_once_with()
@@ -174,12 +208,14 @@ class RemoteSearchTest(unittest.TestCase):
             result = store.search_semantic("deploy", limit=3)
 
         self.assertEqual(result, [row])
-        self.assertEqual(cursor.execute.call_args_list[0], call("SET TRANSACTION READ ONLY"))
+        self.assertEqual(cursor.execute.call_args_list[0], call(READ_ONLY_TRANSACTION))
         select_call = cursor.execute.call_args_list[1]
         statement = str(select_call.args[0])
         self.assertIn("SELECT DISTINCT ON (ee.event_id)", statement)
         self.assertIn("ee.provider = %(provider)s", statement)
         self.assertLess(statement.index("DISTINCT ON"), statement.index("LIMIT"))
+        self.assertIn("JOIN sessions s ON s.id = e.session_id", statement)
+        self.assertIn("(to_jsonb(s)->>'archived_at') IS NULL", statement)
         self.assertIn("ORDER BY ee.embedding <=> %(vec)s::vector, e.id", statement)
         self.assertEqual(select_call.args[1]["limit"], 3)
         self.assertEqual(select_call.args[1]["provider"], PROVIDER)
@@ -237,15 +273,15 @@ class RemoteSearchTest(unittest.TestCase):
                     result = store.sample_events(limit=7, mode=mode)
 
                 self.assertEqual(result, [row])
-                self.assertEqual(
-                    cursor.execute.call_args_list[0], call("SET TRANSACTION READ ONLY")
-                )
+                self.assertEqual(cursor.execute.call_args_list[0], call(READ_ONLY_TRANSACTION))
                 select_call = cursor.execute.call_args_list[1]
                 statement = str(select_call.args[0])
                 parameters = select_call.args[1]
                 self.assertIn("JOIN event_embeddings ee ON ee.event_id = e.id", statement)
                 self.assertIn("ee.provider = %(provider)s", statement)
                 self.assertIn("ee.model = %(model)s", statement)
+                self.assertIn("JOIN sessions s ON s.id = e.session_id", statement)
+                self.assertIn("(to_jsonb(s)->>'archived_at') IS NULL", statement)
                 self.assertIn("LIMIT %(limit)s", statement)
                 self.assertEqual(
                     parameters,
@@ -254,6 +290,20 @@ class RemoteSearchTest(unittest.TestCase):
                 connection.rollback.assert_called_once_with()
                 connection.commit.assert_not_called()
 
+    def test_lexical_sampling_excludes_archived_sessions(self) -> None:
+        connection, cursor = self._connection()
+        store = RemoteStore("postgresql://example/db")
+
+        with patch("khala.remote.psycopg.connect", return_value=connection):
+            result = store.sample_events(limit=7, mode="lexical")
+
+        self.assertEqual(result, [])
+        select_call = cursor.execute.call_args_list[1]
+        statement = str(select_call.args[0])
+        self.assertIn("JOIN sessions s ON s.id = e.session_id", statement)
+        self.assertIn("(to_jsonb(s)->>'archived_at') IS NULL", statement)
+        self.assertEqual(select_call.args[1], {"limit": 7})
+
     def test_invalid_sample_options_fail_before_connecting(self) -> None:
         store = RemoteStore("postgresql://example/db")
         with patch("khala.remote.psycopg.connect") as connect:
@@ -261,6 +311,189 @@ class RemoteSearchTest(unittest.TestCase):
                 store.sample_events(limit=0)
             with self.assertRaisesRegex(ValueError, "unsupported recall mode"):
                 store.sample_events(mode="unknown")
+
+        connect.assert_not_called()
+
+    def test_graph_uses_read_only_transaction(self) -> None:
+        neighbors = [
+            {"id": "event-1", "role": "user", "content": "before"},
+            {"id": "event-3", "role": "assistant", "content": "after"},
+        ]
+        rows = [
+            self._neighbor_query_row(
+                anchor_id="event-2",
+                anchor_content="hit",
+                anchor_created_at="2026-01-01T00:00:02Z",
+                neighbor_id="event-1",
+                neighbor_content="before",
+                neighbor_created_at="2026-01-01T00:00:01Z",
+                side="before",
+            ),
+            self._neighbor_query_row(
+                anchor_id="event-2",
+                anchor_content="hit",
+                anchor_created_at="2026-01-01T00:00:02Z",
+                neighbor_id="event-3",
+                neighbor_content="after",
+                neighbor_created_at="2026-01-01T00:00:03Z",
+                side="after",
+                neighbor_role="assistant",
+            ),
+        ]
+        connection, cursor = self._connection(rows)
+        store = RemoteStore("postgresql://example/db")
+
+        with patch("khala.remote.psycopg.connect", return_value=connection):
+            result = store.graph("event-2", limit=2)
+
+        self.assertTrue(result["found"])
+        self.assertEqual(result["same_session"], neighbors)
+        self.assertEqual(cursor.execute.call_args_list[0], call(READ_ONLY_TRANSACTION))
+        neighbor_statement = str(cursor.execute.call_args_list[1].args[0])
+        self.assertIn("JOIN sessions session ON session.id = event.session_id", neighbor_statement)
+        self.assertIn(
+            "(to_jsonb(session)->>'archived_at') IS NULL",
+            neighbor_statement,
+        )
+        connection.rollback.assert_called_once_with()
+        connection.commit.assert_not_called()
+
+    def test_attach_neighbors_uses_read_only_transaction_and_backfills_boundary(self) -> None:
+        rows = [
+            self._neighbor_query_row(
+                anchor_id="event-0",
+                anchor_content="content-0",
+                anchor_created_at="2026-01-01T00:00:00Z",
+                neighbor_id=f"event-{index}",
+                neighbor_content=f"content-{index}",
+                neighbor_created_at=f"2026-01-01T00:00:0{index}Z",
+                side="after",
+            )
+            for index in range(1, 4)
+        ]
+        connection, cursor = self._connection(rows)
+        store = RemoteStore("postgresql://example/db")
+
+        with patch("khala.remote.psycopg.connect", return_value=connection):
+            result = store.attach_neighbors(
+                [{"id": "event-0", "session_id": "session-1"}], per_hit=3
+            )
+
+        self.assertEqual(
+            [row["content"] for row in result[0]["adjacent"]],
+            ["content-1", "content-2", "content-3"],
+        )
+        self.assertEqual(cursor.execute.call_args_list[0], call(READ_ONLY_TRANSACTION))
+        connection.rollback.assert_called_once_with()
+        connection.commit.assert_not_called()
+
+    def test_attach_neighbors_batches_hits_by_ordinality_and_preserves_input_order(self) -> None:
+        first_window = [
+            self._neighbor_query_row(
+                request_index=1,
+                anchor_id="event-0",
+                anchor_content="content-0",
+                anchor_created_at="2026-01-01T00:00:00Z",
+                neighbor_id=f"event-{index}",
+                neighbor_content=f"content-{index}",
+                neighbor_created_at=f"2026-01-01T00:00:0{index}Z",
+                side="after",
+            )
+            for index in range(1, 4)
+        ]
+        second_window = [
+            self._neighbor_query_row(
+                request_index=2,
+                anchor_id="other-2",
+                anchor_session_id="session-2",
+                anchor_content="other two",
+                anchor_created_at="2026-01-01T00:00:01Z",
+                neighbor_id="other-1",
+                neighbor_content="other one",
+                neighbor_created_at="2026-01-01T00:00:00Z",
+                side="before",
+            ),
+            self._neighbor_query_row(
+                request_index=2,
+                anchor_id="other-2",
+                anchor_session_id="session-2",
+                anchor_content="other two",
+                anchor_created_at="2026-01-01T00:00:01Z",
+                neighbor_id="other-3",
+                neighbor_content="other three",
+                neighbor_created_at="2026-01-01T00:00:02Z",
+                side="after",
+            ),
+        ]
+        duplicate_window = [
+            {
+                **row,
+                "request_index": 3,
+            }
+            for row in first_window
+        ]
+        connection, cursor = self._connection(first_window + second_window + duplicate_window)
+        store = RemoteStore("postgresql://example/db")
+        hits = [
+            {"id": "event-0", "session_id": "session-1"},
+            {"id": "other-2", "session_id": "session-2"},
+            {"id": "event-0", "session_id": "session-1"},
+            {"id": "event-0", "session_id": "session-2"},
+            {"id": "missing", "session_id": "session-1"},
+        ]
+
+        with patch("khala.remote.psycopg.connect", return_value=connection):
+            result = store.attach_neighbors(hits, per_hit=3)
+
+        self.assertEqual(
+            [[row["content"] for row in hit["adjacent"]] for hit in result],
+            [
+                ["content-1", "content-2", "content-3"],
+                ["other one", "other three"],
+                ["content-1", "content-2", "content-3"],
+                [],
+                [],
+            ],
+        )
+        self.assertEqual(len(cursor.execute.call_args_list), 2)
+        neighbor_query = cursor.execute.call_args_list[1]
+        neighbor_statement = str(neighbor_query.args[0])
+        self.assertIn("left(event.content, 200)", neighbor_statement)
+        self.assertEqual(neighbor_statement.count("left(event.content, 500)"), 2)
+        self.assertEqual(
+            neighbor_query.args[1]["event_ids"],
+            ["event-0", "other-2", "event-0", "event-0", "missing"],
+        )
+        self.assertEqual(
+            neighbor_query.args[1]["session_ids"],
+            ["session-1", "session-2", "session-1", "session-2", "session-1"],
+        )
+
+    def test_attach_neighbors_rejects_spoofed_session_id(self) -> None:
+        connection, cursor = self._connection()
+        store = RemoteStore("postgresql://example/db")
+
+        with patch("khala.remote.psycopg.connect", return_value=connection):
+            result = store.attach_neighbors([{"id": "real-event", "session_id": "spoofed-session"}])
+
+        self.assertEqual(result[0]["adjacent"], [])
+        neighbor_query = cursor.execute.call_args_list[1]
+        self.assertIn(
+            "event.session_id = request.session_id",
+            str(neighbor_query.args[0]),
+        )
+        self.assertEqual(neighbor_query.args[1]["session_ids"], ["spoofed-session"])
+
+    def test_graph_and_attach_reject_nonpositive_limits_before_connecting(self) -> None:
+        store = RemoteStore("postgresql://example/db")
+        with patch("khala.remote.psycopg.connect") as connect:
+            for limit in (0, -1):
+                with self.subTest(limit=limit, operation="graph"):
+                    with self.assertRaises(ValueError):
+                        store.graph("no-such-event", limit=limit)
+                with self.subTest(limit=limit, operation="attach"):
+                    with self.assertRaises(ValueError):
+                        store.attach_neighbors([], per_hit=limit)
 
         connect.assert_not_called()
 

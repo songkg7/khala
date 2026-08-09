@@ -9,9 +9,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from khala.adjacency import validate_neighbor_limit
 from khala.identity import User
+from khala.local_adjacency import load_local_event_neighbors
 from khala.local_search import lexical_search, sample_events
-from khala.models import SyncEvent
+from khala.models import ArchivedSession, SyncEvent
 from khala.outbox import OutboxClaim, OutboxRepository, migrate_outbox
 from khala.redact import redact
 from khala.secure_files import prepare_private_file
@@ -52,6 +54,10 @@ BASE_SCHEMA_STATEMENTS = (
     """
     CREATE INDEX IF NOT EXISTS events_session_created
     ON events(session_id, created_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS events_session_created_id
+    ON events(session_id, created_at, id)
     """,
     """
     CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
@@ -162,6 +168,18 @@ class Store:
             self.db.rollback()
         except sqlite3.Error:
             pass
+
+    @contextmanager
+    def _read_transaction(self) -> Iterator[None]:
+        """Keep multi-query reads on one SQLite snapshot without taking a write lock."""
+        if self.db.in_transaction:
+            yield
+            return
+        self.db.execute("BEGIN")
+        try:
+            yield
+        finally:
+            self.db.rollback()
 
     def _insert_session(
         self,
@@ -568,6 +586,29 @@ class Store:
             ).rowcount
         return inserted
 
+    def archived_sessions(self) -> list[ArchivedSession]:
+        """Return durable, content-free tombstones for remote convergence."""
+        rows = self.db.execute(
+            """
+            SELECT id, archived_at, duplicate_of
+            FROM sessions
+            WHERE archived_at IS NOT NULL
+            ORDER BY id
+            """
+        ).fetchall()
+        return [
+            {
+                "id": str(row["id"]),
+                "archived_at": str(row["archived_at"]),
+                "duplicate_of": (
+                    str(row["duplicate_of"])
+                    if row["duplicate_of"] is not None
+                    else None
+                ),
+            }
+            for row in rows
+        ]
+
     def pending_remote(self, limit: int = 200, now: str | None = None) -> list[str]:
         """Outbox event ids due for push (next_attempt_at <= now), oldest first."""
         parsed_now = datetime.fromisoformat(now) if now else None
@@ -639,37 +680,21 @@ class Store:
         ]
 
     def graph(self, event_id: str, limit: int = 5) -> dict[str, Any]:
-        """Associative neighbors of an event: same-session sequence + lexical recall.
-
-        Nerazim (local) has no embeddings, so "related" = same-session neighbors
-        (the conversation flow) plus keyword-recall hits on the event content.
-        """
-        row = self.db.execute(
-            "SELECT e.id, e.session_id, e.role, e.content, e.created_at, s.agent "
-            "FROM events e JOIN sessions s ON s.id = e.session_id WHERE e.id = ?",
-            (event_id,),
-        ).fetchone()
-        if row is None:
-            return {"event_id": event_id, "found": False, "neighbors": []}
-
-        # same-session neighbors (chronological rowids around this event)
-        sid = str(row["session_id"])
-        pos = self.db.execute(
-            "SELECT rowid FROM events WHERE id = ?", (event_id,)
-        ).fetchone()[0]
-        neighbors = [
-            dict(r)
-            for r in self.db.execute(
-                "SELECT e.id, e.role, e.content FROM events e "
-                "WHERE e.session_id = ? AND e.rowid <> ? "
-                "ORDER BY e.rowid LIMIT ?",
-                (sid, pos, limit),
-            )
-        ]
+        """Return bounded same-session context centered on one active event."""
+        validate_neighbor_limit(limit)
+        with self._read_transaction():
+            result = load_local_event_neighbors(self.db, event_id, limit)
+        if result is None:
+            return {"event_id": event_id, "found": False, "same_session": []}
+        event, neighbors = result
         return {
             "event_id": event_id,
             "found": True,
-            "event": {"id": row["id"], "role": row["role"], "content": str(row["content"])[:200]},
+            "event": {
+                "id": event["id"],
+                "role": event["role"],
+                "content": str(event["content"])[:200],
+            },
             "same_session": neighbors,
         }
 
@@ -679,28 +704,41 @@ class Store:
         """Enrich recall hits with same-session adjacent context (Nerazim).
 
         For each hit, `adjacent` is a contiguous conversational window around
-        the hit in the same session (hit itself excluded), in stable rowid
-        order. `before`/`after` split keeps the window centered on the hit.
+        the hit in the same active session (hit itself excluded), in canonical
+        `(created_at, id)` order. Session edges backfill from the available side.
         """
-        before = per_hit // 2
-        after = per_hit - before
-        for hit in hits:
-            sid = hit.get("session_id")
-            if not sid:
-                hit["adjacent"] = []
-                continue
-            hit["adjacent"] = [
-                {"role": r["role"], "content": str(r["content"])[:500]}
-                for r in self.db.execute(
-                    "SELECT role, content FROM events e "
-                    "WHERE e.session_id = ? AND e.id <> ? "
-                    "AND e.rowid BETWEEN "
-                    "(SELECT rowid FROM events WHERE id = ?) - ? "
-                    "AND (SELECT rowid FROM events WHERE id = ?) + ? "
-                    "ORDER BY e.rowid",
-                    (sid, hit.get("id"), hit.get("id"), before, hit.get("id"), after),
+        validate_neighbor_limit(per_hit)
+        if not hits:
+            return hits
+        adjacent_by_hit: list[list[dict[str, Any]]] = []
+        with self._read_transaction():
+            for hit in hits:
+                event_id = str(hit.get("id") or "")
+                session_id = str(hit.get("session_id") or "")
+                if not event_id or not session_id:
+                    adjacent_by_hit.append([])
+                    continue
+                result = load_local_event_neighbors(
+                    self.db,
+                    event_id,
+                    per_hit,
+                    expected_session_id=session_id,
                 )
-            ]
+                if result is None:
+                    adjacent_by_hit.append([])
+                    continue
+                _, neighbors = result
+                adjacent_by_hit.append(
+                    [
+                        {
+                            "role": row["role"],
+                            "content": str(row["content"])[:500],
+                        }
+                        for row in neighbors
+                    ]
+                )
+        for hit, adjacent in zip(hits, adjacent_by_hit):
+            hit["adjacent"] = adjacent
         return hits
 
     def status(self, mode: str = "nerazim") -> dict[str, Any]:

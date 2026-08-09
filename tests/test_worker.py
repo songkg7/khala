@@ -9,6 +9,7 @@ from typing import Any
 from unittest.mock import Mock, patch
 
 from khala.embeddings import DIMENSIONS
+from khala.models import ArchivedSession
 from khala.store import Store
 from khala.worker import (
     EmbeddingJobError,
@@ -32,11 +33,18 @@ class FakeRemote:
         self.jobs: list[dict[str, Any]] = []
         self.failed_jobs: list[tuple[list[dict[str, Any]], str]] = []
         self.completed: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]] = []
+        self.archived: list[list[ArchivedSession]] = []
+        self.calls: list[str] = []
 
     def ensure_schema(self) -> None:
+        self.calls.append("ensure_schema")
         self.schema_calls += 1
         if self.schema_error:
             raise self.schema_error
+
+    def archive_sessions(self, sessions: list[ArchivedSession]) -> None:
+        self.calls.append("archive_sessions")
+        self.archived.append(sessions)
 
     def push_batch(
         self,
@@ -138,9 +146,10 @@ class WorkerReliabilityTest(unittest.TestCase):
     def test_local_ack_failure_defers_idempotent_remote_batch(self):
         event_ids = self._add_events()
         remote = FakeRemote()
-        with patch.object(
-            self.store, "mark_remote_sent", side_effect=OSError("ack failed")
-        ), patch("khala.retry.random.uniform", return_value=0.0):
+        with (
+            patch.object(self.store, "mark_remote_sent", side_effect=OSError("ack failed")),
+            patch("khala.retry.random.uniform", return_value=0.0),
+        ):
             with self.assertRaises(OutboxPushError):
                 push_outbox(self.store, remote)
 
@@ -157,8 +166,7 @@ class WorkerReliabilityTest(unittest.TestCase):
             (poison_id, self.session_id, "bad\x00content", now),
         )
         self.store.db.execute(
-            "INSERT INTO remote_outbox(event_id, queued_at, next_attempt_at) "
-            "VALUES (?, ?, ?)",
+            "INSERT INTO remote_outbox(event_id, queued_at, next_attempt_at) VALUES (?, ?, ?)",
             (poison_id, now, now),
         )
         self.store.db.commit()
@@ -204,10 +212,7 @@ class WorkerReliabilityTest(unittest.TestCase):
             INSERT INTO events(id, session_id, role, content, created_at, metadata)
             VALUES (?, ?, 'user', ?, ?, '{}')
             """,
-            (
-                (event_id, self.session_id, "bad\x00content", queued_at)
-                for event_id in poison_ids
-            ),
+            ((event_id, self.session_id, "bad\x00content", queued_at) for event_id in poison_ids),
         )
         self.store.db.executemany(
             """
@@ -217,17 +222,15 @@ class WorkerReliabilityTest(unittest.TestCase):
             ((event_id, queued_at, queued_at) for event_id in poison_ids),
         )
         self.store.db.commit()
-        valid_id = self.store.add_event(
-            self.session_id, "user", "valid after poison claim"
-        )
+        valid_id = self.store.add_event(self.session_id, "user", "valid after poison claim")
         remote = FakeRemote()
 
-        with patch("khala.worker._lock_conn", return_value=Mock()), patch(
-            "khala.worker.RemoteStore", return_value=remote
-        ), patch("khala.retry.random.uniform", return_value=0.0):
-            result = run_worker(
-                self.db_path, "postgresql://example/db", max_passes=2
-            )
+        with (
+            patch("khala.worker._lock_conn", return_value=Mock()),
+            patch("khala.worker.RemoteStore", return_value=remote),
+            patch("khala.retry.random.uniform", return_value=0.0),
+        ):
+            result = run_worker(self.db_path, "postgresql://example/db", max_passes=2)
 
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["pushed"], [valid_id])
@@ -265,9 +268,11 @@ class WorkerReliabilityTest(unittest.TestCase):
     def test_worker_result_exposes_no_embedding_content(self):
         remote = FakeRemote()
         remote.jobs = [self._job()]
-        with patch("khala.worker._lock_conn", return_value=Mock()), patch(
-            "khala.worker.RemoteStore", return_value=remote
-        ), patch("khala.worker.embed", return_value=[[0.1] * DIMENSIONS]):
+        with (
+            patch("khala.worker._lock_conn", return_value=Mock()),
+            patch("khala.worker.RemoteStore", return_value=remote),
+            patch("khala.worker.embed", return_value=[[0.1] * DIMENSIONS]),
+        ):
             result = run_worker(self.db_path, "postgresql://example/db")
 
         self.assertEqual(result["embedded"], ["event-1"])
@@ -309,8 +314,9 @@ class WorkerReliabilityTest(unittest.TestCase):
         log_path = self.db_path.parent / ".khala-worker.log"
         log_path.write_text("old log")
         process = Mock(pid=1234)
-        with patch("khala.worker.WORKER_LOG_MAX_BYTES", 1), patch(
-            "khala.worker.subprocess.Popen", return_value=process
+        with (
+            patch("khala.worker.WORKER_LOG_MAX_BYTES", 1),
+            patch("khala.worker.subprocess.Popen", return_value=process),
         ):
             spawn_worker(self.db_path, "postgresql://example/db")
 
@@ -320,9 +326,10 @@ class WorkerReliabilityTest(unittest.TestCase):
 
     def test_lock_connection_failure_returns_error_and_is_durable(self):
         event_id = self.store.add_event(self.session_id, "user", "retry connection")
-        with patch(
-            "khala.worker._lock_conn", side_effect=OSError("postgres unavailable")
-        ), patch("khala.retry.random.uniform", return_value=0.0):
+        with (
+            patch("khala.worker._lock_conn", side_effect=OSError("postgres unavailable")),
+            patch("khala.retry.random.uniform", return_value=0.0),
+        ):
             result = run_worker(self.db_path, "postgresql://example/db")
         self.assertEqual(result["status"], "error")
         self.assertEqual(self.store.status()["worker"]["status"], "error")
@@ -346,9 +353,11 @@ class WorkerReliabilityTest(unittest.TestCase):
         remote = FakeRemote()
         remote.schema_error = RuntimeError("schema unavailable")
         lock = Mock()
-        with patch("khala.worker._lock_conn", return_value=lock), patch(
-            "khala.worker.RemoteStore", return_value=remote
-        ), patch("khala.retry.random.uniform", return_value=0.0):
+        with (
+            patch("khala.worker._lock_conn", return_value=lock),
+            patch("khala.worker.RemoteStore", return_value=remote),
+            patch("khala.retry.random.uniform", return_value=0.0),
+        ):
             result = run_worker(self.db_path, "postgresql://example/db")
 
         self.assertEqual(result["status"], "error")
@@ -364,8 +373,9 @@ class WorkerReliabilityTest(unittest.TestCase):
         event_id = self.store.add_event(self.session_id, "user", "push me")
         remote = FakeRemote()
         lock = Mock()
-        with patch("khala.worker._lock_conn", return_value=lock), patch(
-            "khala.worker.RemoteStore", return_value=remote
+        with (
+            patch("khala.worker._lock_conn", return_value=lock),
+            patch("khala.worker.RemoteStore", return_value=remote),
         ):
             result = run_worker(self.db_path, "postgresql://example/db")
 
@@ -374,6 +384,47 @@ class WorkerReliabilityTest(unittest.TestCase):
         self.assertEqual(remote.schema_calls, 1)
         self.assertEqual(self.store.status()["worker"]["status"], "ok")
         lock.close.assert_called_once_with()
+
+    def test_worker_syncs_archive_tombstones_after_schema_on_every_run(self):
+        archived_at = "2026-01-01T00:00:00+00:00"
+        duplicate_of = "canonical-session"
+        self.store.db.execute(
+            """
+            UPDATE sessions
+            SET external_id = NULL, archived_at = ?, duplicate_of = ?
+            WHERE id = ?
+            """,
+            (archived_at, duplicate_of, self.session_id),
+        )
+        self.store.db.commit()
+        remote = FakeRemote()
+
+        with (
+            patch("khala.worker._lock_conn", return_value=Mock()),
+            patch("khala.worker.RemoteStore", return_value=remote),
+        ):
+            first = run_worker(self.db_path, "postgresql://example/db")
+            second = run_worker(self.db_path, "postgresql://example/db")
+
+        expected = [
+            {
+                "id": self.session_id,
+                "archived_at": archived_at,
+                "duplicate_of": duplicate_of,
+            }
+        ]
+        self.assertEqual(first["status"], "ok")
+        self.assertEqual(second["status"], "ok")
+        self.assertEqual(remote.archived, [expected, expected])
+        self.assertEqual(
+            remote.calls,
+            [
+                "ensure_schema",
+                "archive_sessions",
+                "ensure_schema",
+                "archive_sessions",
+            ],
+        )
 
     def test_new_schedule_preserves_previous_failure_history(self):
         failed_run = self.store.mark_worker_started()
@@ -405,8 +456,7 @@ class WorkerReliabilityTest(unittest.TestCase):
     def test_abandoned_scheduled_worker_is_reported_stale(self):
         run_id = self.store.mark_worker_scheduled()
         self.store.db.execute(
-            "UPDATE worker_runs SET scheduled_at = '2000-01-01T00:00:00+00:00' "
-            "WHERE run_id = ?",
+            "UPDATE worker_runs SET scheduled_at = '2000-01-01T00:00:00+00:00' WHERE run_id = ?",
             (run_id,),
         )
         self.store.db.commit()
@@ -461,9 +511,7 @@ class WorkerReliabilityTest(unittest.TestCase):
         ).fetchone()
 
         with patch("khala.worker.sys.stderr"):
-            result = run_worker(
-                self.db_path, "postgresql://example/db", run_id=run_id
-            )
+            result = run_worker(self.db_path, "postgresql://example/db", run_id=run_id)
 
         after = self.store.db.execute(
             "SELECT status, started_at, finished_at FROM worker_runs WHERE run_id = ?",

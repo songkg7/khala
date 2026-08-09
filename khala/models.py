@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, TypedDict
+
+
+class ArchivedSession(TypedDict):
+    """Minimal, content-free tombstone mirrored to the shared store."""
+
+    id: str
+    archived_at: str
+    duplicate_of: str | None
 
 
 @dataclass(frozen=True)
