@@ -11,6 +11,13 @@ dependencies = [
     "psycopg[binary]>=3.2.13",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "coverage[toml]==7.10.7",
+    "pyright==1.1.411",
+    "ruff==0.16.2",
+]
+
 [project.scripts]
 khala = "khala.cli:main"
 
@@ -26,12 +33,24 @@ packages = [
 
 [tool.ruff]
 line-length = 100
-
+src = ["khala", "tests"]
 target-version = "py39"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
 
 [tool.pyright]
+include = ["khala", "tests"]
 pythonVersion = "3.9"
 typeCheckingMode = "standard"
+
+[tool.coverage.run]
+branch = true
+relative_files = true
+source = ["khala"]
+
+[tool.coverage.report]
+fail_under = 80
+precision = 1
+show_missing = true
+skip_covered = false

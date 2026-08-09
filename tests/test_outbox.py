@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from khala import Store, main
 from khala.retry import RetryPolicy
+
 from tests.helpers import make_hermes_state_db
 
 

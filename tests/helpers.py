@@ -2,8 +2,8 @@
 
 import json
 import sqlite3
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 
 def make_hermes_state_db(path: Path) -> None:
@@ -30,11 +30,13 @@ def make_hermes_state_db(path: Path) -> None:
     )
     db.execute("INSERT INTO sessions(id, started_at, cwd) VALUES ('sess-1', 1.0, '/ws')")
     db.execute(
-        "INSERT INTO messages(session_id, role, content, timestamp) VALUES ('sess-1','user','hello',1.0)"
+        "INSERT INTO messages(session_id, role, content, timestamp) "
+        "VALUES ('sess-1','user','hello',1.0)"
     )
     db.execute(
         "INSERT INTO messages(session_id, role, content, tool_calls, timestamp) "
-        "VALUES ('sess-1','assistant','', '[{\"id\":\"c1\",\"function\":{\"name\":\"read_file\"}}]', 2.0)"
+        "VALUES ('sess-1','assistant','', "
+        "'[{\"id\":\"c1\",\"function\":{\"name\":\"read_file\"}}]', 2.0)"
     )
     db.execute(
         "INSERT INTO messages(session_id, role, content, tool_name, timestamp) "

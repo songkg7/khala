@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+TEST_API_KEY_ENV = {"OPENROUTER_API_KEY": "sk-test-1234567890abcdef"}
+
 
 class KhalaEmbeddingsTest(unittest.TestCase):
     def setUp(self):
@@ -16,7 +18,7 @@ class KhalaEmbeddingsTest(unittest.TestCase):
         with patch.object(self.emb, "_load_dotenv", return_value=None):
             with patch.dict(os.environ, {}, clear=True):
                 self.assertFalse(self.emb.api_key_set())
-            with patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-test-1234567890abcdef"}, clear=False):
+            with patch.dict(os.environ, TEST_API_KEY_ENV, clear=False):
                 self.assertTrue(self.emb.api_key_set())
 
     def test_dotenv_supplies_key_when_env_absent(self):
@@ -31,7 +33,11 @@ class KhalaEmbeddingsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             env_file = Path(tmp) / ".env"
             env_file.write_text("OPENROUTER_API_KEY=sk-test-dotenv-1234567890\n")
-            with patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-test-env-1234567890"}, clear=False):
+            with patch.dict(
+                os.environ,
+                {"OPENROUTER_API_KEY": "sk-test-env-1234567890"},
+                clear=False,
+            ):
                 self.emb._load_dotenv(env_file)
                 self.assertEqual(os.environ["OPENROUTER_API_KEY"], "sk-test-env-1234567890")
 
@@ -64,14 +70,14 @@ class KhalaEmbeddingsTest(unittest.TestCase):
             sent["shape"] = len(body["input"][0])
             return Resp()
 
-        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-test-1234567890abcdef"}, clear=False):
+        with patch.dict(os.environ, TEST_API_KEY_ENV, clear=False):
             with patch("urllib.request.urlopen", side_effect=fake_open):
                 out = self.emb.embed([long_text])
         self.assertEqual(out[0][0], 0.5)
         self.assertEqual(sent["shape"], self.emb.MAX_TEXT_LEN)
 
     def test_embed_empty_inputs(self):
-        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-test-1234567890abcdef"}, clear=False):
+        with patch.dict(os.environ, TEST_API_KEY_ENV, clear=False):
             with patch("urllib.request.urlopen", side_effect=AssertionError("no network call")):
                 self.assertEqual(self.emb.embed([]), [])
                 self.assertEqual(self.emb.embed([""]), [])
@@ -103,7 +109,7 @@ class KhalaEmbeddingsTest(unittest.TestCase):
             sent["body"] = body
             return Resp()
 
-        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-test-1234567890abcdef"}, clear=False):
+        with patch.dict(os.environ, TEST_API_KEY_ENV, clear=False):
             with patch("urllib.request.urlopen", side_effect=fake_open):
                 out = self.emb.embed(["a", "b"])
         self.assertEqual(len(out), 2)

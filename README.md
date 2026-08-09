@@ -17,6 +17,17 @@ Run the test suite:
 .venv/bin/python3 -m unittest discover -s tests
 ```
 
+For development, install the pinned quality tools and run the same gates as CI:
+
+```bash
+uv sync --locked --extra dev --python 3.9
+.venv/bin/ruff check .
+.venv/bin/pyright
+.venv/bin/coverage run -m unittest discover -s tests -v
+.venv/bin/coverage report
+.venv/bin/python -m khala eval --baseline
+```
+
 Start the local Khalai database with an explicit development password. The
 port is bound to localhost only:
 
@@ -28,6 +39,16 @@ docker compose up -d postgres
 An existing `khala_pgdata` volume keeps the password from its first database
 initialization; changing the environment variable does not rotate that role's
 password automatically.
+
+PostgreSQL integration tests are opt-in locally. With the service above
+running, provide its DSN and rerun the suite. CI always sets this variable, so
+integration failures cannot silently become skips there:
+
+```bash
+export KHALA_TEST_POSTGRES_DSN='postgresql://khala:choose-a-local-password@127.0.0.1:5432/khala'
+.venv/bin/python -m unittest -v tests.test_postgres_integration
+.venv/bin/coverage run -m unittest discover -s tests -v
+```
 
 Enable a workspace for auto-sync:
 

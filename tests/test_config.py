@@ -173,7 +173,11 @@ class KhalaIdentityTest(unittest.TestCase):
         self.assertEqual(user.email, "alice@example.com")
 
     def test_fallback_to_env_user(self):
-        with patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}):
+        isolated_git = {
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+        }
+        with patch.dict(os.environ, isolated_git):
             user = resolve_user(self.dir)
         self.assertEqual(user.name, os.environ.get("USER"))
         self.assertIsNone(user.email)

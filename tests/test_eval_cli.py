@@ -13,7 +13,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import psycopg
-
 from khala import main
 from khala.store import Store
 

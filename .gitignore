@@ -17,9 +17,6 @@ htmlcov/
 .pytype_cache/
 .tox/
 
-# uv
-uv.lock
-
 # IDE / editors
 .idea/
 .vscode/

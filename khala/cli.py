@@ -51,7 +51,9 @@ def parser() -> argparse.ArgumentParser:
         "dsn",
         help="Postgres DSN, e.g. postgresql://khala:<password>@localhost:5432/khala",
     )
-    disconnect_cmd = commands.add_parser("disconnect", help="Disconnect from remote; return to Nerazim (local) mode")
+    commands.add_parser(
+        "disconnect", help="Disconnect from remote; return to Nerazim (local) mode"
+    )
     config_cmd = commands.add_parser("config", help="Manage khala configuration")
     config_sub = config_cmd.add_subparsers(dest="config_action")
     config_sub.add_parser("show", help="Show config file contents")
@@ -76,13 +78,36 @@ def parser() -> argparse.ArgumentParser:
     ingest.add_argument("--adapter", help="MODULE:CALLABLE; stdin JSONL is the default")
     ingest.add_argument("source", nargs="?")
     sync_cmd = commands.add_parser("sync", help="Sync agent sessions into khala")
-    sync_cmd.add_argument("--adapter", default="hermes", help="Agent adapter name (available: hermes, codex)")
+    sync_cmd.add_argument(
+        "--adapter",
+        default="hermes",
+        help="Agent adapter name (available: hermes, codex)",
+    )
     sync_cmd.add_argument("--session-id", default=None, help="Sync only this session (incremental)")
-    sync_cmd.add_argument("--name", default=None, help="Override user name (default: git config user.name, else $USER)")
-    sync_cmd.add_argument("--email", default=None, help="Override user email (default: git config user.email)")
-    hook = commands.add_parser("hook", help="Agent shell-hook entrypoint; reads vendor hook JSON from stdin")
-    hook.add_argument("adapter", nargs="?", default="hermes", help="Adapter name (hermes, codex, ...)")
-    hook.add_argument("--workspace", default=None, help="Workspace whose sessions to sync (default: payload cwd if enabled)")
+    sync_cmd.add_argument(
+        "--name",
+        default=None,
+        help="Override user name (default: git config user.name, else $USER)",
+    )
+    sync_cmd.add_argument(
+        "--email",
+        default=None,
+        help="Override user email (default: git config user.email)",
+    )
+    hook = commands.add_parser(
+        "hook", help="Agent shell-hook entrypoint; reads vendor hook JSON from stdin"
+    )
+    hook.add_argument(
+        "adapter",
+        nargs="?",
+        default="hermes",
+        help="Adapter name (hermes, codex, ...)",
+    )
+    hook.add_argument(
+        "--workspace",
+        default=None,
+        help="Workspace whose sessions to sync (default: payload cwd if enabled)",
+    )
     ws = commands.add_parser("workspace", help="Manage khala-enabled workspaces")
     ws_sub = ws.add_subparsers(dest="ws_action", required=True)
     ws_add = ws_sub.add_parser("add", help="Enable a workspace for auto-sync")
@@ -90,7 +115,10 @@ def parser() -> argparse.ArgumentParser:
     ws_rm = ws_sub.add_parser("remove", help="Disable a workspace")
     ws_rm.add_argument("path", type=Path)
     ws_sub.add_parser("list")
-    compat = commands.add_parser("compat-check", help="Verify a vendor session landed with a canonical schema + user identity")
+    compat = commands.add_parser(
+        "compat-check",
+        help="Verify a vendor session landed with a canonical schema + user identity",
+    )
     compat.add_argument("--adapter", required=True, help="Adapter name (hermes, codex)")
     compat.add_argument("--session-id", required=True, help="Vendor session id")
     remote_worker = commands.add_parser(
@@ -168,7 +196,9 @@ def main(argv: list[str] | None = None) -> int:
             if dsn:
                 from khala.remote import RemoteStore, recall_by_mode
 
-                results = recall_by_mode(RemoteStore(dsn), args.query, mode=args.mode, limit=args.limit)
+                results = recall_by_mode(
+                    RemoteStore(dsn), args.query, mode=args.mode, limit=args.limit
+                )
                 if args.graph:
                     results = RemoteStore(dsn).attach_neighbors(results)
             else:
@@ -294,7 +324,9 @@ def main(argv: list[str] | None = None) -> int:
             config_data = load_config()
             action = getattr(args, "config_action", None) or "show"
             if action == "show":
-                shown: dict[str, Any] = {"mode": "khalai" if config_data.get("remote") else "nerazim"}
+                shown: dict[str, Any] = {
+                    "mode": "khalai" if config_data.get("remote") else "nerazim"
+                }
                 shown["workspaces"] = config_data.get("workspaces", [])
                 shown["embedding"] = {
                     "provider": "openrouter",

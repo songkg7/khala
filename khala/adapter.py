@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import importlib
 import json
-from typing import Any, Iterable, Mapping, cast
+from collections.abc import Iterable, Mapping
+from typing import Any, cast
 
 
 def load_adapter(spec: str):
@@ -28,7 +29,11 @@ def read_jsonl(stream: Iterable[str]) -> Iterable[Mapping[str, Any]]:
 
 
 # ponytail: cast due to dynamic load. Consider typed protocols for strict adapters.
-def ingest_events(adapter_spec: str | None, source: str | None, stdin: Iterable[str]) -> Iterable[Mapping[str, Any]]:
+def ingest_events(
+    adapter_spec: str | None,
+    source: str | None,
+    stdin: Iterable[str],
+) -> Iterable[Mapping[str, Any]]:
     """Dispatch to adapter or fall back to JSONL stdin."""
     if adapter_spec:
         adapter = load_adapter(adapter_spec)

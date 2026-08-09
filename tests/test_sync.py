@@ -11,6 +11,7 @@ from khala import Store
 from khala.models import AdapterBatch
 from khala.store import SyncReconciliationError
 from khala.sync import sync_session
+
 from tests.helpers import make_hermes_state_db
 
 

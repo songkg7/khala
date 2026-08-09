@@ -80,7 +80,12 @@ def mask_dsn(dsn: str) -> str:
         parameters = conninfo_to_dict(dsn)
         for key in _CONNINFO_SECRET_KEYS & parameters.keys():
             parameters[key] = "***"
-        return make_conninfo(**parameters)
+        serialized = {
+            key: str(value)
+            for key, value in parameters.items()
+            if value is not None
+        }
+        return make_conninfo(**serialized)
     except Exception:
         return "[invalid PostgreSQL DSN]"
 
