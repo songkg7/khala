@@ -117,7 +117,9 @@ class KhalaCLIIntegrationTest(unittest.TestCase):
         self.assertIn("source requires --adapter", err)
 
     def test_ingest_with_adapter(self):
-        code, out, _ = self._run("ingest", "--agent", "hermes", "--adapter", "tests.helpers:adapter")
+        code, out, _ = self._run(
+            "ingest", "--agent", "hermes", "--adapter", "tests.helpers:adapter"
+        )
         self.assertEqual(code, 0)
         sid = json.loads(out)["session_id"]
         self.assertIsInstance(sid, str)
@@ -166,6 +168,63 @@ class KhalaCLIIntegrationTest(unittest.TestCase):
         self.assertEqual(out, "")
         self.assertNotIn(secret, err)
         self.assertIn("PostgreSQL ProgrammingError", err)
+
+    def test_remote_worker_error_returns_nonzero_exit(self):
+        self.config.save_config(
+            {"workspaces": [], "remote": "postgresql://example.invalid/khala"}
+        )
+        with patch(
+            "khala.worker.run_worker",
+            return_value={"status": "error", "reason": "remote unavailable"},
+        ):
+            code, out, err = self._run("remote-worker")
+
+        self.assertEqual(code, 2)
+        self.assertEqual(err, "")
+        self.assertEqual(json.loads(out)["status"], "error")
+
+    def test_disconnected_remote_worker_finalizes_scheduled_run(self):
+        from khala.store import Store
+
+        state_store = Store(Path(self.db))
+        run_id = state_store.mark_worker_scheduled()
+        state_store.close()
+
+        code, out, err = self._run("remote-worker", "--run-id", run_id)
+
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["status"], "skipped")
+        state_store = Store(Path(self.db))
+        try:
+            status = state_store.status()["worker"]
+        finally:
+            state_store.close()
+        self.assertEqual(status["status"], "skipped")
+        self.assertEqual(status["active_runs"], 0)
+
+    def test_outbox_dead_letters_can_be_inspected_and_requeued(self):
+        from khala.store import Store
+
+        state_store = Store(Path(self.db))
+        session_id = state_store.add_session("test", "external")
+        event_id = state_store.add_event(session_id, "user", "poison")
+        for _ in range(8):
+            state_store.mark_remote_error(event_id, "remote unavailable")
+        state_store.close()
+
+        code, out, err = self._run("outbox", "dead")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)[0]["event_id"], event_id)
+
+        code, out, err = self._run("outbox", "retry-dead", event_id)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["requeued"], 1)
+
+        state_store = Store(Path(self.db))
+        try:
+            self.assertIn(event_id, state_store.pending_remote())
+        finally:
+            state_store.close()
 
     @unittest.skipUnless(os.name == "posix", "POSIX permission bits required")
     def test_canonical_database_directory_is_private_with_custom_config_dir(self):

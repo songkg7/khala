@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
-import time
+from collections.abc import Iterator, Mapping
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any
+
+from khala.models import AdapterBatch
 
 CODEX_SESSIONS_DIR = Path(os.environ.get("CODEX_SESSIONS_DIR", Path.home() / ".codex" / "sessions"))
 
@@ -16,7 +18,11 @@ def _extract_text(content: Any) -> str:
     if isinstance(content, list):
         parts: list[str] = []
         for block in content:
-            if isinstance(block, dict) and block.get("type") in {"input_text", "output_text", "text"}:
+            if isinstance(block, dict) and block.get("type") in {
+                "input_text",
+                "output_text",
+                "text",
+            }:
                 text = block.get("text")
                 if isinstance(text, str):
                     parts.append(text)
@@ -72,28 +78,42 @@ class CodexAdapter:
         paths = sorted(self._rollout_paths(), key=lambda p: p.stat().st_mtime, reverse=True)
         return [p.stem for p in paths[:limit]]
 
-    def iter_events(self, session_id: str, after_id: int = 0) -> Iterator[tuple[int, Mapping[str, Any]]]:
+    def iter_events(
+        self, session_id: str, after_id: int = 0
+    ) -> Iterator[tuple[int, Mapping[str, Any]]]:
         """Yield (line_no, canonical_event) for a Codex rollout.
 
         Codex has no monotonic per-record id, so the line number serves as the
         sync watermark (kept in sync_state, never stored as khala data).
         """
+        yield from self.read_batch(session_id, after_id).events
+
+    def read_batch(self, session_id: str, after_id: int = 0) -> AdapterBatch:
+        """Read complete JSONL records; leave a partial final line for the next pass."""
         path = self._find_rollout(session_id)
         if path is None:
-            return
-        line_no = 0
-        with open(path) as f:
-            for line in f:
-                line_no += 1
-                if line_no <= after_id or not line.strip():
+            return AdapterBatch((), after_id)
+        events: list[tuple[int, Mapping[str, Any]]] = []
+        next_watermark = after_id
+        with open(path) as stream:
+            for line_no, line in enumerate(stream, 1):
+                if line_no <= after_id:
+                    continue
+                if not line.endswith("\n"):
+                    break
+                next_watermark = line_no
+                if not line.strip():
                     continue
                 try:
                     record = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(record, Mapping):
+                    continue
                 event = _canonical_event(record)
                 if event is not None:
-                    yield line_no, event
+                    events.append((line_no, event))
+        return AdapterBatch(tuple(events), next_watermark)
 
     def _find_rollout(self, session_id: str) -> Path | None:
         for path in self._rollout_paths():

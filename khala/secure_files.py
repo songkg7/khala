@@ -4,6 +4,7 @@ import os
 import stat
 import tempfile
 from pathlib import Path
+from typing import TextIO
 
 PRIVATE_DIRECTORY_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
@@ -60,6 +61,25 @@ def prepare_private_file(path: Path) -> None:
             os.fchmod(descriptor, PRIVATE_FILE_MODE)
     finally:
         os.close(descriptor)
+
+
+def open_private_append(path: Path) -> TextIO:
+    """Open a regular private file for append without following a symlink."""
+    ensure_private_directory(path.parent, tighten_existing=False)
+    _reject_symlink(path)
+    flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, PRIVATE_FILE_MODE)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(f"private path is not a regular file: {path}")
+        if os.name == "posix":
+            os.fchmod(descriptor, PRIVATE_FILE_MODE)
+        return os.fdopen(descriptor, "a", encoding="utf-8")
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def tighten_private_file(path: Path) -> None:

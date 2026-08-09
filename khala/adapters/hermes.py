@@ -4,9 +4,12 @@ import json
 import os
 import sqlite3
 import time
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any
+
+from khala.models import AdapterBatch
 
 HERMES_STATE_DB = Path(os.environ.get("HERMES_STATE_DB", Path.home() / ".hermes" / "state.db"))
 
@@ -110,19 +113,30 @@ class HermesAdapter:
             ).fetchall()
             return [str(r["id"]) for r in rows]
 
-    def iter_events(self, session_id: str, after_id: int = 0) -> Iterator[tuple[int, Mapping[str, Any]]]:
+    def iter_events(
+        self, session_id: str, after_id: int = 0
+    ) -> Iterator[tuple[int, Mapping[str, Any]]]:
         """Yield (message_id, canonical_event) for messages after `after_id`.
 
         message_id is the vendor-internal monotonically-increasing id, used only
         for incremental bookkeeping — it is never stored as khala data.
         """
+        yield from self.read_batch(session_id, after_id).events
+
+    def read_batch(self, session_id: str, after_id: int = 0) -> AdapterBatch:
+        """Read a stable SQLite result set and advance across filtered rows too."""
         with _connections(self.state_db) as db:
             rows = db.execute(
                 "SELECT id, role, content, tool_calls, timestamp FROM messages "
                 "WHERE session_id = ? AND id > ? ORDER BY id",
                 (session_id, after_id),
             ).fetchall()
-            for row in rows:
-                event = _canonical_event(row)
-                if event is not None:
-                    yield int(row["id"]), event
+        events: list[tuple[int, Mapping[str, Any]]] = []
+        next_watermark = after_id
+        for row in rows:
+            message_id = int(row["id"])
+            next_watermark = message_id
+            event = _canonical_event(row)
+            if event is not None:
+                events.append((message_id, event))
+        return AdapterBatch(tuple(events), next_watermark)

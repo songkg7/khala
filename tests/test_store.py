@@ -1,6 +1,8 @@
 import os
+import sqlite3
 import stat
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -60,11 +62,19 @@ class KhalaStoreTest(unittest.TestCase):
         with self.assertRaises(ValueError, msg="unsupported role"):
             self.store.add_event(session, "invalid", "x")
 
+    def test_add_event_rejects_postgres_incompatible_nul(self):
+        session = self.store.add_session("test")
+        with self.assertRaisesRegex(ValueError, "NUL"):
+            self.store.add_event(session, "user", "valid prefix\x00poison")
+        self.assertEqual(self.store.replay(session), [])
+        self.assertEqual(self.store.status()["pending_push_total"], 0)
+
     def test_recall_empty(self):
         session = self.store.add_session("test")
         self.store.add_event(session, "user", "needle in haystack")
         self.assertEqual(self.store.recall("nonexistent"), [])
-        self.assertEqual(self.store.recall("needle", limit=0), [])  # ponytail: limit=0 returns nothing
+        # ponytail: limit=0 returns nothing
+        self.assertEqual(self.store.recall("needle", limit=0), [])
 
     def test_recall_limit_and_weighting(self):
         session = self.store.add_session("test")
@@ -145,7 +155,13 @@ class KhalaStoreTest(unittest.TestCase):
 
     def test_import_events_atomic_rollback(self):
         with self.assertRaises(ValueError, msg="unsupported role"):
-            self.store.import_events("broken", [{"role": "user", "content": "ok"}, {"role": "invalid", "content": "bad"}])
+            self.store.import_events(
+                "broken",
+                [
+                    {"role": "user", "content": "ok"},
+                    {"role": "invalid", "content": "bad"},
+                ],
+            )
         status = self.store.status()
         self.assertEqual(status["sessions"], 0)
         self.assertEqual(status["events"], 0)
@@ -155,6 +171,155 @@ class KhalaStoreTest(unittest.TestCase):
         session = self.store.import_events("test", [])
         self.assertEqual(self.store.replay(session), [])
         self.assertEqual(self.store.status()["sessions"], 1)
+
+    def test_nested_transaction_rolls_back_inner_without_committing_outer(self):
+        with self.assertRaisesRegex(RuntimeError, "outer failure"):
+            with self.store.transaction():
+                first = self.store.add_session("outer")
+                with self.assertRaisesRegex(ValueError, "unsupported role"):
+                    self.store.add_event(first, "invalid", "bad")
+                second = self.store.add_session("outer")
+                self.assertNotEqual(first, second)
+                self.store.enqueue_backlog()
+                raise RuntimeError("outer failure")
+
+        self.assertEqual(self.store.status()["sessions"], 0)
+
+    def test_external_session_identity_is_unique(self):
+        self.store.add_session("agent", "external")
+        with self.assertRaisesRegex(ValueError, "session already exists"):
+            self.store.add_session("agent", "external")
+
+    def test_null_external_session_identity_can_repeat(self):
+        first = self.store.add_session("agent")
+        second = self.store.add_session("agent")
+        self.assertNotEqual(first, second)
+
+    def test_legacy_duplicate_sessions_are_quarantined_without_event_loss(self):
+        legacy_path = Path(self.tmp.name) / "duplicate-sessions.db"
+        db = sqlite3.connect(legacy_path)
+        db.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                agent TEXT NOT NULL,
+                external_id TEXT,
+                created_at TEXT NOT NULL,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                user_name TEXT,
+                user_email TEXT
+            );
+            CREATE TABLE events (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id),
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                metadata TEXT NOT NULL DEFAULT '{}'
+            );
+            INSERT INTO sessions VALUES
+                ('older', 'agent', 'external', '1', '{}', NULL, NULL),
+                ('newer', 'agent', 'external', '2', '{}', 'Alice', 'a@example.com');
+            INSERT INTO events VALUES
+                ('event-1', 'older', 'user', 'one', '1', '{}'),
+                ('event-2', 'newer', 'assistant', 'two', '2', '{}');
+            """
+        )
+        db.commit()
+        db.close()
+
+        migrated = Store(legacy_path)
+        try:
+            sessions = migrated.db.execute(
+                """
+                SELECT id, user_name, user_email, archived_at, duplicate_of
+                FROM sessions ORDER BY id
+                """
+            ).fetchall()
+            event_sessions = migrated.db.execute(
+                "SELECT id, session_id FROM events ORDER BY id"
+            ).fetchall()
+            self.assertEqual(len(sessions), 2)
+            active = next(row for row in sessions if row["archived_at"] is None)
+            archived = next(row for row in sessions if row["archived_at"] is not None)
+            self.assertEqual(str(active["id"]), "older")
+            self.assertEqual(str(active["user_name"]), "Alice")
+            self.assertEqual(str(archived["id"]), "newer")
+            self.assertEqual(str(archived["duplicate_of"]), "older")
+            self.assertEqual(
+                [(str(row["id"]), str(row["session_id"])) for row in event_sessions],
+                [("event-1", "older"), ("event-2", "newer")],
+            )
+            status = migrated.status()
+            self.assertEqual(status["sessions"], 1)
+            self.assertEqual(status["events"], 1)
+            self.assertEqual(status["archived_sessions"], 1)
+            self.assertEqual(status["archived_events"], 1)
+            migrated.enqueue_backlog()
+            self.assertEqual(migrated.pending_remote(), ["event-1"])
+            with self.assertRaisesRegex(ValueError, "archived session"):
+                migrated.add_event("newer", "user", "must stay quarantined")
+            self.assertEqual(migrated.pending_remote(), ["event-1"])
+        finally:
+            migrated.close()
+
+    def test_concurrent_store_open_serializes_forward_migrations(self):
+        legacy_path = Path(self.tmp.name) / "concurrent-migration.db"
+        db = sqlite3.connect(legacy_path)
+        db.execute(
+            """
+            CREATE TABLE remote_outbox (
+                event_id TEXT PRIMARY KEY,
+                queued_at TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at TEXT NOT NULL,
+                last_error TEXT
+            )
+            """
+        )
+        db.commit()
+        db.close()
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def open_store() -> None:
+            try:
+                barrier.wait(timeout=5)
+                opened = Store(legacy_path)
+                opened.close()
+            except BaseException as error:
+                errors.append(error)
+
+        threads = [threading.Thread(target=open_store) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        migrated = Store(legacy_path)
+        try:
+            columns = {
+                str(row[1])
+                for row in migrated.db.execute("PRAGMA table_info(remote_outbox)")
+            }
+            self.assertTrue(
+                {"last_attempt_at", "dead_lettered_at", "lease_owner"} <= columns
+            )
+            self.assertIsNotNone(
+                migrated.db.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'sync_event_ledger'
+                    """
+                ).fetchone()
+            )
+        finally:
+            migrated.close()
+
+    def test_khalai_status_does_not_claim_remote_embedding_count(self):
+        self.assertIsNone(self.store.status(mode="khalai")["pending_embedding"])
 
     def test_status_empty(self):
         status = self.store.status()
@@ -192,6 +357,11 @@ class KhalaRedactTest(unittest.TestCase):
     def test_no_false_positive_on_url(self):
         self.assertEqual(redact("https://example.com/api_key=test"), redact("https://example.com/api_key=test"))
 
+    def test_uri_password(self):
+        result = redact("failed postgresql://alice:uri-secret@db.example/khala")
+        self.assertNotIn("uri-secret", result)
+        self.assertIn("alice:[REDACTED]@", result)
+
 
 class KhalaAdapterTest(unittest.TestCase):
     def test_load_adapter_invalid_spec(self):
@@ -217,7 +387,12 @@ class KhalaAdapterTest(unittest.TestCase):
         self.assertEqual(result[0]["role"], "user")
 
     def test_read_jsonl_skip_blank(self):
-        lines = ['{"role": "user", "content": "hi"}', '', '  ', '{"role": "user", "content": "bye"}']
+        lines = [
+            '{"role": "user", "content": "hi"}',
+            "",
+            "  ",
+            '{"role": "user", "content": "bye"}',
+        ]
         result = list(read_jsonl(lines))
         self.assertEqual(len(result), 2)
 

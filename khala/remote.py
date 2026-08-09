@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import contextlib
-from typing import Any, Iterator
+from collections.abc import Iterator
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import psycopg
 from psycopg.rows import dict_row
+
+from khala.redact import redact
+from khala.retry import DEFAULT_RETRY_POLICY, RetryPolicy
 
 _SCHEMA_SESSIONS = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -55,9 +60,12 @@ CREATE TABLE IF NOT EXISTS embedding_jobs (
     attempt_count INTEGER NOT NULL DEFAULT 0,
     next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_error TEXT,
+    last_attempt_at TIMESTAMPTZ,
+    dead_lettered_at TIMESTAMPTZ,
     PRIMARY KEY (event_id, provider, model, content_hash)
 )
 """
+_ORPHAN_EMBED_JOB_ERROR = "orphan embedding job: local event was never committed"
 
 # worker advisory-lock key — serializes all remote-worker instances
 WORKER_LOCK_KEY = 884_221_001
@@ -99,22 +107,103 @@ class RemoteStore:
 
     def ensure_schema(self) -> None:
         with self._cursor() as cur:
-            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-            cur.execute(_SCHEMA_SESSIONS)
-            cur.execute(_SCHEMA_EVENTS)
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS events_session_created ON events(session_id, created_at)"
-            )
-            cur.execute(_SCHEMA_RECALLS)
-            cur.execute(_SCHEMA_EMBEDDINGS)
-            cur.execute(_SCHEMA_EMBED_JOBS)
+            self._ensure_schema(cur)
+
+    @staticmethod
+    def _ensure_schema(cur: Any) -> None:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        cur.execute(_SCHEMA_SESSIONS)
+        cur.execute(_SCHEMA_EVENTS)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS events_session_created ON events(session_id, created_at)"
+        )
+        cur.execute(_SCHEMA_RECALLS)
+        cur.execute(_SCHEMA_EMBEDDINGS)
+        cur.execute(_SCHEMA_EMBED_JOBS)
+        cur.execute(
+            "ALTER TABLE embedding_jobs ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ"
+        )
+        cur.execute(
+            "ALTER TABLE embedding_jobs ADD COLUMN IF NOT EXISTS dead_lettered_at TIMESTAMPTZ"
+        )
+        cur.execute(
+            """
+            UPDATE embedding_jobs job
+            SET attempt_count = GREATEST(attempt_count, 8),
+                last_error = %(orphan_error)s,
+                last_attempt_at = now(), dead_lettered_at = now()
+            WHERE NOT EXISTS (SELECT 1 FROM events event WHERE event.id = job.event_id)
+              AND dead_lettered_at IS NULL
+            """,
+            {"orphan_error": _ORPHAN_EMBED_JOB_ERROR},
+        )
+
+    def push_batch(
+        self,
+        sessions: list[dict[str, Any]],
+        events: list[dict[str, Any]],
+        embedding_jobs: list[dict[str, Any]],
+    ) -> None:
+        """Atomically initialize schema and mirror one idempotent outbox batch."""
+        with self._cursor() as cur:
+            self._ensure_schema(cur)
+            if sessions:
+                cur.executemany(
+                    """
+                    INSERT INTO sessions(
+                        id, agent, external_id, created_at, metadata, user_name, user_email
+                    )
+                    VALUES (
+                        %(id)s, %(agent)s, %(external_id)s, %(created_at)s,
+                        %(metadata)s, %(user_name)s, %(user_email)s
+                    )
+                    ON CONFLICT (id) DO NOTHING
+                    """,
+                    sessions,
+                )
+            if events:
+                cur.executemany(
+                    """
+                    INSERT INTO events(id, session_id, role, content, created_at, metadata)
+                    VALUES (
+                        %(id)s, %(session_id)s, %(role)s, %(content)s,
+                        %(created_at)s, %(metadata)s
+                    )
+                    ON CONFLICT (id) DO NOTHING
+                    """,
+                    events,
+                )
+            if embedding_jobs:
+                cur.executemany(
+                    """
+                    INSERT INTO embedding_jobs (event_id, provider, model, content_hash)
+                    VALUES (%(event_id)s, %(provider)s, %(model)s, %(content_hash)s)
+                    ON CONFLICT (event_id, provider, model, content_hash) DO UPDATE
+                    SET attempt_count = 0,
+                        next_attempt_at = now(),
+                        last_error = NULL,
+                        last_attempt_at = NULL,
+                        dead_lettered_at = NULL
+                    WHERE embedding_jobs.dead_lettered_at IS NOT NULL
+                      AND embedding_jobs.last_error = %(orphan_error)s
+                    """,
+                    [
+                        {**job, "orphan_error": _ORPHAN_EMBED_JOB_ERROR}
+                        for job in embedding_jobs
+                    ],
+                )
 
     def upsert_session(self, session: dict[str, Any]) -> None:
         with self._cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO sessions(id, agent, external_id, created_at, metadata, user_name, user_email)
-                VALUES (%(id)s, %(agent)s, %(external_id)s, %(created_at)s, %(metadata)s, %(user_name)s, %(user_email)s)
+                INSERT INTO sessions(
+                    id, agent, external_id, created_at, metadata, user_name, user_email
+                )
+                VALUES (
+                    %(id)s, %(agent)s, %(external_id)s, %(created_at)s,
+                    %(metadata)s, %(user_name)s, %(user_email)s
+                )
                 ON CONFLICT (id) DO NOTHING
                 """,
                 session,
@@ -198,7 +287,10 @@ class RemoteStore:
             return cur.rowcount
 
     def pending_embed_jobs(
-        self, limit: int = 100, provider: str = "openrouter", model: str = "openai/text-embedding-3-small"
+        self,
+        limit: int = 100,
+        provider: str = "openrouter",
+        model: str = "openai/text-embedding-3-small",
     ) -> list[dict[str, Any]]:
         """Due embedding jobs joined with event content (redacted already at ingest)."""
         with self._cursor() as cur:
@@ -210,6 +302,7 @@ class RemoteStore:
                 JOIN events e ON e.id = j.event_id
                 WHERE j.provider = %(provider)s
                   AND j.model = %(model)s
+                  AND j.dead_lettered_at IS NULL
                   AND j.next_attempt_at <= now()
                 ORDER BY j.next_attempt_at
                 LIMIT %(limit)s
@@ -218,49 +311,167 @@ class RemoteStore:
             ).fetchall()
             return [dict(r) for r in rows]
 
-    def mark_embed_success(self, event_id: str, provider: str, model: str, content_hash: str) -> None:
+    def mark_embed_success(
+        self, event_id: str, provider: str, model: str, content_hash: str
+    ) -> None:
         with self._cursor() as cur:
             cur.execute(
-                "DELETE FROM embedding_jobs WHERE event_id=%s AND provider=%s AND model=%s AND content_hash=%s",
+                "DELETE FROM embedding_jobs "
+                "WHERE event_id=%s AND provider=%s AND model=%s AND content_hash=%s",
                 (event_id, provider, model, content_hash),
             )
 
     def mark_embed_error(
-        self, event_id: str, provider: str, model: str, content_hash: str, error: str
+        self,
+        event_id: str,
+        provider: str,
+        model: str,
+        content_hash: str,
+        error: str,
     ) -> None:
-        with self._cursor() as cur:
-            cur.execute(
-                """
-                UPDATE embedding_jobs
-                SET attempt_count = attempt_count + 1,
-                    next_attempt_at = now() + make_interval(secs => LEAST(3600, 30 * power(2, attempt_count))),
-                    last_error = %(err)s
-                WHERE event_id = %(event_id)s AND provider = %(provider)s
-                  AND model = %(model)s AND content_hash = %(content_hash)s
-                """,
+        self.mark_embed_errors(
+            [
                 {
-                    "err": error[:500],
                     "event_id": event_id,
                     "provider": provider,
                     "model": model,
                     "content_hash": content_hash,
-                },
+                }
+            ],
+            error,
+        )
+
+    def mark_embed_errors(
+        self,
+        jobs: list[dict[str, Any]],
+        error: str,
+        retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
+    ) -> None:
+        """Atomically defer or dead-letter every failed embedding job."""
+        if not jobs:
+            return
+        attempted_at = datetime.now(timezone.utc)
+        with self._cursor() as cur:
+            for job in jobs:
+                row = cur.execute(
+                    """
+                    SELECT attempt_count FROM embedding_jobs
+                    WHERE event_id = %(event_id)s AND provider = %(provider)s
+                      AND model = %(model)s AND content_hash = %(content_hash)s
+                    FOR UPDATE
+                    """,
+                    job,
+                ).fetchone()
+                if row is None:
+                    continue
+                attempt_count = int(row["attempt_count"]) + 1
+                is_dead = attempt_count >= retry_policy.max_attempts
+                next_attempt_at = attempted_at
+                if not is_dead:
+                    next_attempt_at += timedelta(
+                        seconds=retry_policy.delay_seconds(attempt_count)
+                    )
+                cur.execute(
+                    """
+                    UPDATE embedding_jobs
+                    SET attempt_count = %(attempt_count)s,
+                        next_attempt_at = %(next_attempt_at)s,
+                        last_error = %(error)s,
+                        last_attempt_at = %(attempted_at)s,
+                        dead_lettered_at = %(dead_lettered_at)s
+                    WHERE event_id = %(event_id)s AND provider = %(provider)s
+                      AND model = %(model)s AND content_hash = %(content_hash)s
+                    """,
+                    {
+                        **job,
+                        "attempt_count": attempt_count,
+                        "next_attempt_at": next_attempt_at,
+                        "error": redact(error)[:500],
+                        "attempted_at": attempted_at,
+                        "dead_lettered_at": attempted_at if is_dead else None,
+                    },
+                )
+
+    def complete_embed_jobs(
+        self, embeddings: list[dict[str, Any]], jobs: list[dict[str, Any]]
+    ) -> None:
+        """Persist vectors and acknowledge their jobs in one transaction."""
+        if not embeddings:
+            return
+        with self._cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO event_embeddings
+                    (event_id, provider, model, dimensions, content_hash, embedding)
+                VALUES
+                    (%(event_id)s, %(provider)s, %(model)s, %(dimensions)s,
+                     %(content_hash)s, %(embedding)s::vector)
+                ON CONFLICT (event_id, provider, model, content_hash) DO NOTHING
+                """,
+                embeddings,
+            )
+            cur.executemany(
+                """
+                DELETE FROM embedding_jobs
+                WHERE event_id = %(event_id)s AND provider = %(provider)s
+                  AND model = %(model)s AND content_hash = %(content_hash)s
+                """,
+                jobs,
             )
 
     def embedding_status(self) -> dict[str, Any]:
         with self._cursor() as cur:
             done = cur.execute("SELECT count(*) FROM event_embeddings").fetchone()
             due = cur.execute(
-                "SELECT count(*) FROM embedding_jobs WHERE next_attempt_at <= now()"
+                "SELECT count(*) FROM embedding_jobs job "
+                "WHERE dead_lettered_at IS NULL AND next_attempt_at <= now() "
+                "AND EXISTS (SELECT 1 FROM events event WHERE event.id = job.event_id)"
             ).fetchone()
             retry = cur.execute(
-                "SELECT count(*) FROM embedding_jobs WHERE next_attempt_at > now()"
+                "SELECT count(*) FROM embedding_jobs job "
+                "WHERE dead_lettered_at IS NULL AND next_attempt_at > now() "
+                "AND EXISTS (SELECT 1 FROM events event WHERE event.id = job.event_id)"
             ).fetchone()
+            dead = cur.execute(
+                "SELECT count(*) FROM embedding_jobs WHERE dead_lettered_at IS NOT NULL"
+            ).fetchone()
+            failure = cur.execute(
+                """
+                SELECT event_id, last_error, last_attempt_at
+                FROM embedding_jobs
+                WHERE last_error IS NOT NULL
+                ORDER BY last_attempt_at DESC NULLS LAST
+                LIMIT 1
+                """
+            ).fetchone()
+            failure_status = dict(failure) if failure else None
+            if failure_status and failure_status.get("last_error"):
+                failure_status["last_error"] = redact(
+                    str(failure_status["last_error"])
+                )[:500]
             return {
                 "embeddings_done": int(done["count"]),
                 "embed_jobs_due": int(due["count"]),
                 "embed_jobs_retrying": int(retry["count"]),
+                "embed_jobs_dead_lettered": int(dead["count"]),
+                "last_embed_error": failure_status,
             }
+
+    def requeue_dead_embed_jobs(self) -> int:
+        with self._cursor() as cur:
+            updated = cur.execute(
+                """
+                UPDATE embedding_jobs job
+                SET attempt_count = 0, next_attempt_at = now(),
+                    last_error = NULL, last_attempt_at = NULL,
+                    dead_lettered_at = NULL
+                WHERE dead_lettered_at IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM events event WHERE event.id = job.event_id
+                  )
+                """
+            )
+            return int(updated.rowcount)
 
     # --- recall ----------------------------------------------------------
 
@@ -303,12 +514,14 @@ class RemoteStore:
         vec = _fmt(vectors[0])
         with self._cursor() as cur:
             rows = cur.execute(
-                f"""
+                """
                 SELECT e.id, e.session_id, e.role, e.content, e.created_at,
                        s.agent, s.user_name, s.user_email,
                        COALESCE(r.count, 0) AS recall_count,
                        0 AS lexical_rank,
-                       row_number() OVER (ORDER BY (ee.embedding <=> %(vec)s::vector)) AS semantic_rank,
+                       row_number() OVER (
+                           ORDER BY (ee.embedding <=> %(vec)s::vector)
+                       ) AS semantic_rank,
                        0 AS rank
                 FROM event_embeddings ee
                 JOIN events e ON e.id = ee.event_id

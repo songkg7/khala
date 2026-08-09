@@ -63,6 +63,13 @@ def parser() -> argparse.ArgumentParser:
     embed_sub = embed_cmd.add_subparsers(dest="embed_action", required=True)
     embed_sub.add_parser("pending", help="Enqueue missing embeddings for pushed events")
     embed_sub.add_parser("status", help="Show embedding backlog on remote")
+    embed_sub.add_parser("retry-dead", help="Requeue dead-lettered embedding jobs")
+    outbox_cmd = commands.add_parser("outbox", help="Inspect or requeue remote-write failures")
+    outbox_sub = outbox_cmd.add_subparsers(dest="outbox_action", required=True)
+    outbox_dead = outbox_sub.add_parser("dead", help="List local dead-lettered writes")
+    outbox_dead.add_argument("--limit", type=int, default=100)
+    outbox_retry = outbox_sub.add_parser("retry-dead", help="Requeue local dead letters")
+    outbox_retry.add_argument("event_ids", nargs="*")
     ingest = commands.add_parser("ingest")
     ingest.add_argument("--agent", required=True)
     ingest.add_argument("--adapter", help="MODULE:CALLABLE; stdin JSONL is the default")
@@ -85,7 +92,11 @@ def parser() -> argparse.ArgumentParser:
     compat = commands.add_parser("compat-check", help="Verify a vendor session landed with a canonical schema + user identity")
     compat.add_argument("--adapter", required=True, help="Adapter name (hermes, codex)")
     compat.add_argument("--session-id", required=True, help="Vendor session id")
-    commands.add_parser("remote-worker", help="One detached push+embedding pass (internal — spawned by hook/connect)")
+    remote_worker = commands.add_parser(
+        "remote-worker",
+        help="One detached push+embedding pass (internal — spawned by hook/connect)",
+    )
+    remote_worker.add_argument("--run-id", help=argparse.SUPPRESS)
     return root
 
 
@@ -167,7 +178,7 @@ def main(argv: list[str] | None = None) -> int:
             if dsn:
                 from khala.worker import spawn_worker
 
-                spawn_worker(dsn)
+                spawn_worker(database_path, dsn)
             output(result)
         elif args.command == "hook":
             from khala.adapters import get_adapter
@@ -194,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
             if dsn:
                 from khala.worker import spawn_worker
 
-                spawn_worker(dsn)
+                spawn_worker(database_path, dsn)
             output({"status": "synced", **result})
         elif args.command == "workspace":
             from khala.config import load_config, save_config
@@ -228,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
             save_config(config_data)
             from khala.worker import spawn_worker
 
-            spawn_worker(args.dsn)
+            spawn_worker(database_path, args.dsn)
             from khala.config import mask_dsn
 
             output({"mode": "khalai", "remote": mask_dsn(args.dsn), "queued": queued})
@@ -292,9 +303,16 @@ def main(argv: list[str] | None = None) -> int:
 
             dsn = get_remote_dsn()
             if not dsn:
+                if args.run_id:
+                    store.mark_worker_finished(args.run_id, "skipped")
                 output({"status": "skipped", "reason": "not connected"})
                 return 0
-            output(run_worker(args.db.expanduser(), dsn, max_passes=5))
+            worker_result = run_worker(
+                database_path, dsn, max_passes=5, run_id=args.run_id
+            )
+            output(worker_result)
+            if worker_result.get("status") == "error":
+                return 2
         elif args.command == "embed":
             from khala.config import get_remote_dsn
             from khala.embeddings import api_key_set
@@ -305,6 +323,7 @@ def main(argv: list[str] | None = None) -> int:
                 output({"error": "not connected — connect to a remote first"})
                 return 0
             remote = RemoteStore(dsn)
+            remote.ensure_schema()
             if args.embed_action == "status":
                 output(remote.embedding_status())
             elif args.embed_action == "pending":
@@ -315,8 +334,28 @@ def main(argv: list[str] | None = None) -> int:
                 jobs = remote.enqueue_missing_embed_jobs()
                 from khala.worker import spawn_worker
 
-                spawn_worker(dsn)
+                spawn_worker(database_path, dsn)
                 output({"enqueued": jobs, "hint": "worker running in background"})
+            elif args.embed_action == "retry-dead":
+                jobs = remote.requeue_dead_embed_jobs()
+                from khala.worker import spawn_worker
+
+                spawn_worker(database_path, dsn)
+                output({"requeued": jobs, "hint": "worker running in background"})
+        elif args.command == "outbox":
+            if args.outbox_action == "dead":
+                if args.limit < 1:
+                    raise ValueError("limit must be positive")
+                output(store.dead_remote(args.limit))
+            elif args.outbox_action == "retry-dead":
+                event_ids = args.event_ids or None
+                requeued = store.requeue_remote_dead(event_ids)
+                dsn = _remote_dsn()
+                if dsn and requeued:
+                    from khala.worker import spawn_worker
+
+                    spawn_worker(database_path, dsn)
+                output({"requeued": requeued})
         return 0
     except psycopg.Error as error:
         print(f"khala: {public_error_message(error)}", file=sys.stderr)

@@ -38,7 +38,7 @@ khala workspace add /path/to/workspace
 ## CLI
 
 ```
-khala status                     # store stats (+ pending_push/pending_embedding)
+khala status                     # backlog/retry/dead-letter + worker health
 khala start --agent <name>       # start a session, returns session_id
 khala record <sid> <role> [txt]  # add a user/assistant/system/tool event
 khala recall <query> [--limit] [--mode lexical|semantic|hybrid]
@@ -49,7 +49,8 @@ khala hook <adapter>             # vendor hook entrypoint (reads stdin JSON)
 khala workspace add|remove|list  # manage auto-sync workspaces
 khala connect <postgres dsn>     # Khalai: connect to a shared store (pgvector)
 khala disconnect                 # back to Nerazim (local-only)
-khala embed status|pending       # embedding backlog / backfill jobs
+khala embed status|pending|retry-dead  # embedding backlog / recovery
+khala outbox dead|retry-dead     # inspect / requeue local push dead letters
 khala compat-check --adapter X --session-id Y   # canonical-schema gate
 ```
 
@@ -78,6 +79,12 @@ khala recall "how do I sync agent sessions" --mode hybrid     # RRF fusion (defa
   unavailable.
 - Embedding generation runs in the background `remote-worker` (spawned by
   `khala connect` / `khala hook`), never blocking the CLI.
+- Failed remote writes use bounded exponential backoff with jitter. After eight
+  attempts they remain as queryable dead letters instead of hot-looping.
+  `khala status` reports due, retrying, dead-letter, last-error, and durable
+  detached-worker state. Early detached-process failures are captured in the
+  private `.khala-worker.log` beside the local DB. `khala remote-worker` exits
+  nonzero on worker failure.
 
 ### OpenRouter API key
 
@@ -168,7 +175,19 @@ correctly (see `hermes hooks test`).
 1. Create `khala/adapters/<vendor>.py` with:
    - `name` class attr
    - `list_sessions(limit) -> list[str]`
+   - `read_batch(session_id, after_id) -> AdapterBatch`
    - `iter_events(session_id, after_id) -> Iterator[(message_id, canonical_event)]`
    - `handle_hook(payload) -> (session_id, cwd)` for hook-driven vendors
 2. Register it in `khala/adapters/__init__.py` `ADAPTERS`.
 3. `khala sync --adapter <vendor>` / `khala hook <vendor>` works.
+
+`AdapterBatch.next_watermark` is the highest completely read vendor position,
+including filtered/non-canonical records. Khala reads the full batch before any
+local write, then commits the session, canonical events, outbox rows, and
+watermark in one transaction. Adapters that only implement `iter_events` remain
+supported, but cannot advance across a trailing filtered record. On the first
+upgrade to the source-event ledger, only sessions that predate the ledger are
+verified against one full adapter stream; matching prefixes are adopted without
+duplication, while a mismatch fails without modifying local data. Legacy
+duplicate sessions are retained as archived records but excluded from recall,
+remote delivery, and backlog counts.

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from khala.identity import User, resolve_user
-from khala.store import Store
+from khala.models import AdapterBatch, SessionAdapter, SyncEvent
+from khala.store import Store, SyncConflict
+
+MAX_SYNC_CONFLICT_RETRIES = 3
 
 
 def _user(user: User | None, cwd: Path | None = None) -> User | None:
@@ -13,7 +17,7 @@ def _user(user: User | None, cwd: Path | None = None) -> User | None:
 
 
 def sync_session(
-    store: Store, adapter: Any, session_id: str,
+    store: Store, adapter: SessionAdapter, session_id: str,
     user: User | None = None, cwd: Path | None = None,
 ) -> dict[str, Any]:
     """Incrementally sync one vendor session into khala (canonical events only).
@@ -21,46 +25,94 @@ def sync_session(
     The adapter yields khala-canonical events; the vendor-specific message id
     is used only as a sync watermark (sync_state) and never stored as khala data.
     """
-    agent = getattr(adapter, "name")
+    agent = adapter.name
     resolved = _user(user, cwd)
-    khala_sid = store.get_session_id(agent, session_id)
-    if khala_sid is None:
-        khala_sid = store.add_session(agent, session_id, user=resolved)
-    elif resolved:
-        store.set_session_user(khala_sid, resolved)
 
-    watermark = store.get_watermark(agent, session_id)
-    added = 0
+    for _ in range(MAX_SYNC_CONFLICT_RETRIES):
+        watermark = store.get_watermark(agent, session_id)
+        reconcile = store.needs_sync_reconciliation(agent, session_id)
+        read_after = 0 if reconcile else watermark
+        batch = _read_batch(adapter, session_id, read_after)
+        events, skipped = _normalize_events(batch, read_after)
+        try:
+            if reconcile:
+                result = store.reconcile_sync_batch(
+                    agent=agent,
+                    external_id=session_id,
+                    expected_watermark=watermark,
+                    next_watermark=batch.next_watermark,
+                    events=events,
+                    user=resolved,
+                )
+            else:
+                result = store.apply_sync_batch(
+                    agent=agent,
+                    external_id=session_id,
+                    expected_watermark=watermark,
+                    next_watermark=batch.next_watermark,
+                    events=events,
+                    user=resolved,
+                )
+        except SyncConflict:
+            continue
+        result["session"] = session_id
+        result["skipped"] += skipped
+        return result
+    raise RuntimeError(f"sync conflict did not settle for session: {session_id}")
+
+
+def _read_batch(
+    adapter: SessionAdapter, session_id: str, watermark: int
+) -> AdapterBatch:
+    """Read a complete vendor range, with compatibility for legacy adapters."""
+    reader = getattr(adapter, "read_batch", None)
+    if callable(reader):
+        batch = reader(session_id, watermark)
+        if not isinstance(batch, AdapterBatch):
+            raise TypeError("adapter read_batch must return AdapterBatch")
+        return batch
+    rows = tuple(adapter.iter_events(session_id, watermark))
+    next_watermark = max((int(source_id) for source_id, _ in rows), default=watermark)
+    return AdapterBatch(rows, next_watermark)
+
+
+def _normalize_events(
+    batch: AdapterBatch, watermark: int
+) -> tuple[list[SyncEvent], int]:
+    if batch.next_watermark < watermark:
+        raise ValueError("adapter watermark cannot move backwards")
+    normalized: list[SyncEvent] = []
     skipped = 0
-    last_id = watermark
-    for mid, event in adapter.iter_events(session_id, watermark):
-        if mid <= watermark:
+    previous_source_id = watermark
+    for raw_source_id, raw_event in batch.events:
+        source_id = int(raw_source_id)
+        if source_id <= watermark:
             skipped += 1
             continue
-        last_id = max(last_id, mid)
-        store.add_event(
-            khala_sid,
-            str(event["role"]),
-            str(event["content"]),
-            event.get("created_at"),
-            None,
-        )
-        added += 1
-
-    if last_id > watermark:
-        store.set_watermark(agent, session_id, last_id)
-
-    events_total = len(store.get_events(khala_sid))
-    return {
-        "session": session_id,
-        "khala_session": khala_sid,
-        "added": added,
-        "skipped": skipped,
-        "events_total": events_total,
-    }
+        if source_id <= previous_source_id:
+            raise ValueError("adapter event ids must be strictly increasing")
+        if source_id > batch.next_watermark:
+            raise ValueError("adapter event id exceeds batch watermark")
+        if not isinstance(raw_event, Mapping):
+            raise TypeError("adapter event must be a mapping")
+        role = raw_event.get("role")
+        content = raw_event.get("content")
+        if not isinstance(role, str) or not isinstance(content, str):
+            raise TypeError("adapter event role and content must be strings")
+        created_at = raw_event.get("created_at")
+        if created_at is not None and not isinstance(created_at, str):
+            raise TypeError("adapter event created_at must be a string or null")
+        normalized.append(SyncEvent(source_id, role, content, created_at))
+        previous_source_id = source_id
+    return normalized, skipped
 
 
-def sync(store: Store, adapter: Any, user: User | None = None, max_sessions: int = 200) -> dict[str, Any]:
+def sync(
+    store: Store,
+    adapter: SessionAdapter,
+    user: User | None = None,
+    max_sessions: int = 200,
+) -> dict[str, Any]:
     """Bulk sync: import recent sessions not yet known to khala, catch up on known ones."""
     result = {"synced": 0, "skipped_sessions": 0, "errors": 0, "last_error": ""}
     for sid in adapter.list_sessions(max_sessions):
@@ -83,7 +135,7 @@ def push_session(store: Store, remote: Any, khala_session_id: str) -> dict[str, 
     """
     session_row = store.db.execute(
         "SELECT id, agent, external_id, created_at, metadata, user_name, user_email "
-        "FROM sessions WHERE id = ?",
+        "FROM sessions WHERE id = ? AND archived_at IS NULL",
         (khala_session_id,),
     ).fetchone()
     if session_row is None:
@@ -119,7 +171,11 @@ def push_session(store: Store, remote: Any, khala_session_id: str) -> dict[str, 
 def push_pending(store: Store, remote: Any, limit: int = 100) -> dict[str, Any]:
     """Push all local sessions to remote (used on connect to sync the backlog)."""
     rows = store.db.execute(
-        "SELECT id FROM sessions ORDER BY created_at DESC LIMIT ?",
+        """
+        SELECT id FROM sessions
+        WHERE archived_at IS NULL
+        ORDER BY created_at DESC LIMIT ?
+        """,
         (limit,),
     ).fetchall()
     total = 0

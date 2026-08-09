@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Iterable, Mapping
 
 # ponytail: regex-based redaction. Upgrade to AST-parsed detection in high-security deployments.
 SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -9,10 +8,14 @@ SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b(?:sk|ghp|github_pat)_[A-Za-z0-9_\-]{16,}\b"),
     re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"),
 )
+URI_USERINFO_PATTERN = re.compile(
+    r"([a-zA-Z][a-zA-Z0-9+.-]*://[^\s/:@]+:)[^\s/@]+(?=@)"
+)
 
 
 def redact(text: str) -> str:
     """Mask known secret patterns in-place. Non-destructive for clean text."""
+    text = URI_USERINFO_PATTERN.sub(r"\1[REDACTED]", text)
     text = SECRET_PATTERNS[0].sub(lambda m: f"{m.group(1)}=[REDACTED]", text)
     for pattern in SECRET_PATTERNS[1:]:
         text = pattern.sub("[REDACTED]", text)
