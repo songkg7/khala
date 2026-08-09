@@ -119,7 +119,12 @@ class EvalCLIIntegrationTest(unittest.TestCase):
         self.assertEqual(first_report["mode"], "lexical")
         self.assertEqual(first_report["hit_rate"], 1.0)
         with sqlite3.connect(self.database) as connection:
-            recall_rows = connection.execute("SELECT count(*) FROM recalls").fetchone()[0]
+            recall_rows = connection.execute(
+                """
+                SELECT (SELECT count(*) FROM recalls)
+                     + (SELECT count(*) FROM recall_requests)
+                """
+            ).fetchone()[0]
         self.assertEqual(recall_rows, 0)
         self.assertFalse(self.config_directory.exists())
         ensure_config_directory.assert_not_called()
@@ -195,7 +200,12 @@ class EvalCLIIntegrationTest(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertIn("invalid JSON", stderr)
         with sqlite3.connect(self.database) as connection:
-            recall_rows = connection.execute("SELECT count(*) FROM recalls").fetchone()[0]
+            recall_rows = connection.execute(
+                """
+                SELECT (SELECT count(*) FROM recalls)
+                     + (SELECT count(*) FROM recall_requests)
+                """
+            ).fetchone()[0]
         self.assertEqual(recall_rows, 0)
 
     def test_natural_language_punctuation_is_safe_for_local_fts(self) -> None:

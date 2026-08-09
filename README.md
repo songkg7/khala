@@ -60,6 +60,7 @@ khala workspace add /path/to/workspace
 
 ```
 khala status                     # backlog/retry/dead-letter + worker health
+khala usage [--days N] [--top-actors N]  # recall + event-creation statistics
 khala start --agent <name>       # start a session, returns session_id
 khala record <sid> <role> [txt]  # add a user/assistant/system/tool event
 khala recall <query> [--limit] [--mode lexical|semantic|hybrid]
@@ -81,7 +82,31 @@ khala eval --baseline            # deterministic Phase 3 recall quality gate
 
 Sessions are tagged with `user_name`/`user_email` resolved from
 `git config user.name`/`user.email` (global config included); falls back to
-`$USER` when no git identity exists. Override per sync with `--name`/`--email`.
+`$USER` when no git identity exists. This applies to `start`, `ingest`, and
+sync paths. Override per sync with `--name`/`--email`.
+
+### Usage statistics
+
+`khala usage` reports a bounded UTC window of product recall requests and
+canonical events created, grouped deterministically by day, actor, and recall
+mode. It never stores or reports the raw recall query, a query hash, event
+content, or error text. A zero-result recall still counts as one request, and a
+hybrid fallback is shown as requested `hybrid` / effective `lexical`.
+Actor identities use NFC normalization; email case folding is intentionally
+limited to ASCII letters so SQLite, PostgreSQL, and Python produce the same
+bucket before `--top-actors` is applied.
+
+Usage-request tracking is additive: `tracking_started_at` marks the migration
+boundary, and requests made before that time are not guessed from legacy event
+popularity counters. Event-creation counts are derived from the original event
+timestamp and session identity; archived duplicate sessions are excluded.
+Only the documented strict, timezone-aware RFC 3339 subset is assigned to a
+UTC day, keeping local and remote data-quality counts identical.
+Nerazim reports the local database, while Khalai reports only requests made
+against the shared remote. Offline local recall history is not uploaded when a
+client later connects. `data_quality.invalid_event_timestamps` is explicitly
+all-time across active events because malformed timestamps cannot be assigned
+to a requested UTC window.
 
 ### Semantic & hybrid recall (Khalai)
 

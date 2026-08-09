@@ -14,7 +14,16 @@ from khala.adjacency import validate_neighbor_limit
 from khala.embedding_chunks import CHUNKER_VERSION, MAX_CHUNK_UTF8_BYTES
 from khala.embedding_pipeline import ChunkEmbeddingRow
 from khala.embeddings import MODEL, PROVIDER
+from khala.identity import User
 from khala.models import ArchivedSession
+from khala.recall_usage import (
+    RecallMode,
+    UsageQuery,
+    UsageReport,
+    build_recall_usage,
+    validate_recall_limit,
+    validate_recall_mode,
+)
 from khala.redact import redact
 from khala.remote_adjacency import load_remote_event_neighbors
 from khala.remote_embeddings import complete_chunk_embed_jobs as persist_chunk_embed_jobs
@@ -25,6 +34,11 @@ from khala.remote_embeddings import (
 )
 from khala.remote_embeddings import enqueue_missing_embed_jobs as enqueue_missing_chunk_jobs
 from khala.remote_embeddings import search_semantic as search_chunk_semantic
+from khala.remote_recall_usage import (
+    ensure_remote_recall_usage_schema,
+    load_remote_usage,
+    record_remote_recall_usage,
+)
 from khala.retry import DEFAULT_RETRY_POLICY, RetryPolicy
 
 _SCHEMA_SESSIONS = """
@@ -117,29 +131,34 @@ def _literal_ilike_pattern(query: str) -> str:
 
 
 def recall_by_mode(
-    remote: Any, query: str, mode: str, limit: int = 5
+    remote: Any,
+    query: str,
+    mode: str,
+    limit: int = 5,
+    *,
+    user: User | None = None,
 ) -> list[dict[str, Any]]:
     """Dispatch remote recall by mode; hybrid falls back to lexical automatically."""
-    if mode == "semantic":
-        return remote.recall_semantic(query, limit)
-    if mode == "lexical":
-        return remote.recall_lexical(query, limit)
-    if mode == "hybrid":
-        return remote.recall_hybrid(query, limit)
-    raise ValueError(f"unsupported recall mode: {mode}")
+    validated_mode = validate_recall_mode(mode)
+    validated_limit = validate_recall_limit(limit)
+    if validated_mode == "semantic":
+        return remote.recall_semantic(query, validated_limit, user=user)
+    if validated_mode == "lexical":
+        return remote.recall_lexical(query, validated_limit, user=user)
+    return remote.recall_hybrid(query, validated_limit, user=user)
 
 
 def search_by_mode(
     remote: Any, query: str, mode: str, limit: int = 5
 ) -> list[dict[str, Any]]:
     """Dispatch read-only remote search without usage-stat mutations."""
-    if mode == "semantic":
-        return remote.search_semantic(query, limit)
-    if mode == "lexical":
-        return remote.search_lexical(query, limit)
-    if mode == "hybrid":
-        return remote.search_hybrid(query, limit)
-    raise ValueError(f"unsupported recall mode: {mode}")
+    validated_mode = validate_recall_mode(mode)
+    validated_limit = validate_recall_limit(limit)
+    if validated_mode == "semantic":
+        return remote.search_semantic(query, validated_limit)
+    if validated_mode == "lexical":
+        return remote.search_lexical(query, validated_limit)
+    return remote.search_hybrid(query, validated_limit)
 
 
 def _fuse_hybrid_results(
@@ -277,6 +296,7 @@ class RemoteStore:
         )
         cur.execute(_SCHEMA_EVENTS)
         cur.execute(_SCHEMA_RECALLS)
+        ensure_remote_recall_usage_schema(cur)
         cur.execute(_SCHEMA_EMBEDDINGS)
         ensure_chunk_schema(cur)
         cur.execute(_SCHEMA_EMBED_JOBS)
@@ -761,20 +781,24 @@ class RemoteStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def _record_recalls(self, event_ids: list[str]) -> None:
-        if not event_ids:
-            return
+    def _record_recall_usage(
+        self,
+        event_ids: Sequence[str],
+        *,
+        requested_mode: RecallMode,
+        effective_mode: RecallMode,
+        requested_limit: int,
+        user: User | None,
+    ) -> None:
+        usage = build_recall_usage(
+            actor=user,
+            requested_mode=requested_mode,
+            effective_mode=effective_mode,
+            requested_limit=requested_limit,
+            event_ids=event_ids,
+        )
         with self._cursor() as cur:
-            cur.executemany(
-                """
-                INSERT INTO recalls(event_id, count, last_recalled_at)
-                VALUES (%(event_id)s, 1, now())
-                ON CONFLICT(event_id) DO UPDATE SET
-                    count = recalls.count + 1,
-                    last_recalled_at = now()
-                """,
-                [{"event_id": event_id} for event_id in dict.fromkeys(event_ids)],
-            )
+            record_remote_recall_usage(cur, usage)
 
     def search(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         """Full-text search over the shared store, ordered by recency.
@@ -784,12 +808,13 @@ class RemoteStore:
         """
         return self.search_lexical(query, limit=limit)
 
-    def recall(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
-        rows = self.search(query, limit)
-        self._record_recalls([str(row["id"]) for row in rows])
-        return rows
+    def recall(
+        self, query: str, limit: int = 5, *, user: User | None = None
+    ) -> list[dict[str, Any]]:
+        return self.recall_lexical(query, limit, user=user)
 
     def search_lexical(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        validated_limit = validate_recall_limit(limit)
         with self._read_cursor() as cur:
             rows = cur.execute(
                 """
@@ -806,21 +831,29 @@ class RemoteStore:
                 ORDER BY e.created_at DESC, e.id
                 LIMIT %(limit)s
                 """,
-                {"pattern": _literal_ilike_pattern(query), "limit": limit},
+                {"pattern": _literal_ilike_pattern(query), "limit": validated_limit},
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def recall_lexical(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
-        rows = self.search_lexical(query, limit)
-        self._record_recalls([str(row["id"]) for row in rows])
+    def recall_lexical(
+        self, query: str, limit: int = 5, *, user: User | None = None
+    ) -> list[dict[str, Any]]:
+        validated_limit = validate_recall_limit(limit)
+        rows = self.search_lexical(query, validated_limit)
+        self._record_recall_usage(
+            [str(row["id"]) for row in rows],
+            requested_mode="lexical",
+            effective_mode="lexical",
+            requested_limit=validated_limit,
+            user=user,
+        )
         return rows
 
     def search_semantic(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         """Embed the query and return nearest events by cosine distance."""
         from khala.embeddings import embed
 
-        if type(limit) is not int or limit < 1:
-            raise ValueError("semantic search limit must be positive")
+        validated_limit = validate_recall_limit(limit)
         try:
             vectors = embed([query])
         except Exception as exc:
@@ -835,30 +868,56 @@ class RemoteStore:
                 provider=PROVIDER,
                 model=MODEL,
                 chunker_version=CHUNKER_VERSION,
-                limit=limit,
+                limit=validated_limit,
             )
 
-    def recall_semantic(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
-        rows = self.search_semantic(query, limit)
-        self._record_recalls([str(row["id"]) for row in rows])
+    def recall_semantic(
+        self, query: str, limit: int = 5, *, user: User | None = None
+    ) -> list[dict[str, Any]]:
+        validated_limit = validate_recall_limit(limit)
+        rows = self.search_semantic(query, validated_limit)
+        self._record_recall_usage(
+            [str(row["id"]) for row in rows],
+            requested_mode="semantic",
+            effective_mode="semantic",
+            requested_limit=validated_limit,
+            user=user,
+        )
         return rows
 
     def search_hybrid(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         """Strict RRF fusion for evaluation; semantic failure is surfaced."""
-        lex = self.search_lexical(query, limit=limit * 2)
-        sem = self.search_semantic(query, limit=limit * 2)
-        return _fuse_hybrid_results(lex, sem, limit)
+        validated_limit = validate_recall_limit(limit)
+        lex = self.search_lexical(query, limit=validated_limit * 2)
+        sem = self.search_semantic(query, limit=validated_limit * 2)
+        return _fuse_hybrid_results(lex, sem, validated_limit)
 
-    def recall_hybrid(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
-        lex = self.search_lexical(query, limit=limit * 2)
+    def recall_hybrid(
+        self, query: str, limit: int = 5, *, user: User | None = None
+    ) -> list[dict[str, Any]]:
+        validated_limit = validate_recall_limit(limit)
+        lex = self.search_lexical(query, limit=validated_limit * 2)
         try:
-            sem = self.search_semantic(query, limit=limit * 2)
+            sem = self.search_semantic(query, limit=validated_limit * 2)
         except ValueError:
-            rows = lex[:limit]
+            rows = lex[:validated_limit]
+            effective_mode: RecallMode = "lexical"
         else:
-            rows = _fuse_hybrid_results(lex, sem, limit)
-        self._record_recalls([str(row["id"]) for row in rows])
+            rows = _fuse_hybrid_results(lex, sem, validated_limit)
+            effective_mode = "hybrid"
+        self._record_recall_usage(
+            [str(row["id"]) for row in rows],
+            requested_mode="hybrid",
+            effective_mode=effective_mode,
+            requested_limit=validated_limit,
+            user=user,
+        )
         return rows
+
+    def usage(self, query: UsageQuery) -> UsageReport:
+        """Return bounded, privacy-safe shared-store usage statistics."""
+        with self._read_cursor() as cur:
+            return load_remote_usage(cur, query)
 
     def attach_neighbors(
         self, hits: list[dict[str, Any]], per_hit: int = 3

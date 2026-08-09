@@ -12,9 +12,22 @@ from typing import Any
 from khala.adjacency import validate_neighbor_limit
 from khala.identity import User
 from khala.local_adjacency import load_local_event_neighbors
+from khala.local_recall_usage import (
+    load_local_usage,
+    migrate_local_recall_usage,
+    record_local_recall_usage,
+)
 from khala.local_search import lexical_search, sample_events
 from khala.models import ArchivedSession, SyncEvent
 from khala.outbox import OutboxClaim, OutboxRepository, migrate_outbox
+from khala.recall_usage import (
+    RecallMode,
+    UsageQuery,
+    UsageReport,
+    build_recall_usage,
+    validate_recall_limit,
+    validate_recall_mode,
+)
 from khala.redact import redact
 from khala.secure_files import prepare_private_file
 from khala.session_migrations import migrate_sessions
@@ -132,6 +145,7 @@ class Store:
             migrate_worker_runs(self.db)
             migrate_sessions(self.db)
             migrate_sync_ledger(self.db)
+            migrate_local_recall_usage(self.db)
             self.db.commit()
         except BaseException:
             self._rollback_quietly()
@@ -542,26 +556,50 @@ class Store:
         """Read-only lexical search used by evaluation and recall."""
         return lexical_search(self.db, query, limit)
 
-    def _record_recalls(self, event_ids: Iterable[str]) -> None:
-        ids = tuple(dict.fromkeys(event_ids))
-        if not ids:
-            return
-        recalled_at = _now()
+    def _record_recall_usage(
+        self,
+        event_ids: Iterable[str],
+        *,
+        requested_mode: RecallMode,
+        effective_mode: RecallMode,
+        requested_limit: int,
+        user: User | None,
+    ) -> None:
+        usage = build_recall_usage(
+            actor=user,
+            requested_mode=requested_mode,
+            effective_mode=effective_mode,
+            requested_limit=requested_limit,
+            event_ids=event_ids,
+        )
         with self.transaction():
-            self.db.executemany(
-                """
-                INSERT INTO recalls(event_id, count, last_recalled_at) VALUES (?, 1, ?)
-                ON CONFLICT(event_id) DO UPDATE SET
-                    count = count + 1, last_recalled_at = excluded.last_recalled_at
-                """,
-                ((event_id, recalled_at) for event_id in ids),
-            )
+            record_local_recall_usage(self.db, usage)
 
-    def recall(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+    def recall(
+        self,
+        query: str,
+        limit: int = 5,
+        *,
+        requested_mode: RecallMode = "lexical",
+        user: User | None = None,
+    ) -> list[dict[str, Any]]:
         """Search and record returned events as real product usage."""
-        rows = self.search(query, limit)
-        self._record_recalls(str(row["id"]) for row in rows)
+        validated_limit = validate_recall_limit(limit)
+        validated_mode = validate_recall_mode(requested_mode)
+        rows = self.search(query, validated_limit)
+        self._record_recall_usage(
+            (str(row["id"]) for row in rows),
+            requested_mode=validated_mode,
+            effective_mode="lexical",
+            requested_limit=validated_limit,
+            user=user,
+        )
         return rows
+
+    def usage(self, query: UsageQuery) -> UsageReport:
+        """Return bounded, privacy-safe usage statistics from one read snapshot."""
+        with self._read_transaction():
+            return load_local_usage(self.db, query)
 
     def sample_events(self, limit: int = 20) -> list[dict[str, Any]]:
         """Read-only deterministic sample for opt-in eval-set generation."""

@@ -62,7 +62,7 @@ class RemoteSearchTest(unittest.TestCase):
 
         with (
             patch("khala.remote.psycopg.connect", return_value=connection),
-            patch.object(store, "_record_recalls") as record_recalls,
+            patch.object(store, "_record_recall_usage") as record_usage,
         ):
             result = store.search_lexical("deploy", limit=3)
 
@@ -74,7 +74,7 @@ class RemoteSearchTest(unittest.TestCase):
         self.assertIn("JOIN sessions s ON s.id = e.session_id", statement)
         self.assertIn("(to_jsonb(s)->>'archived_at') IS NULL", statement)
         self.assertEqual(select_call.args[1], {"pattern": "%deploy%", "limit": 3})
-        record_recalls.assert_not_called()
+        record_usage.assert_not_called()
         connection.rollback.assert_called_once_with()
         connection.commit.assert_not_called()
         connection.close.assert_called_once_with()
@@ -123,13 +123,19 @@ class RemoteSearchTest(unittest.TestCase):
 
         with (
             patch.object(store, "search_lexical", return_value=rows) as search,
-            patch.object(store, "_record_recalls") as record_recalls,
+            patch.object(store, "_record_recall_usage") as record_usage,
         ):
             result = store.recall_lexical("deploy", limit=2)
 
         self.assertEqual(result, rows)
         search.assert_called_once_with("deploy", 2)
-        record_recalls.assert_called_once_with(["event-1", "event-2"])
+        record_usage.assert_called_once_with(
+            ["event-1", "event-2"],
+            requested_mode="lexical",
+            effective_mode="lexical",
+            requested_limit=2,
+            user=None,
+        )
 
     def test_recall_recorder_deduplicates_event_ids_in_one_write(self) -> None:
         cursor = MagicMock()
@@ -137,12 +143,20 @@ class RemoteSearchTest(unittest.TestCase):
         cursor_context = MagicMock()
         cursor_context.__enter__.return_value = cursor
 
-        with patch.object(store, "_cursor", return_value=cursor_context):
-            store._record_recalls(["event-1", "event-1", "event-2"])
+        with patch.object(store, "_cursor", return_value=cursor_context), patch(
+            "khala.remote.record_remote_recall_usage"
+        ) as record_usage:
+            store._record_recall_usage(
+                ["event-1", "event-1", "event-2"],
+                requested_mode="lexical",
+                effective_mode="lexical",
+                requested_limit=2,
+                user=None,
+            )
 
-        cursor.executemany.assert_called_once()
-        written_rows = list(cursor.executemany.call_args.args[1])
-        self.assertEqual(written_rows, [{"event_id": "event-1"}, {"event_id": "event-2"}])
+        usage = record_usage.call_args.args[1]
+        self.assertEqual(usage.event_ids, ("event-1", "event-2"))
+        self.assertEqual(usage.result_count, 2)
 
     def test_search_hybrid_surfaces_semantic_failure_without_recording(self) -> None:
         lexical_rows = [
@@ -160,14 +174,14 @@ class RemoteSearchTest(unittest.TestCase):
             patch.object(
                 store, "search_semantic", side_effect=ValueError("semantic unavailable")
             ) as semantic,
-            patch.object(store, "_record_recalls") as record_recalls,
+            patch.object(store, "_record_recall_usage") as record_usage,
         ):
             with self.assertRaisesRegex(ValueError, "semantic unavailable"):
                 store.search_hybrid("deploy", limit=2)
 
         lexical.assert_called_once_with("deploy", limit=4)
         semantic.assert_called_once_with("deploy", limit=4)
-        record_recalls.assert_not_called()
+        record_usage.assert_not_called()
 
     def test_search_hybrid_fuses_without_mutating_backend_rows(self) -> None:
         lexical_rows = [
@@ -207,7 +221,7 @@ class RemoteSearchTest(unittest.TestCase):
         with (
             patch("khala.remote.psycopg.connect", return_value=connection),
             patch("khala.embeddings.embed", return_value=[[0.25, 0.5]]),
-            patch.object(store, "_record_recalls") as record_recalls,
+            patch.object(store, "_record_recall_usage") as record_usage,
         ):
             result = store.search_semantic("deploy", limit=3)
 
@@ -229,7 +243,7 @@ class RemoteSearchTest(unittest.TestCase):
         self.assertEqual(select_call.args[1]["provider"], PROVIDER)
         self.assertEqual(select_call.args[1]["model"], MODEL)
         self.assertEqual(select_call.args[1]["chunker_version"], CHUNKER_VERSION)
-        record_recalls.assert_not_called()
+        record_usage.assert_not_called()
         connection.rollback.assert_called_once_with()
         connection.commit.assert_not_called()
 
@@ -255,14 +269,20 @@ class RemoteSearchTest(unittest.TestCase):
             patch.object(
                 store, "search_semantic", side_effect=ValueError("semantic unavailable")
             ) as semantic,
-            patch.object(store, "_record_recalls") as record_recalls,
+            patch.object(store, "_record_recall_usage") as record_usage,
         ):
             result = store.recall_hybrid("deploy", limit=2)
 
         self.assertEqual(result, rows)
         lexical.assert_called_once_with("deploy", limit=4)
         semantic.assert_called_once_with("deploy", limit=4)
-        record_recalls.assert_called_once_with(["event-1", "event-2"])
+        record_usage.assert_called_once_with(
+            ["event-1", "event-2"],
+            requested_mode="hybrid",
+            effective_mode="lexical",
+            requested_limit=2,
+            user=None,
+        )
 
     def test_recall_hybrid_does_not_hide_unexpected_errors(self) -> None:
         store = RemoteStore("postgresql://example/db")
@@ -272,14 +292,14 @@ class RemoteSearchTest(unittest.TestCase):
             patch.object(
                 store, "search_semantic", side_effect=RuntimeError("programming error")
             ) as semantic,
-            patch.object(store, "_record_recalls") as record_recalls,
+            patch.object(store, "_record_recall_usage") as record_usage,
         ):
             with self.assertRaisesRegex(RuntimeError, "programming error"):
                 store.recall_hybrid("deploy")
 
         lexical.assert_called_once_with("deploy", limit=10)
         semantic.assert_called_once_with("deploy", limit=10)
-        record_recalls.assert_not_called()
+        record_usage.assert_not_called()
 
     def test_semantic_and_hybrid_sampling_only_select_embedded_events(self) -> None:
         for mode in ("semantic", "hybrid"):

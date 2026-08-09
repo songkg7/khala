@@ -8,6 +8,7 @@ import time
 import unittest
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, patch
@@ -17,7 +18,10 @@ from khala.embedding_chunks import CHUNKER_VERSION, chunk_text
 from khala.embedding_pipeline import ChunkEmbeddingRow
 from khala.embeddings import DIMENSIONS, MODEL, PROVIDER
 from khala.evaluation.backends import RemoteEvalBackend
+from khala.identity import User
 from khala.models import ArchivedSession
+from khala.recall_usage import UsageQuery, build_recall_usage
+from khala.remote_recall_usage import record_remote_recall_usage
 from khala.store import Store
 from khala.worker import OutboxPushError, process_embedding_jobs, push_outbox, run_worker
 
@@ -63,6 +67,8 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
                     "sessions",
                     "events",
                     "recalls",
+                    "recall_requests",
+                    "recall_usage_metadata",
                     "event_embeddings",
                     "event_embedding_chunks",
                     "embedding_jobs",
@@ -254,6 +260,8 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
                 "sessions",
                 "events",
                 "recalls",
+                "recall_requests",
+                "recall_usage_metadata",
                 "event_embeddings",
                 "event_embedding_chunks",
                 "embedding_jobs",
@@ -562,7 +570,10 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
         rows = self.remote.search_lexical("needle", limit=5)
 
         self.assertEqual([row["id"] for row in rows], ["event-1"])
-        self.assertEqual(self._counts("recalls"), {"recalls": 0})
+        self.assertEqual(
+            self._counts("recalls", "recall_requests"),
+            {"recalls": 0, "recall_requests": 0},
+        )
         with self.remote._read_cursor() as cursor:
             cursor.execute("SELECT count(*) FROM events")
             with self.assertRaises(psycopg.errors.ReadOnlySqlTransaction):
@@ -573,7 +584,10 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
                     """,
                     ("event-1",),
                 )
-        self.assertEqual(self._counts("recalls"), {"recalls": 0})
+        self.assertEqual(
+            self._counts("recalls", "recall_requests"),
+            {"recalls": 0, "recall_requests": 0},
+        )
 
     def test_product_hybrid_recall_records_one_usage_per_invocation(self) -> None:
         query_vector = fixed_vector(1.0)
@@ -595,14 +609,339 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
         with patch("khala.embeddings.embed", return_value=[query_vector]):
             search_rows = self.remote.search_hybrid("needle", limit=1)
             self.assertEqual([row["id"] for row in search_rows], ["event-1"])
-            self.assertEqual(self._counts("recalls"), {"recalls": 0})
+            self.assertEqual(
+                self._counts("recalls", "recall_requests"),
+                {"recalls": 0, "recall_requests": 0},
+            )
 
             recall_rows = self.remote.recall_hybrid("needle", limit=1)
 
         self.assertEqual([row["id"] for row in recall_rows], ["event-1"])
         with self.sandbox.connection() as connection:
-            usage = connection.execute("SELECT event_id, count FROM recalls").fetchone()
-        self.assertEqual(usage, ("event-1", 1))
+            popularity = connection.execute(
+                "SELECT event_id, count FROM recalls"
+            ).fetchone()
+            request = connection.execute(
+                """
+                SELECT requested_mode, effective_mode, requested_limit, result_count
+                FROM recall_requests
+                """
+            ).fetchone()
+        self.assertEqual(popularity, ("event-1", 1))
+        self.assertEqual(request, ("hybrid", "hybrid", 1, 1))
+
+    def test_zero_result_request_is_recorded_without_popularity(self) -> None:
+        with patch.object(self.remote, "search_lexical", return_value=[]):
+            rows = self.remote.recall_lexical(
+                "private query that must not be stored",
+                limit=3,
+                user=User("Integration", "INTEGRATION@example.invalid"),
+            )
+
+        self.assertEqual(rows, [])
+        self.assertEqual(
+            self._counts("recalls", "recall_requests"),
+            {"recalls": 0, "recall_requests": 1},
+        )
+        with self.sandbox.connection() as connection:
+            request = connection.execute(
+                """
+                SELECT actor_name, email, requested_mode, effective_mode,
+                       requested_limit, result_count
+                FROM recall_requests
+                """
+            ).fetchone()
+            columns = {
+                str(row[0])
+                for row in connection.execute(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'recall_requests'
+                    """
+                ).fetchall()
+            }
+        self.assertEqual(
+            request,
+            ("Integration", "integration@example.invalid", "lexical", "lexical", 3, 0),
+        )
+        self.assertFalse(columns & {"query", "query_hash", "content", "error"})
+
+    def test_request_rolls_back_when_popularity_foreign_key_fails(self) -> None:
+        with patch.object(
+            self.remote, "search_lexical", return_value=[{"id": "missing-event"}]
+        ):
+            with self.assertRaises(psycopg.errors.ForeignKeyViolation):
+                self.remote.recall_lexical("missing", limit=1)
+
+        self.assertEqual(
+            self._counts("recalls", "recall_requests"),
+            {"recalls": 0, "recall_requests": 0},
+        )
+
+    def test_late_older_request_cannot_regress_remote_last_recalled_at(self) -> None:
+        self.remote.push_batch(
+            [session_row()],
+            [event_row("event-1")],
+            [],
+        )
+        with self.sandbox.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO recalls(event_id, count, last_recalled_at)
+                VALUES ('event-1', 1, '2026-08-09T05:00:00+00:00')
+                """
+            )
+        usage = build_recall_usage(
+            actor=None,
+            requested_mode="lexical",
+            effective_mode="lexical",
+            requested_limit=1,
+            event_ids=("event-1",),
+            request_id="77777777-7777-4777-8777-777777777777",
+            recalled_at=datetime(2026, 8, 9, 4, tzinfo=timezone.utc),
+        )
+
+        with self.remote._cursor() as cursor:
+            record_remote_recall_usage(cursor, usage)
+
+        with self.sandbox.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT count, last_recalled_at::timestamptz
+                FROM recalls WHERE event_id = 'event-1'
+                """
+            ).fetchone()
+        self.assertEqual(row, (2, datetime(2026, 8, 9, 5, tzinfo=timezone.utc)))
+
+    def test_usage_report_aggregates_utc_actor_modes_and_archive_quality(self) -> None:
+        alice_session = {
+            **session_row("alice-session"),
+            "user_name": "Alice",
+            "user_email": "ALICE@example.com",
+        }
+        unknown_session = {
+            **session_row("unknown-session"),
+            "user_name": None,
+            "user_email": None,
+        }
+        archived_session = {
+            **session_row("archived-session"),
+            "user_name": "Bob",
+            "user_email": "bob@example.com",
+        }
+        events = [
+            event_row(
+                "alice-event",
+                session_id="alice-session",
+                created_at="2026-08-09T09:00:00+09:00",
+            ),
+            event_row(
+                "invalid-event",
+                session_id="alice-session",
+                created_at="not-a-time",
+            ),
+            event_row(
+                "sqlite-julian-event",
+                session_id="alice-session",
+                created_at="1",
+            ),
+            event_row(
+                "invalid-calendar-event",
+                session_id="alice-session",
+                created_at="2026-02-30T00:00:00Z",
+            ),
+            event_row(
+                "naive-timestamp-event",
+                session_id="alice-session",
+                created_at="2026-08-09T00:30:00",
+            ),
+            event_row(
+                "unknown-event",
+                session_id="unknown-session",
+                created_at="2026-08-08T23:00:00+00:00",
+            ),
+            event_row(
+                "archived-event",
+                session_id="archived-session",
+                created_at="2026-08-09T00:00:00+00:00",
+            ),
+        ]
+        self.remote.push_batch(
+            [alice_session, unknown_session, archived_session], events, []
+        )
+        self.remote.archive_sessions(
+            [
+                {
+                    "id": "archived-session",
+                    "archived_at": "2026-08-09T01:00:00+00:00",
+                    "duplicate_of": "alice-session",
+                }
+            ]
+        )
+        usages = (
+            build_recall_usage(
+                actor=User("Alice", "ALICE@example.com"),
+                requested_mode="hybrid",
+                effective_mode="lexical",
+                requested_limit=2,
+                event_ids=("alice-event",),
+                request_id="44444444-4444-4444-8444-444444444444",
+                recalled_at=datetime(2026, 8, 9, 3, tzinfo=timezone.utc),
+            ),
+            build_recall_usage(
+                actor=None,
+                requested_mode="lexical",
+                effective_mode="lexical",
+                requested_limit=2,
+                event_ids=(),
+                request_id="55555555-5555-4555-8555-555555555555",
+                recalled_at=datetime(2026, 8, 8, 3, tzinfo=timezone.utc),
+            ),
+        )
+        with self.remote._cursor() as cursor:
+            for usage in usages:
+                record_remote_recall_usage(cursor, usage)
+            cursor.execute(
+                """
+                UPDATE recall_usage_metadata
+                SET tracking_started_at = '2026-08-01T00:00:00+00:00'
+                WHERE singleton = 1
+                """
+            )
+
+        report = self.remote.usage(
+            UsageQuery(
+                days=2,
+                top_actors=1,
+                now=datetime(2026, 8, 9, 12, tzinfo=timezone.utc),
+            )
+        )
+
+        self.assertEqual(
+            report["totals"],
+            {
+                "recall_requests": 2,
+                "zero_result_requests": 1,
+                "results_returned": 1,
+                "fallback_requests": 1,
+                "events_created": 2,
+            },
+        )
+        self.assertEqual(
+            report["data_quality"],
+            {"scope": "all_active_events", "invalid_event_timestamps": 4},
+        )
+        self.assertEqual(
+            [row["day"] for row in report["by_day"]],
+            ["2026-08-08", "2026-08-09"],
+        )
+        self.assertEqual(report["by_actor"][0]["actor_key"], "email:alice@example.com")
+        self.assertEqual(report["by_actor"][1]["actor_key"], "other")
+        self.assertEqual(report["by_actor"][1]["recall_requests"], 1)
+        self.assertEqual(report["by_actor"][1]["events_created"], 1)
+
+    def test_usage_report_uses_strict_portable_timestamp_and_actor_contract(self) -> None:
+        actors = (
+            "Hári",
+            "Hári",
+            "Ha\u0301ri",
+            "Ha\u0301ri",
+            "Rival",
+            "Rival",
+            "Rival",
+        )
+        sessions = [
+            {**session_row(f"actor-{index}"), "user_name": name, "user_email": None}
+            for index, name in enumerate(actors)
+        ]
+        events = [
+            event_row(
+                f"actor-event-{index}",
+                session_id=f"actor-{index}",
+                created_at=f"2026-08-09T00:00:0{index}Z",
+            )
+            for index in range(len(actors))
+        ]
+        invalid_values = (
+            "2026-08-09t00:00:00z",
+            "0000-01-01T00:00:00Z",
+            "0001-01-01T00:00:00Z",
+            "9999-01-01T00:00:00Z",
+            "2026-08-09T23:59:60Z",
+            "2026-08-09T00:00:00+15:59",
+            "\t2026-08-09T00:00:00Z",
+            "2026-08-09T00:00:00.1234567Z",
+        )
+        edge_session = {**session_row("edge-session"), "user_email": None}
+        sessions.append(edge_session)
+        events.extend(
+            event_row(
+                f"invalid-edge-{index}",
+                session_id="edge-session",
+                created_at=created_at,
+            )
+            for index, created_at in enumerate(invalid_values)
+        )
+        events.append(
+            event_row(
+                "valid-offset-edge",
+                session_id="edge-session",
+                created_at="2026-08-09T00:00:00.123456+14:00",
+            )
+        )
+        self.remote.push_batch(sessions, events, [])
+
+        report = self.remote.usage(
+            UsageQuery(
+                days=2,
+                top_actors=1,
+                now=datetime(2026, 8, 9, 12, tzinfo=timezone.utc),
+            )
+        )
+
+        self.assertEqual(report["totals"]["events_created"], len(actors) + 1)
+        self.assertEqual(
+            report["data_quality"]["invalid_event_timestamps"],
+            len(invalid_values),
+        )
+        self.assertEqual(report["by_actor"][0]["actor_key"], "name:Hári")
+        self.assertEqual(report["by_actor"][0]["events_created"], 4)
+        self.assertEqual(report["by_actor"][1]["actor_key"], "other")
+        self.assertEqual(report["by_actor"][1]["events_created"], 4)
+
+    def test_usage_report_preserves_non_ascii_email_case_portably(self) -> None:
+        sessions = [
+            {
+                **session_row(f"email-{index}"),
+                "user_name": "Unicode Email",
+                "user_email": email,
+            }
+            for index, email in enumerate(("ΟΣ@example.com", "Ος@example.com"))
+        ]
+        events = [
+            event_row(
+                f"email-event-{index}",
+                session_id=f"email-{index}",
+                created_at=f"2026-08-09T00:00:0{index}Z",
+            )
+            for index in range(2)
+        ]
+        self.remote.push_batch(sessions, events, [])
+
+        report = self.remote.usage(
+            UsageQuery(
+                days=1,
+                top_actors=2,
+                now=datetime(2026, 8, 9, 12, tzinfo=timezone.utc),
+            )
+        )
+
+        self.assertEqual(
+            {row["actor_key"] for row in report["by_actor"]},
+            {"email:ΟΣ@example.com", "email:Ος@example.com"},
+        )
 
     def test_semantic_search_deduplicates_canonical_events_before_limit(self) -> None:
         query_vector = fixed_vector(1.0)
@@ -1333,6 +1672,7 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
                     """
                     SELECT
                         (SELECT count(*) FROM recalls),
+                        (SELECT count(*) FROM recall_requests),
                         (SELECT count(*) FROM sessions),
                         (SELECT count(*) FROM events),
                         (SELECT count(*) FROM embedding_jobs),
@@ -1362,6 +1702,7 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
                     """
                     SELECT
                         (SELECT count(*) FROM recalls),
+                        (SELECT count(*) FROM recall_requests),
                         (SELECT count(*) FROM sessions),
                         (SELECT count(*) FROM events),
                         (SELECT count(*) FROM embedding_jobs),

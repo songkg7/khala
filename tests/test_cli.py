@@ -70,6 +70,72 @@ class KhalaCLIIntegrationTest(unittest.TestCase):
         status = json.loads(out)
         self.assertEqual(status["sessions"], 0)
 
+    def test_local_usage_reports_recall_and_created_event_actor(self):
+        from khala.identity import User
+
+        user = User("Usage User", "USAGE@example.com")
+        with patch("khala.cli.resolve_user", return_value=user):
+            code, out, error = self._run("start", "--agent", "test")
+            self.assertEqual(code, 0, error)
+            session = json.loads(out)["session_id"]
+            code, _, error = self._run("record", session, "user", "usage needle")
+            self.assertEqual(code, 0, error)
+            code, _, error = self._run("recall", "usage needle", "--mode", "hybrid")
+            self.assertEqual(code, 0, error)
+
+        code, out, error = self._run("usage", "--days", "1", "--top-actors", "10")
+
+        self.assertEqual(code, 0, error)
+        report = json.loads(out)
+        self.assertEqual(report["backend"], "local")
+        self.assertEqual(report["totals"]["recall_requests"], 1)
+        self.assertEqual(report["totals"]["results_returned"], 1)
+        self.assertEqual(report["totals"]["events_created"], 1)
+        self.assertEqual(report["totals"]["fallback_requests"], 1)
+        self.assertEqual(report["by_actor"][0]["actor_key"], "email:usage@example.com")
+        self.assertEqual(
+            (report["by_mode"][0]["requested_mode"], report["by_mode"][0]["effective_mode"]),
+            ("hybrid", "lexical"),
+        )
+
+    def test_usage_bounds_fail_before_store_or_remote_lookup(self):
+        invalid = (("--days", "0"), ("--days", "3651"), ("--top-actors", "101"))
+        for arguments in invalid:
+            with self.subTest(arguments=arguments), patch("khala.cli.Store") as store:
+                code, _, error = self._run("usage", *arguments)
+
+                self.assertEqual(code, 2)
+                self.assertIn("must be between", error)
+                store.assert_not_called()
+
+    def test_remote_usage_converges_archives_and_routes_query(self):
+        tombstones = self._seed_archived_session()
+        self.config.save_config(
+            {"workspaces": [], "remote": "postgresql://example.invalid/khala"}
+        )
+        calls = []
+        with patch("khala.remote.RemoteStore") as remote_store:
+            remote = remote_store.return_value
+            remote.ensure_schema.side_effect = lambda: calls.append("schema")
+            remote.archive_sessions.side_effect = (
+                lambda sessions: calls.append(("archive", sessions))
+            )
+            remote.usage.side_effect = lambda query: (
+                calls.append(("usage", query.days, query.top_actors))
+                or {"backend": "remote"}
+            )
+
+            code, out, error = self._run(
+                "usage", "--days", "7", "--top-actors", "3"
+            )
+
+        self.assertEqual(code, 0, error)
+        self.assertEqual(json.loads(out), {"backend": "remote"})
+        self.assertEqual(
+            calls,
+            ["schema", ("archive", tombstones), ("usage", 7, 3)],
+        )
+
     def test_start_and_record_and_recall(self):
         code, out, _ = self._run("start", "--agent", "hermes", "--external-id", "ext-1")
         self.assertEqual(code, 0)

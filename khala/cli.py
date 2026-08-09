@@ -12,10 +12,31 @@ import psycopg
 
 from khala.adapter import ingest_events
 from khala.errors import public_error_message
+from khala.identity import resolve_user
 from khala.store import Store
 
 CANONICAL_DB = Path("~/.khala/khala.db").expanduser()
 DEFAULT_DB = Path(os.environ.get("KHALA_DB", str(CANONICAL_DB))).expanduser()
+
+
+def _bounded_integer(value: str, *, name: str, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"{name} must be an integer") from error
+    if parsed < minimum or parsed > maximum:
+        raise argparse.ArgumentTypeError(
+            f"{name} must be between {minimum} and {maximum}"
+        )
+    return parsed
+
+
+def _usage_days(value: str) -> int:
+    return _bounded_integer(value, name="days", minimum=1, maximum=3650)
+
+
+def _usage_top_actors(value: str) -> int:
+    return _bounded_integer(value, name="top actors", minimum=0, maximum=100)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -23,6 +44,11 @@ def parser() -> argparse.ArgumentParser:
     root.add_argument("--db", type=Path, default=DEFAULT_DB)
     commands = root.add_subparsers(dest="command", required=True)
     commands.add_parser("status")
+    usage = commands.add_parser(
+        "usage", help="Show privacy-safe recall and event-creation usage statistics"
+    )
+    usage.add_argument("--days", type=_usage_days, default=30)
+    usage.add_argument("--top-actors", type=_usage_top_actors, default=20)
     start = commands.add_parser("start")
     start.add_argument("--agent", required=True)
     start.add_argument("--external-id")
@@ -192,8 +218,25 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             mode = "khalai" if _remote_dsn() else "nerazim"
             output(store.status(mode=mode))
+        elif args.command == "usage":
+            from khala.recall_usage import UsageQuery
+
+            query = UsageQuery(days=args.days, top_actors=args.top_actors)
+            dsn = _remote_dsn()
+            if dsn:
+                output(_converged_remote(store, dsn).usage(query))
+            else:
+                output(store.usage(query))
         elif args.command == "start":
-            output({"session_id": store.add_session(args.agent, args.external_id)})
+            output(
+                {
+                    "session_id": store.add_session(
+                        args.agent,
+                        args.external_id,
+                        user=resolve_user(Path.cwd()),
+                    )
+                }
+            )
         elif args.command == "record":
             content = args.content if args.content is not None else sys.stdin.read()
             output({"event_id": store.add_event(args.session_id, args.role, content)})
@@ -203,17 +246,27 @@ def main(argv: list[str] | None = None) -> int:
             from khala.config import get_remote_dsn
 
             dsn = get_remote_dsn()
+            user = resolve_user(Path.cwd())
             if dsn:
                 from khala.remote import recall_by_mode
 
                 remote = _converged_remote(store, dsn)
                 results = recall_by_mode(
-                    remote, args.query, mode=args.mode, limit=args.limit
+                    remote,
+                    args.query,
+                    mode=args.mode,
+                    limit=args.limit,
+                    user=user,
                 )
                 if args.graph:
                     results = remote.attach_neighbors(results)
             else:
-                results = store.recall(args.query, args.limit)
+                results = store.recall(
+                    args.query,
+                    args.limit,
+                    requested_mode=args.mode,
+                    user=user,
+                )
                 if args.graph:
                     results = store.attach_neighbors(results)
             output(results)
@@ -229,10 +282,18 @@ def main(argv: list[str] | None = None) -> int:
                 output(store.graph(args.event_id, args.limit))
         elif args.command == "ingest":
             events = ingest_events(args.adapter, args.source, sys.stdin)
-            output({"session_id": store.import_events(args.agent, events)})
+            output(
+                {
+                    "session_id": store.import_events(
+                        args.agent,
+                        events,
+                        user=resolve_user(Path.cwd()),
+                    )
+                }
+            )
         elif args.command == "sync":
             from khala.adapters import get_adapter
-            from khala.identity import User, resolve_user
+            from khala.identity import User
             from khala.sync import sync as bulk_sync
             from khala.sync import sync_session as sync_one
 

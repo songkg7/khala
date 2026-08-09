@@ -743,7 +743,14 @@ class LocalEvaluationBackendTest(unittest.TestCase):
     def _recall_count(database: Path) -> int:
         db = sqlite3.connect(database)
         try:
-            return int(db.execute("SELECT count(*) FROM recalls").fetchone()[0])
+            return int(
+                db.execute(
+                    """
+                    SELECT (SELECT count(*) FROM recalls)
+                         + (SELECT count(*) FROM recall_requests)
+                    """
+                ).fetchone()[0]
+            )
         finally:
             db.close()
 
@@ -807,6 +814,10 @@ class LocalEvaluationBackendTest(unittest.TestCase):
         self.assertEqual(
             int(store.db.execute("SELECT count(*) FROM recalls").fetchone()[0]), 0
         )
+        self.assertEqual(
+            int(store.db.execute("SELECT count(*) FROM recall_requests").fetchone()[0]),
+            0,
+        )
 
         recalled = store.recall("needle")
         self.assertEqual([row["id"] for row in recalled], [event_id])
@@ -819,7 +830,12 @@ class LocalEvaluationBackendTest(unittest.TestCase):
             1,
         )
         self.assertEqual(int(store.search("needle")[0]["recall_count"]), 1)
-        self.assertEqual(store.recall("needle", limit=0), [])
+        self.assertEqual(
+            int(store.db.execute("SELECT count(*) FROM recall_requests").fetchone()[0]),
+            1,
+        )
+        with self.assertRaisesRegex(ValueError, "limit must be positive"):
+            store.recall("needle", limit=0)
 
     def test_local_backend_and_selection_fail_fast_on_invalid_configuration(self) -> None:
         missing = self.directory / "missing.db"

@@ -179,7 +179,15 @@ def run_baseline(path: Path | None = None) -> dict[str, Any]:
             if must_hit[index]
             and not set(row["gold"]) & {item["id"] for item in row["results"]}
         ]
-        recall_writes = int(store.db.execute("SELECT count(*) FROM recalls").fetchone()[0])
+        recall_writes = int(
+            store.db.execute(
+                """
+                SELECT
+                    (SELECT count(*) FROM recalls)
+                    + (SELECT count(*) FROM recall_requests)
+                """
+            ).fetchone()[0]
+        )
         passed = (
             not failures
             and recall_writes == 0

@@ -73,8 +73,16 @@ class KhalaStoreTest(unittest.TestCase):
         session = self.store.add_session("test")
         self.store.add_event(session, "user", "needle in haystack")
         self.assertEqual(self.store.recall("nonexistent"), [])
-        # ponytail: limit=0 returns nothing
-        self.assertEqual(self.store.recall("needle", limit=0), [])
+        self.assertEqual(
+            self.store.db.execute("SELECT count(*) FROM recall_requests").fetchone()[0],
+            1,
+        )
+        with self.assertRaisesRegex(ValueError, "limit must be positive"):
+            self.store.recall("needle", limit=0)
+        self.assertEqual(
+            self.store.db.execute("SELECT count(*) FROM recall_requests").fetchone()[0],
+            1,
+        )
 
     def test_recall_limit_and_weighting(self):
         session = self.store.add_session("test")
