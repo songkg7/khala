@@ -13,11 +13,13 @@ from typing import Any
 from unittest.mock import Mock, patch
 
 import psycopg
+from khala.embedding_chunks import CHUNKER_VERSION, chunk_text
+from khala.embedding_pipeline import ChunkEmbeddingRow
 from khala.embeddings import DIMENSIONS, MODEL, PROVIDER
 from khala.evaluation.backends import RemoteEvalBackend
 from khala.models import ArchivedSession
 from khala.store import Store
-from khala.worker import OutboxPushError, push_outbox, run_worker
+from khala.worker import OutboxPushError, process_embedding_jobs, push_outbox, run_worker
 
 from tests.postgres_integration_support import (
     PostgresSandbox,
@@ -62,6 +64,7 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
                     "events",
                     "recalls",
                     "event_embeddings",
+                    "event_embedding_chunks",
                     "embedding_jobs",
                 }:
                     raise ValueError(f"unsupported integration-test table: {table}")
@@ -100,6 +103,36 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
                     created_at,
                 ),
             )
+
+    @staticmethod
+    def _chunk_row(
+        event_id: str,
+        chunk_index: int,
+        chunk_count: int,
+        vector: list[float],
+        *,
+        content: str,
+        content_hash: str | None = None,
+        chunker_version: str = CHUNKER_VERSION,
+    ) -> ChunkEmbeddingRow:
+        expected_chunks = chunk_text(content)
+        if chunk_count != len(expected_chunks):
+            raise ValueError("test chunk count must match deterministic chunks")
+        expected = expected_chunks[chunk_index]
+        return ChunkEmbeddingRow(
+            event_id=event_id,
+            provider=PROVIDER,
+            model=MODEL,
+            content_hash=content_hash or f"hash-{event_id}",
+            chunker_version=chunker_version,
+            chunk_index=chunk_index,
+            chunk_count=chunk_count,
+            chunk_start=expected.char_start,
+            chunk_end=expected.char_end,
+            chunk_hash=expected.chunk_hash,
+            dimensions=DIMENSIONS,
+            embedding=tuple(vector),
+        )
 
     @staticmethod
     def _adjacency_events() -> list[dict[str, Any]]:
@@ -222,12 +255,60 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
                 "events",
                 "recalls",
                 "event_embeddings",
+                "event_embedding_chunks",
                 "embedding_jobs",
             },
         )
-        self.assertTrue({"events_session_created", "events_session_created_id"} <= indexes)
+        self.assertTrue(
+            {
+                "events_session_created",
+                "events_session_created_id",
+                "event_embedding_chunks_generation_lookup",
+            }
+            <= indexes
+        )
         self.assertEqual(composite_columns, ["session_id", "created_at", "id"])
         self.assertEqual(composite_state, (1, True, True))
+
+    def test_concurrent_schema_upgrades_do_not_deadlock_each_other(self) -> None:
+        first = PostgresSandbox.create(
+            self.sandbox.base_dsn,
+            self.vector_schema,
+            initialize=False,
+        )
+        second = PostgresSandbox.create(
+            self.sandbox.base_dsn,
+            self.vector_schema,
+            initialize=False,
+        )
+        self.addCleanup(first.close)
+        self.addCleanup(second.close)
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+        errors_lock = threading.Lock()
+
+        def migrate(sandbox: PostgresSandbox) -> None:
+            try:
+                barrier.wait(timeout=5)
+                sandbox.remote.ensure_schema()
+            except BaseException as error:
+                with errors_lock:
+                    errors.append(error)
+
+        migrations = [
+            threading.Thread(target=migrate, args=(sandbox,), daemon=True)
+            for sandbox in (first, second)
+        ]
+        for migration in migrations:
+            migration.start()
+        for migration in migrations:
+            migration.join(timeout=15)
+
+        self.assertFalse(
+            any(migration.is_alive() for migration in migrations),
+            "concurrent schema upgrades did not finish",
+        )
+        self.assertEqual(errors, [])
 
     def test_concurrent_index_upgrade_allows_writes_while_waiting_for_a_writer(
         self,
@@ -570,6 +651,410 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
         self.assertEqual([row["id"] for row in rows], ["event-1", "event-2"])
         self.assertEqual([int(row["semantic_rank"]) for row in rows], [1, 2])
 
+    def test_chunk_completion_dual_writes_and_empty_jobs_ack_atomically(self) -> None:
+        event_id = "chunked-event"
+        empty_event_id = "empty-event"
+        content = "x" * 6001
+        job = embedding_job_row(event_id, "chunked-generation")
+        empty_job = embedding_job_row(empty_event_id, "empty-generation")
+        self.remote.push_batch(
+            [session_row()],
+            [
+                event_row(event_id, content=content),
+                event_row(empty_event_id, content=""),
+            ],
+            [job, empty_job],
+        )
+        rows = [
+            self._chunk_row(
+                event_id,
+                0,
+                2,
+                fixed_vector(0.0, 1.0),
+                content=content,
+                content_hash="chunked-generation",
+            ),
+            self._chunk_row(
+                event_id,
+                1,
+                2,
+                fixed_vector(1.0),
+                content=content,
+                content_hash="chunked-generation",
+            ),
+        ]
+
+        self.remote.complete_chunk_embed_jobs(rows, [{**job, "content": content}])
+        self.remote.complete_chunk_embed_jobs([], [{**empty_job, "content": ""}])
+        self.remote.ensure_schema()
+        self.remote.ensure_schema()
+
+        with self.sandbox.connection() as connection:
+            chunks = connection.execute(
+                """
+                SELECT chunk_index, chunk_count, chunk_start, chunk_end
+                FROM event_embedding_chunks
+                WHERE event_id = %s
+                ORDER BY chunk_index
+                """,
+                (event_id,),
+            ).fetchall()
+            legacy = connection.execute(
+                """
+                SELECT count(*), min(content_hash)
+                FROM event_embeddings
+                WHERE event_id = %s
+                """,
+                (event_id,),
+            ).fetchone()
+            jobs = connection.execute(
+                "SELECT count(*) FROM embedding_jobs"
+            ).fetchone()
+            lookup_index = connection.execute(
+                "SELECT to_regclass('event_embedding_chunks_generation_lookup')::text"
+            ).fetchone()
+
+        self.assertEqual(chunks, [(0, 2, 0, 6000), (1, 2, 5400, 6001)])
+        self.assertEqual(legacy, (1, "chunked-generation"))
+        self.assertEqual(jobs, (0,))
+        self.assertEqual(lookup_index, ("event_embedding_chunks_generation_lookup",))
+        self.assertEqual(
+            self._counts("event_embedding_chunks", "event_embeddings"),
+            {"event_embedding_chunks": 2, "event_embeddings": 1},
+        )
+
+    def test_chunk_completion_rolls_back_when_caller_content_disagrees(self) -> None:
+        event_id = "content-bound-event"
+        actual_content = "database content is authoritative"
+        forged_content = "caller supplied different content"
+        job = embedding_job_row(event_id, "content-bound-generation")
+        self.remote.push_batch(
+            [session_row()],
+            [event_row(event_id, content=actual_content)],
+            [job],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "preconditions were not satisfied"):
+            self.remote.complete_chunk_embed_jobs([], [{**job, "content": ""}])
+
+        forged_row = self._chunk_row(
+            event_id,
+            0,
+            1,
+            fixed_vector(1.0),
+            content=forged_content,
+            content_hash="content-bound-generation",
+        )
+        with self.assertRaisesRegex(RuntimeError, "preconditions were not satisfied"):
+            self.remote.complete_chunk_embed_jobs(
+                [forged_row],
+                [{**job, "content": forged_content}],
+            )
+
+        self.assertEqual(
+            self._counts(
+                "event_embedding_chunks",
+                "event_embeddings",
+                "embedding_jobs",
+            ),
+            {
+                "event_embedding_chunks": 0,
+                "event_embeddings": 0,
+                "embedding_jobs": 1,
+            },
+        )
+
+    def test_duplicate_chunk_completion_keeps_chunk_and_legacy_vectors_immutable(
+        self,
+    ) -> None:
+        event_id = "immutable-chunk-event"
+        content = "content-addressed embedding input"
+        content_hash = "immutable-generation"
+        job = embedding_job_row(event_id, content_hash)
+        self.remote.push_batch(
+            [session_row()],
+            [event_row(event_id, content=content)],
+            [job],
+        )
+        first_vector = fixed_vector(0.0, 1.0)
+        second_vector = fixed_vector(1.0)
+        self.remote.complete_chunk_embed_jobs(
+            [
+                self._chunk_row(
+                    event_id,
+                    0,
+                    1,
+                    first_vector,
+                    content=content,
+                    content_hash=content_hash,
+                )
+            ],
+            [{**job, "content": content}],
+        )
+
+        self.remote.push_batch([], [], [job])
+        self.remote.complete_chunk_embed_jobs(
+            [
+                self._chunk_row(
+                    event_id,
+                    0,
+                    1,
+                    second_vector,
+                    content=content,
+                    content_hash=content_hash,
+                )
+            ],
+            [{**job, "content": content}],
+        )
+
+        with self.sandbox.connection() as connection:
+            vectors = connection.execute(
+                """
+                SELECT chunk.embedding = %s::vector,
+                       legacy.embedding = %s::vector
+                FROM event_embedding_chunks chunk
+                JOIN event_embeddings legacy
+                  ON legacy.event_id = chunk.event_id
+                 AND legacy.provider = chunk.provider
+                 AND legacy.model = chunk.model
+                 AND legacy.content_hash = chunk.content_hash
+                WHERE chunk.event_id = %s
+                """,
+                (
+                    vector_literal(first_vector),
+                    vector_literal(first_vector),
+                    event_id,
+                ),
+            ).fetchone()
+
+        self.assertEqual(vectors, (True, True))
+        self.assertEqual(self._counts("embedding_jobs"), {"embedding_jobs": 0})
+
+    def test_worker_chunks_long_event_and_persists_tail_with_legacy_compatibility(self) -> None:
+        event_id = "worker-long-event"
+        private_tail = "tail-semantic-marker"
+        content = ("x" * 6500) + private_tail
+        job = embedding_job_row(event_id, "worker-long-hash")
+        self.remote.push_batch(
+            [session_row()],
+            [event_row(event_id, content=content)],
+            [job],
+        )
+
+        def vectors(texts: list[str]) -> list[list[float]]:
+            return [
+                fixed_vector(0.0, 1.0) if index == 0 else fixed_vector(1.0)
+                for index, _ in enumerate(texts)
+            ]
+
+        with patch("khala.worker.embed", side_effect=vectors) as embed_mock:
+            result = process_embedding_jobs(self.remote)
+
+        sent = embed_mock.call_args.args[0]
+        self.assertEqual(len(sent), 2)
+        self.assertTrue(sent[-1].endswith(private_tail))
+        self.assertEqual(result, {"embedded": [event_id]})
+        self.assertNotIn(private_tail, repr(result))
+        self.assertEqual(
+            self._counts(
+                "event_embedding_chunks",
+                "event_embeddings",
+                "embedding_jobs",
+            ),
+            {
+                "event_embedding_chunks": 2,
+                "event_embeddings": 1,
+                "embedding_jobs": 0,
+            },
+        )
+        with patch("khala.embeddings.embed", return_value=[fixed_vector(1.0)]):
+            rows = self.remote.search_semantic("tail", limit=1)
+        self.assertEqual([row["id"] for row in rows], [event_id])
+
+    def test_semantic_search_ranks_events_by_best_complete_current_chunk(self) -> None:
+        event_ids = ["a-tail", "b-single", "c-incomplete", "d-current", "e-old"]
+        contents = {
+            event_id: (
+                ("a" * 6001)
+                if event_id == "a-tail"
+                else f"semantic chunk ranking content for {event_id}"
+            )
+            for event_id in event_ids
+        }
+        completed_ids = ("a-tail", "b-single", "d-current")
+        self.remote.push_batch(
+            [session_row()],
+            [
+                event_row(
+                    event_id,
+                    content=contents[event_id],
+                    created_at=f"2026-01-01T00:00:0{index}+00:00",
+                )
+                for index, event_id in enumerate(event_ids, 1)
+            ],
+            [
+                embedding_job_row(event_id, f"hash-{event_id}")
+                for event_id in completed_ids
+            ],
+        )
+        self._insert_embedding(
+            "c-incomplete",
+            content_hash="legacy-c",
+            vector=fixed_vector(1.0, 0.01),
+            created_at="2026-01-01T00:00:00+00:00",
+        )
+        self._insert_embedding(
+            "d-current",
+            content_hash="legacy-d",
+            vector=fixed_vector(1.0),
+            created_at="2026-01-01T00:00:00+00:00",
+        )
+        self._insert_embedding(
+            "e-old",
+            content_hash="legacy-e",
+            vector=fixed_vector(0.0, 1.0),
+            created_at="2026-01-01T00:00:00+00:00",
+        )
+        chunk_rows = [
+            self._chunk_row(
+                "a-tail", 0, 2, fixed_vector(0.0, 1.0), content=contents["a-tail"]
+            ),
+            self._chunk_row(
+                "a-tail", 1, 2, fixed_vector(1.0), content=contents["a-tail"]
+            ),
+            self._chunk_row(
+                "b-single",
+                0,
+                1,
+                fixed_vector(1.0, 0.05),
+                content=contents["b-single"],
+            ),
+            self._chunk_row(
+                "d-current",
+                0,
+                1,
+                fixed_vector(0.0, 1.0),
+                content=contents["d-current"],
+            ),
+        ]
+        self.remote.complete_chunk_embed_jobs(
+            chunk_rows,
+            [
+                {
+                    **embedding_job_row(event_id, f"hash-{event_id}"),
+                    "content": contents[event_id],
+                }
+                for event_id in completed_ids
+            ],
+        )
+        with self.sandbox.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO event_embedding_chunks(
+                    event_id, provider, model, content_hash, chunker_version,
+                    chunk_index, chunk_count, chunk_start, chunk_end, chunk_hash,
+                    dimensions, embedding
+                ) VALUES
+                    (%s, %s, %s, 'incomplete-c', %s,
+                     0, 2, 0, 10, 'incomplete-c-0', %s, %s::vector),
+                    (%s, %s, %s, 'old-e', 'utf8-bytes-v0',
+                     0, 1, 0, 10, 'old-e-0', %s, %s::vector)
+                """,
+                (
+                    "c-incomplete",
+                    PROVIDER,
+                    MODEL,
+                    CHUNKER_VERSION,
+                    DIMENSIONS,
+                    vector_literal(fixed_vector(0.0, 1.0)),
+                    "e-old",
+                    PROVIDER,
+                    MODEL,
+                    DIMENSIONS,
+                    vector_literal(fixed_vector(1.0)),
+                ),
+            )
+
+        with patch("khala.embeddings.embed", return_value=[fixed_vector(1.0)]):
+            rows = self.remote.search_semantic("tail meaning", limit=5)
+
+        self.assertEqual(
+            [row["id"] for row in rows],
+            ["a-tail", "c-incomplete", "b-single", "d-current", "e-old"],
+        )
+        self.assertEqual([int(row["semantic_rank"]) for row in rows], [1, 2, 3, 4, 5])
+        sampled = self.remote.sample_events(10, mode="semantic")
+        self.assertEqual(set(row["id"] for row in sampled), set(event_ids))
+        self.assertEqual(len(sampled), len(event_ids))
+        self.assertEqual(self.remote.embedding_status()["embeddings_done"], len(event_ids))
+
+    def test_chunk_backfill_requeues_only_missing_or_truncated_nonempty_events(self) -> None:
+        short_legacy = "short-legacy"
+        long_legacy = "long-legacy"
+        missing = "missing"
+        current = "current"
+        empty = "empty"
+        current_content = "y" * 6001
+        current_job = embedding_job_row(current, "hash-current")
+        self.remote.push_batch(
+            [session_row()],
+            [
+                event_row(short_legacy, content="short legacy content"),
+                event_row(long_legacy, content="x" * 6001),
+                event_row(missing, content="missing embedding"),
+                event_row(current, content=current_content),
+                event_row(empty, content=""),
+            ],
+            [current_job],
+        )
+        self._insert_embedding(
+            short_legacy,
+            content_hash="legacy-short",
+            vector=fixed_vector(1.0),
+            created_at="2026-01-01T00:00:00+00:00",
+        )
+        self._insert_embedding(
+            long_legacy,
+            content_hash="legacy-long",
+            vector=fixed_vector(1.0),
+            created_at="2026-01-01T00:00:00+00:00",
+        )
+        self.remote.complete_chunk_embed_jobs(
+            [
+                self._chunk_row(
+                    current,
+                    0,
+                    2,
+                    fixed_vector(1.0),
+                    content=current_content,
+                    content_hash="hash-current",
+                ),
+                self._chunk_row(
+                    current,
+                    1,
+                    2,
+                    fixed_vector(0.0, 1.0),
+                    content=current_content,
+                    content_hash="hash-current",
+                ),
+            ],
+            [{**current_job, "content": current_content}],
+        )
+
+        first = self.remote.enqueue_missing_embed_jobs()
+        second = self.remote.enqueue_missing_embed_jobs()
+        pending = self.remote.pending_embed_jobs(limit=10)
+
+        self.assertEqual(first, 2)
+        self.assertEqual(second, 0)
+        self.assertEqual(
+            {row["event_id"] for row in pending},
+            {long_legacy, missing},
+        )
+        self.assertNotIn(short_legacy, {row["event_id"] for row in pending})
+        self.assertNotIn(current, {row["event_id"] for row in pending})
+        self.assertNotIn(empty, {row["event_id"] for row in pending})
+
     def test_worker_archive_sync_quarantines_every_remote_read_path(self) -> None:
         active_session_id = "active-session"
         active_event_id = "active-event"
@@ -766,6 +1251,7 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
             connection.execute(
                 "ALTER TABLE sessions DROP COLUMN archived_at, DROP COLUMN duplicate_of"
             )
+            connection.execute("DROP TABLE event_embedding_chunks")
 
         self.assertEqual(
             [row["id"] for row in self.remote.search_lexical("compatibility", 10)],
@@ -776,10 +1262,12 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
             hybrid = self.remote.search_hybrid("compatibility", 10)
         self.assertEqual([row["id"] for row in semantic], [event_id])
         self.assertEqual([row["id"] for row in hybrid], [event_id])
-        self.assertEqual(
-            [row["id"] for row in self.remote.sample_events(10)],
-            [event_id],
-        )
+        for mode in ("lexical", "semantic", "hybrid"):
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    [row["id"] for row in self.remote.sample_events(10, mode=mode)],
+                    [event_id],
+                )
         self.assertTrue(self.remote.graph(event_id, 3)["found"])
         attached = self.remote.attach_neighbors(
             [{"id": event_id, "session_id": "session-1"}], per_hit=3
@@ -1198,6 +1686,59 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
         self.assertEqual(
             self._counts("event_embeddings", "embedding_jobs"),
             {"event_embeddings": 0, "embedding_jobs": 1},
+        )
+
+    def test_chunk_legacy_dual_write_and_job_ack_roll_back_together(self) -> None:
+        job = embedding_job_row("event-1")
+        self.remote.push_batch(
+            [session_row()],
+            [event_row("event-1")],
+            [job],
+        )
+        with self.sandbox.connection() as connection:
+            connection.execute(
+                """
+                CREATE FUNCTION reject_chunk_job_delete() RETURNS trigger
+                LANGUAGE plpgsql AS $$
+                BEGIN
+                    RAISE EXCEPTION 'forced chunk ack rollback';
+                END
+                $$
+                """
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER reject_chunk_job_delete
+                BEFORE DELETE ON embedding_jobs
+                FOR EACH ROW EXECUTE FUNCTION reject_chunk_job_delete()
+                """
+            )
+
+        row = self._chunk_row(
+            "event-1",
+            0,
+            1,
+            fixed_vector(1.0),
+            content="needle integration memory",
+            content_hash="hash-1",
+        )
+        with self.assertRaises(psycopg.errors.RaiseException):
+            self.remote.complete_chunk_embed_jobs(
+                [row],
+                [{**job, "content": "needle integration memory"}],
+            )
+
+        self.assertEqual(
+            self._counts(
+                "event_embedding_chunks",
+                "event_embeddings",
+                "embedding_jobs",
+            ),
+            {
+                "event_embedding_chunks": 0,
+                "event_embeddings": 0,
+                "embedding_jobs": 1,
+            },
         )
 
 

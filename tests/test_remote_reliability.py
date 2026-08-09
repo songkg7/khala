@@ -60,7 +60,7 @@ class RemoteTransactionTest(unittest.TestCase):
     def test_ensure_schema_migrates_legacy_sessions_with_archive_columns(self):
         schema_connection, schema_cursor = self._connection()
         index_connection, index_cursor = self._connection()
-        index_cursor.execute.return_value.fetchone.return_value = None
+        index_cursor.execute.return_value.fetchone.side_effect = [(True,), None, None]
 
         with patch(
             "khala.remote.psycopg.connect",
@@ -94,7 +94,7 @@ class RemoteTransactionTest(unittest.TestCase):
             ],
         )
         index_statements = [str(call.args[0]) for call in index_cursor.execute.call_args_list]
-        self.assertIn("pg_advisory_lock", index_statements[0])
+        self.assertIn("pg_try_advisory_lock", index_statements[0])
         self.assertEqual(
             sum("CREATE INDEX CONCURRENTLY IF NOT EXISTS" in sql for sql in index_statements),
             2,
@@ -105,7 +105,7 @@ class RemoteTransactionTest(unittest.TestCase):
 
     def test_concurrent_index_migration_repairs_an_invalid_prior_attempt(self):
         connection, cursor = self._connection()
-        cursor.execute.return_value.fetchone.side_effect = [(False,), None]
+        cursor.execute.return_value.fetchone.side_effect = [(True,), (False,), None]
 
         with patch("khala.remote.psycopg.connect", return_value=connection):
             RemoteStore("postgresql://example/db")._ensure_event_indexes()
@@ -121,6 +121,30 @@ class RemoteTransactionTest(unittest.TestCase):
         )
         connection.commit.assert_not_called()
         connection.close.assert_called_once_with()
+
+    def test_schema_migration_lock_wait_does_not_hold_a_blocking_query(self):
+        connection, cursor = self._connection()
+        cursor.execute.return_value.fetchone.side_effect = [
+            (False,),
+            (False,),
+            (True,),
+            None,
+            None,
+        ]
+
+        with patch("khala.remote.psycopg.connect", return_value=connection), patch(
+            "khala.remote.time.sleep"
+        ) as sleep:
+            RemoteStore("postgresql://example/db")._ensure_event_indexes()
+
+        lock_statements = [
+            str(call.args[0])
+            for call in cursor.execute.call_args_list
+            if "pg_try_advisory_lock" in str(call.args[0])
+        ]
+        self.assertEqual(len(lock_statements), 3)
+        self.assertEqual(sleep.call_count, 2)
+        connection.commit.assert_not_called()
 
     def test_archive_sessions_upserts_placeholders_and_deletes_jobs_atomically(self):
         connection, cursor = self._connection()
@@ -361,6 +385,7 @@ class RemoteTransactionTest(unittest.TestCase):
     def test_embedding_status_due_counts_match_processable_jobs(self):
         connection, cursor = self._connection()
         cursor.execute.return_value.fetchone.side_effect = [
+            {"chunk_table_exists": True},
             {"count": 1},
             {"count": 2},
             {"count": 3},
@@ -374,16 +399,18 @@ class RemoteTransactionTest(unittest.TestCase):
         self.assertEqual(status["embed_jobs_due"], 2)
         self.assertEqual(status["embed_jobs_retrying"], 3)
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
-        self.assertIn("EXISTS", statements[1])
-        self.assertIn("FROM events", statements[1])
-        self.assertIn("event.id = job.event_id", statements[1])
+        self.assertIn("event_embedding_chunks", statements[1])
         self.assertIn("EXISTS", statements[2])
         self.assertIn("FROM events", statements[2])
         self.assertIn("event.id = job.event_id", statements[2])
         self.assertIn("EXISTS", statements[3])
-        self.assertIn("(to_jsonb(session)->>'archived_at') IS NULL", statements[3])
+        self.assertIn("FROM events", statements[3])
+        self.assertIn("event.id = job.event_id", statements[3])
         self.assertIn("EXISTS", statements[4])
+        self.assertIn("(to_jsonb(session)->>'archived_at') IS NULL", statements[3])
         self.assertIn("(to_jsonb(session)->>'archived_at') IS NULL", statements[4])
+        self.assertIn("EXISTS", statements[5])
+        self.assertIn("(to_jsonb(session)->>'archived_at') IS NULL", statements[5])
 
 
 if __name__ == "__main__":

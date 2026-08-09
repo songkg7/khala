@@ -95,7 +95,8 @@ khala recall "how do I sync agent sessions" --mode hybrid     # RRF fusion (defa
 
 - Events with `user`/`assistant` roles are embedded with
   `openai/text-embedding-3-small` (1536-dim, via OpenRouter) and stored in the
-  remote store (`event_embeddings`).
+  remote store (`event_embedding_chunks`, with `event_embeddings` compatibility
+  rows for older readers).
 - `hybrid` fuses lexical + semantic top candidates with Reciprocal Rank
   Fusion, so an exact identifier (e.g. `cross-agent`) and a paraphrase both
   surface. It silently falls back to lexical-only when the embedding API is
@@ -125,6 +126,15 @@ export OPENROUTER_API_KEY='***'
 `khala config show` only reports whether the key is set (`api_key_set`), and
 masks any DSN password. Only user/assistant event *content* is sent to
 OpenRouter for embedding; tool/system output stays local.
+
+Long event content is embedded without truncation. Khala splits it at Unicode
+boundaries into deterministic UTF-8 chunks (6,000-byte maximum with 600-byte
+overlap), stores a complete versioned generation atomically, and ranks each
+event by its closest chunk before applying the result limit. A first-chunk
+legacy vector keeps older readers working; newer readers use a canonical legacy
+vector only when no complete current chunk generation exists. `khala embed
+pending` requeues legacy long events for lossless backfill while leaving known
+full-content short vectors in place.
 
 ### Canonical schema
 

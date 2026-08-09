@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Protocol, TextIO
 
 import psycopg
 
+from khala.embedding_pipeline import (
+    ChunkEmbeddingRow,
+    EmbeddingJob,
+    map_embedding_vectors,
+    prepare_embedding_batch,
+)
 from khala.embeddings import DIMENSIONS, EMBED_ROLES, MODEL, PROVIDER, embed
 from khala.errors import public_error_message
 from khala.models import ArchivedSession
@@ -38,8 +43,8 @@ class RemoteWorkerStore(Protocol):
         self, jobs: list[dict[str, Any]], error: str
     ) -> None: ...
 
-    def complete_embed_jobs(
-        self, embeddings: list[dict[str, Any]], jobs: list[dict[str, Any]]
+    def complete_chunk_embed_jobs(
+        self, embeddings: list[ChunkEmbeddingRow], jobs: list[dict[str, Any]]
     ) -> None: ...
 
 
@@ -144,7 +149,7 @@ def push_outbox(
                 "metadata": row["metadata"],
             }
         )
-        if row["role"] in EMBED_ROLES:
+        if row["role"] in EMBED_ROLES and str(row["content"]):
             jobs.append(
                 {
                     "event_id": event_id,
@@ -208,30 +213,29 @@ def process_embedding_jobs(
         raise EmbeddingJobError(reason)
 
     try:
-        vectors = embed([str(job["content"]) for job in jobs])
-        if len(vectors) != len(jobs):
-            raise ValueError("embedding result count does not match job count")
-        embeddings = [
-            {
-                "event_id": job["event_id"],
-                "provider": job["provider"],
-                "model": job["model"],
-                "dimensions": DIMENSIONS,
-                "content_hash": job["content_hash"],
-                "embedding": _fmt(vector),
-            }
-            for job, vector in zip(jobs, vectors)
-        ]
-        remote.complete_embed_jobs(embeddings, jobs)
+        prepared = prepare_embedding_batch(
+            [
+                EmbeddingJob(
+                    event_id=str(job["event_id"]),
+                    provider=str(job["provider"]),
+                    model=str(job["model"]),
+                    content_hash=str(job["content_hash"]),
+                    content=str(job["content"]),
+                )
+                for job in jobs
+            ]
+        )
+        vectors = embed(list(prepared.texts)) if prepared.requests else []
+        mapped = map_embedding_vectors(prepared, vectors, dimensions=DIMENSIONS)
+        remote.complete_chunk_embed_jobs(
+            list(mapped.chunk_rows),
+            jobs,
+        )
     except Exception as error:
         reason = _failure_reason(error)
         remote.mark_embed_errors(jobs, reason)
         raise EmbeddingJobError(reason) from error
     return {"embedded": [str(job["event_id"]) for job in jobs]}
-
-
-def _fmt(vector: Sequence[float]) -> str:
-    return "[" + ",".join(f"{value:.6f}" for value in vector) + "]"
 
 
 def spawn_worker(db_path: Path, args_dsn: str | None = None) -> int | None:

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, patch
 
+from khala.embedding_pipeline import ChunkEmbeddingRow
 from khala.embeddings import DIMENSIONS
 from khala.models import ArchivedSession
 from khala.store import Store
@@ -32,7 +33,7 @@ class FakeRemote:
         ] = []
         self.jobs: list[dict[str, Any]] = []
         self.failed_jobs: list[tuple[list[dict[str, Any]], str]] = []
-        self.completed: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]] = []
+        self.completed: list[tuple[list[ChunkEmbeddingRow], list[dict[str, Any]]]] = []
         self.archived: list[list[ArchivedSession]] = []
         self.calls: list[str] = []
 
@@ -62,8 +63,8 @@ class FakeRemote:
     def mark_embed_errors(self, jobs: list[dict[str, Any]], error: str) -> None:
         self.failed_jobs.append((jobs, error))
 
-    def complete_embed_jobs(
-        self, embeddings: list[dict[str, Any]], jobs: list[dict[str, Any]]
+    def complete_chunk_embed_jobs(
+        self, embeddings: list[ChunkEmbeddingRow], jobs: list[dict[str, Any]]
     ) -> None:
         if self.complete_error:
             raise self.complete_error
@@ -110,6 +111,15 @@ class WorkerReliabilityTest(unittest.TestCase):
         self.assertEqual(len(sessions), 1)
         self.assertEqual([event["id"] for event in events], event_ids)
         self.assertEqual([job["event_id"] for job in jobs], event_ids)
+
+    def test_push_does_not_enqueue_empty_embedding_content(self):
+        event_id = self.store.add_event(self.session_id, "user", "")
+        remote = FakeRemote()
+
+        result = push_outbox(self.store, remote)
+
+        self.assertEqual(result["pushed"], [event_id])
+        self.assertEqual(remote.pushed[0][2], [])
 
     def test_push_failure_persists_sanitized_backoff_for_every_event(self):
         event_ids = self._add_events()
@@ -263,7 +273,48 @@ class WorkerReliabilityTest(unittest.TestCase):
         self.assertNotIn("embed me", repr(result))
         embeddings, completed_jobs = remote.completed[0]
         self.assertEqual(completed_jobs, remote.jobs)
-        self.assertEqual(embeddings[0]["dimensions"], DIMENSIONS)
+        self.assertEqual(embeddings[0].dimensions, DIMENSIONS)
+        self.assertEqual(embeddings[0].chunk_index, 0)
+        self.assertEqual(embeddings[0].chunk_count, 1)
+
+    def test_long_embedding_job_sends_every_chunk_including_the_tail(self):
+        private_tail = "tail-marker"
+        remote = FakeRemote()
+        remote.jobs = [
+            {
+                **self._job(),
+                "content": ("x" * 6500) + private_tail,
+            }
+        ]
+
+        with patch(
+            "khala.worker.embed",
+            side_effect=lambda texts: [
+                [float(index)] * DIMENSIONS for index in range(len(texts))
+            ],
+        ) as embed_mock:
+            result = process_embedding_jobs(remote)
+
+        sent = embed_mock.call_args.args[0]
+        self.assertEqual(len(sent), 2)
+        self.assertTrue(sent[-1].endswith(private_tail))
+        rows, completed_jobs = remote.completed[0]
+        self.assertEqual([row.chunk_index for row in rows], [0, 1])
+        self.assertEqual([row.chunk_count for row in rows], [2, 2])
+        self.assertEqual(completed_jobs, remote.jobs)
+        self.assertEqual(result["embedded"], ["event-1"])
+        self.assertNotIn(private_tail, repr(result))
+
+    def test_empty_embedding_job_is_acknowledged_without_api_call(self):
+        remote = FakeRemote()
+        remote.jobs = [{**self._job(), "content": ""}]
+
+        with patch("khala.worker.embed") as embed_mock:
+            result = process_embedding_jobs(remote)
+
+        embed_mock.assert_not_called()
+        self.assertEqual(result["embedded"], ["event-1"])
+        self.assertEqual(remote.completed, [([], remote.jobs)])
 
     def test_worker_result_exposes_no_embedding_content(self):
         remote = FakeRemote()

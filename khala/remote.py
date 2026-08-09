@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import time
 from collections.abc import Iterator, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -10,10 +11,20 @@ from psycopg import sql
 from psycopg.rows import dict_row
 
 from khala.adjacency import validate_neighbor_limit
+from khala.embedding_chunks import CHUNKER_VERSION, MAX_CHUNK_UTF8_BYTES
+from khala.embedding_pipeline import ChunkEmbeddingRow
 from khala.embeddings import MODEL, PROVIDER
 from khala.models import ArchivedSession
 from khala.redact import redact
 from khala.remote_adjacency import load_remote_event_neighbors
+from khala.remote_embeddings import complete_chunk_embed_jobs as persist_chunk_embed_jobs
+from khala.remote_embeddings import (
+    count_embedded_events,
+    ensure_chunk_schema,
+    sample_embedded_events,
+)
+from khala.remote_embeddings import enqueue_missing_embed_jobs as enqueue_missing_chunk_jobs
+from khala.remote_embeddings import search_semantic as search_chunk_semantic
 from khala.retry import DEFAULT_RETRY_POLICY, RetryPolicy
 
 _SCHEMA_SESSIONS = """
@@ -77,6 +88,7 @@ _ORPHAN_EMBED_JOB_ERROR = "orphan embedding job: local event was never committed
 # worker advisory-lock key — serializes all remote-worker instances
 WORKER_LOCK_KEY = 884_221_001
 SCHEMA_MIGRATION_LOCK_KEY = 884_221_002
+_SCHEMA_LOCK_POLL_SECONDS = 0.05
 _EVENT_INDEXES = (
     (
         "events_session_created",
@@ -214,10 +226,7 @@ class RemoteStore:
         )
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT pg_advisory_lock(%s)",
-                    (SCHEMA_MIGRATION_LOCK_KEY,),
-                )
+                self._acquire_schema_migration_lock(cur)
                 try:
                     for index_name, create_statement in _EVENT_INDEXES:
                         row = cur.execute(
@@ -245,6 +254,18 @@ class RemoteStore:
             conn.close()
 
     @staticmethod
+    def _acquire_schema_migration_lock(cur: Any) -> None:
+        """Wait without holding a transaction that blocks concurrent index builds."""
+        while True:
+            row = cur.execute(
+                "SELECT pg_try_advisory_lock(%s)",
+                (SCHEMA_MIGRATION_LOCK_KEY,),
+            ).fetchone()
+            if row is not None and bool(row[0]):
+                return
+            time.sleep(_SCHEMA_LOCK_POLL_SECONDS)
+
+    @staticmethod
     def _ensure_schema(cur: Any) -> None:
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
         cur.execute(_SCHEMA_SESSIONS)
@@ -257,6 +278,7 @@ class RemoteStore:
         cur.execute(_SCHEMA_EVENTS)
         cur.execute(_SCHEMA_RECALLS)
         cur.execute(_SCHEMA_EMBEDDINGS)
+        ensure_chunk_schema(cur)
         cur.execute(_SCHEMA_EMBED_JOBS)
         cur.execute(
             "ALTER TABLE embedding_jobs ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ"
@@ -436,33 +458,15 @@ class RemoteStore:
     def enqueue_missing_embed_jobs(
         self, provider: str = PROVIDER, model: str = MODEL
     ) -> int:
-        """Backfill: enqueue jobs for user/assistant events that have no
-        embedding yet (idempotent — conflicts are skipped)."""
+        """Backfill missing or historically truncated current-version vectors."""
         with self._cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO embedding_jobs (event_id, provider, model, content_hash)
-                SELECT e.id, %(provider)s, %(model)s, md5(e.content)
-                FROM events e
-                JOIN sessions s ON s.id = e.session_id
-                WHERE e.role IN ('user', 'assistant')
-                  AND (to_jsonb(s)->>'archived_at') IS NULL
-                  AND NOT EXISTS (
-                      SELECT 1 FROM event_embeddings ee
-                      WHERE ee.event_id = e.id
-                        AND ee.provider = %(provider)s
-                        AND ee.model = %(model)s
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM embedding_jobs j
-                      WHERE j.event_id = e.id
-                        AND j.provider = %(provider)s
-                        AND j.model = %(model)s
-                  )
-                """,
-                {"provider": provider, "model": model},
+            return enqueue_missing_chunk_jobs(
+                cur,
+                provider=provider,
+                model=model,
+                chunker_version=CHUNKER_VERSION,
+                legacy_full_content_max_bytes=MAX_CHUNK_UTF8_BYTES,
             )
-            return cur.rowcount
 
     def pending_embed_jobs(
         self,
@@ -599,17 +603,25 @@ class RemoteStore:
                 jobs,
             )
 
+    def complete_chunk_embed_jobs(
+        self,
+        embeddings: list[ChunkEmbeddingRow],
+        jobs: list[dict[str, Any]],
+    ) -> None:
+        """Persist a complete chunk generation, legacy row, and job ack atomically."""
+        if not embeddings and not jobs:
+            return
+        with self._cursor() as cur:
+            persist_chunk_embed_jobs(cur, embeddings, jobs)
+
     def embedding_status(self) -> dict[str, Any]:
         with self._cursor() as cur:
-            done = cur.execute(
-                """
-                SELECT count(DISTINCT embedding.event_id)
-                FROM event_embeddings embedding
-                JOIN events event ON event.id = embedding.event_id
-                JOIN sessions session ON session.id = event.session_id
-                WHERE (to_jsonb(session)->>'archived_at') IS NULL
-                """
-            ).fetchone()
+            done = count_embedded_events(
+                cur,
+                provider=PROVIDER,
+                model=MODEL,
+                chunker_version=CHUNKER_VERSION,
+            )
             due = cur.execute(
                 "SELECT count(*) FROM embedding_jobs job "
                 "WHERE dead_lettered_at IS NULL AND next_attempt_at <= now() "
@@ -655,7 +667,7 @@ class RemoteStore:
                     str(failure_status["last_error"])
                 )[:500]
             return {
-                "embeddings_done": int(done["count"]),
+                "embeddings_done": done,
                 "embed_jobs_due": int(due["count"]),
                 "embed_jobs_retrying": int(retry["count"]),
                 "embed_jobs_dead_lettered": int(dead["count"]),
@@ -726,28 +738,26 @@ class RemoteStore:
             raise ValueError("sample limit must be positive")
         if mode not in {"lexical", "semantic", "hybrid"}:
             raise ValueError(f"unsupported recall mode: {mode}")
-        embedding_join = ""
-        parameters: dict[str, Any] = {"limit": limit}
-        if mode in {"semantic", "hybrid"}:
-            embedding_join = (
-                "JOIN event_embeddings ee ON ee.event_id = e.id "
-                "AND ee.provider = %(provider)s AND ee.model = %(model)s"
-            )
-            parameters["provider"] = PROVIDER
-            parameters["model"] = MODEL
         with self._read_cursor() as cur:
+            if mode in {"semantic", "hybrid"}:
+                return sample_embedded_events(
+                    cur,
+                    provider=PROVIDER,
+                    model=MODEL,
+                    chunker_version=CHUNKER_VERSION,
+                    limit=limit,
+                )
             rows = cur.execute(
-                f"""
-                SELECT DISTINCT e.id, e.content, e.created_at
+                """
+                SELECT e.id, e.content, e.created_at
                 FROM events e
                 JOIN sessions s ON s.id = e.session_id
-                {embedding_join}
                 WHERE e.role IN ('user', 'assistant') AND length(e.content) > 30
                   AND (to_jsonb(s)->>'archived_at') IS NULL
                 ORDER BY e.created_at DESC, e.id
                 LIMIT %(limit)s
                 """,
-                parameters,
+                {"limit": limit},
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -809,45 +819,24 @@ class RemoteStore:
         """Embed the query and return nearest events by cosine distance."""
         from khala.embeddings import embed
 
+        if type(limit) is not int or limit < 1:
+            raise ValueError("semantic search limit must be positive")
         try:
             vectors = embed([query])
         except Exception as exc:
             raise ValueError(f"semantic recall unavailable: {exc}") from exc
+        if len(vectors) != 1:
+            raise ValueError("semantic recall unavailable: unexpected query vector count")
         vec = _fmt(vectors[0])
         with self._read_cursor() as cur:
-            rows = cur.execute(
-                """
-                WITH canonical_embeddings AS (
-                    SELECT DISTINCT ON (ee.event_id)
-                           ee.event_id, ee.embedding
-                    FROM event_embeddings ee
-                    WHERE ee.provider = %(provider)s AND ee.model = %(model)s
-                    ORDER BY ee.event_id, ee.created_at DESC, ee.content_hash DESC
-                )
-                SELECT e.id, e.session_id, e.role, e.content, e.created_at,
-                       s.agent, s.user_name, s.user_email,
-                       COALESCE(r.count, 0) AS recall_count,
-                       0 AS lexical_rank,
-                       row_number() OVER (
-                           ORDER BY (ee.embedding <=> %(vec)s::vector), e.id
-                       ) AS semantic_rank,
-                       0 AS rank
-                FROM canonical_embeddings ee
-                JOIN events e ON e.id = ee.event_id
-                JOIN sessions s ON s.id = e.session_id
-                LEFT JOIN recalls r ON r.event_id = e.id
-                WHERE (to_jsonb(s)->>'archived_at') IS NULL
-                ORDER BY ee.embedding <=> %(vec)s::vector, e.id
-                LIMIT %(limit)s
-                """,
-                {
-                    "vec": vec,
-                    "provider": PROVIDER,
-                    "model": MODEL,
-                    "limit": limit,
-                },
-            ).fetchall()
-            return [dict(row) for row in rows]
+            return search_chunk_semantic(
+                cur,
+                query_vector=vec,
+                provider=PROVIDER,
+                model=MODEL,
+                chunker_version=CHUNKER_VERSION,
+                limit=limit,
+            )
 
     def recall_semantic(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         rows = self.search_semantic(query, limit)

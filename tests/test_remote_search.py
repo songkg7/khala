@@ -4,6 +4,7 @@ import unittest
 from collections.abc import Mapping, Sequence
 from unittest.mock import MagicMock, call, patch
 
+from khala.embedding_chunks import CHUNKER_VERSION
 from khala.embeddings import MODEL, PROVIDER
 from khala.remote import RemoteStore, recall_by_mode, search_by_mode
 
@@ -198,6 +199,9 @@ class RemoteSearchTest(unittest.TestCase):
             "content": "deploy complete",
         }
         connection, cursor = self._connection([row])
+        cursor.execute.return_value.fetchone.return_value = {
+            "chunk_table_exists": True
+        }
         store = RemoteStore("postgresql://example/db")
 
         with (
@@ -209,20 +213,38 @@ class RemoteSearchTest(unittest.TestCase):
 
         self.assertEqual(result, [row])
         self.assertEqual(cursor.execute.call_args_list[0], call(READ_ONLY_TRANSACTION))
-        select_call = cursor.execute.call_args_list[1]
+        self.assertIn(
+            "to_regclass('event_embedding_chunks')",
+            str(cursor.execute.call_args_list[1].args[0]),
+        )
+        select_call = cursor.execute.call_args_list[2]
         statement = str(select_call.args[0])
-        self.assertIn("SELECT DISTINCT ON (ee.event_id)", statement)
-        self.assertIn("ee.provider = %(provider)s", statement)
-        self.assertLess(statement.index("DISTINCT ON"), statement.index("LIMIT"))
-        self.assertIn("JOIN sessions s ON s.id = e.session_id", statement)
-        self.assertIn("(to_jsonb(s)->>'archived_at') IS NULL", statement)
-        self.assertIn("ORDER BY ee.embedding <=> %(vec)s::vector, e.id", statement)
+        self.assertIn("complete_generations AS", statement)
+        self.assertIn("MIN(chunk.embedding <=> %(vec)s::vector)", statement)
+        self.assertLess(statement.index("MIN(chunk.embedding"), statement.index("LIMIT"))
+        self.assertIn("JOIN sessions session ON session.id = event.session_id", statement)
+        self.assertIn("(to_jsonb(session)->>'archived_at') IS NULL", statement)
+        self.assertIn("ORDER BY score.distance, event.id", statement)
         self.assertEqual(select_call.args[1]["limit"], 3)
         self.assertEqual(select_call.args[1]["provider"], PROVIDER)
         self.assertEqual(select_call.args[1]["model"], MODEL)
+        self.assertEqual(select_call.args[1]["chunker_version"], CHUNKER_VERSION)
         record_recalls.assert_not_called()
         connection.rollback.assert_called_once_with()
         connection.commit.assert_not_called()
+
+    def test_semantic_search_rejects_invalid_limit_before_api_or_database(self) -> None:
+        store = RemoteStore("postgresql://example/db")
+
+        for limit in (0, -1, True, 1.5):
+            with self.subTest(limit=limit), patch(
+                "khala.embeddings.embed"
+            ) as embed_mock, patch("khala.remote.psycopg.connect") as connect:
+                with self.assertRaisesRegex(ValueError, "limit must be positive"):
+                    store.search_semantic("query", limit=limit)  # type: ignore[arg-type]
+
+                embed_mock.assert_not_called()
+                connect.assert_not_called()
 
     def test_recall_hybrid_falls_back_to_lexical_and_records_once(self) -> None:
         rows = [{"id": "event-1"}, {"id": "event-2"}]
@@ -267,6 +289,9 @@ class RemoteSearchTest(unittest.TestCase):
                     "content": "long enough content for evaluation sampling",
                 }
                 connection, cursor = self._connection([row])
+                cursor.execute.return_value.fetchone.return_value = {
+                    "chunk_table_exists": True
+                }
                 store = RemoteStore("postgresql://example/db")
 
                 with patch("khala.remote.psycopg.connect", return_value=connection):
@@ -274,18 +299,22 @@ class RemoteSearchTest(unittest.TestCase):
 
                 self.assertEqual(result, [row])
                 self.assertEqual(cursor.execute.call_args_list[0], call(READ_ONLY_TRANSACTION))
-                select_call = cursor.execute.call_args_list[1]
+                select_call = cursor.execute.call_args_list[2]
                 statement = str(select_call.args[0])
                 parameters = select_call.args[1]
-                self.assertIn("JOIN event_embeddings ee ON ee.event_id = e.id", statement)
-                self.assertIn("ee.provider = %(provider)s", statement)
-                self.assertIn("ee.model = %(model)s", statement)
-                self.assertIn("JOIN sessions s ON s.id = e.session_id", statement)
-                self.assertIn("(to_jsonb(s)->>'archived_at') IS NULL", statement)
+                self.assertIn("embedded_event_ids AS", statement)
+                self.assertIn("JOIN embedded_event_ids embedded", statement)
+                self.assertIn("JOIN sessions session ON session.id = event.session_id", statement)
+                self.assertIn("(to_jsonb(session)->>'archived_at') IS NULL", statement)
                 self.assertIn("LIMIT %(limit)s", statement)
                 self.assertEqual(
                     parameters,
-                    {"limit": 7, "provider": PROVIDER, "model": MODEL},
+                    {
+                        "limit": 7,
+                        "provider": PROVIDER,
+                        "model": MODEL,
+                        "chunker_version": CHUNKER_VERSION,
+                    },
                 )
                 connection.rollback.assert_called_once_with()
                 connection.commit.assert_not_called()

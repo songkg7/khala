@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
 from pathlib import Path
+
+from khala.embedding_chunks import MAX_CHUNK_UTF8_BYTES
 
 # ponytail: stdlib urllib; a batched HTTP client (httpx) only when we need
 # concurrency or streaming. OpenRouter's embeddings endpoint is POST-only.
@@ -20,7 +24,16 @@ API_KEY_ENV = "OPENROUTER_API_KEY"
 # so we exclude it by default — embedding cost stays low and secrets stay local.
 EMBED_ROLES = frozenset({"user", "assistant"})
 
-_PER_BATCH = 32
+MAX_TEXT_UTF8_BYTES = MAX_CHUNK_UTF8_BYTES
+MAX_BATCH_INPUTS = 32
+# At most 16 maximum-sized chunks share one request; smaller chunks may use all
+# 32 positions. Both provider-facing limits are enforced independently.
+MAX_BATCH_UTF8_BYTES = 96_000
+
+# Kept as compatibility aliases for callers that imported the old limits.
+# MAX_TEXT_LEN now represents a UTF-8 byte limit, never a character truncation.
+MAX_TEXT_LEN = MAX_TEXT_UTF8_BYTES
+_PER_BATCH = MAX_BATCH_INPUTS
 
 
 class EmbeddingError(Exception):
@@ -59,7 +72,114 @@ def content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def _input_utf8_sizes(texts: list[str]) -> list[int]:
+    sizes: list[int] = []
+    for index, text in enumerate(texts):
+        if not isinstance(text, str) or not text:
+            raise EmbeddingError("embedding inputs must be non-empty strings")
+        try:
+            size = len(text.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise EmbeddingError(
+                f"embedding input {index} is not valid UTF-8"
+            ) from None
+        if size > MAX_TEXT_UTF8_BYTES:
+            raise EmbeddingError(
+                f"embedding input {index} exceeds {MAX_TEXT_UTF8_BYTES} UTF-8 bytes"
+            )
+        sizes.append(size)
+    return sizes
+
+
+def _request_batches(texts: list[str], sizes: list[int]) -> Iterator[list[str]]:
+    if len(texts) != len(sizes):
+        raise EmbeddingError("embedding input size count does not match inputs")
+    batch: list[str] = []
+    batch_bytes = 0
+    for text, size in zip(texts, sizes):
+        exceeds_count = len(batch) >= MAX_BATCH_INPUTS
+        exceeds_bytes = batch_bytes + size > MAX_BATCH_UTF8_BYTES
+        if batch and (exceeds_count or exceeds_bytes):
+            yield batch
+            batch = []
+            batch_bytes = 0
+        batch.append(text)
+        batch_bytes += size
+    if batch:
+        yield batch
+
+
+def _validate_request_batch(texts: list[str]) -> None:
+    if not texts:
+        raise EmbeddingError("embedding request batch must not be empty")
+    if len(texts) > MAX_BATCH_INPUTS:
+        raise EmbeddingError(
+            f"embedding request batch exceeds {MAX_BATCH_INPUTS} inputs"
+        )
+    if sum(_input_utf8_sizes(texts)) > MAX_BATCH_UTF8_BYTES:
+        raise EmbeddingError(
+            f"embedding request batch exceeds {MAX_BATCH_UTF8_BYTES} UTF-8 bytes"
+        )
+
+
+def _decode_response(response: object) -> object:
+    read = getattr(response, "read", None)
+    if not callable(read):
+        raise EmbeddingError("unexpected response shape")
+    raw_body = read()
+    if not isinstance(raw_body, bytes):
+        raise EmbeddingError("unexpected response shape")
+    try:
+        return json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise EmbeddingError("invalid JSON response") from None
+
+
+def _validated_vector(value: object) -> list[float]:
+    if not isinstance(value, list) or len(value) != DIMENSIONS:
+        raise EmbeddingError(f"embedding dim != {DIMENSIONS}")
+
+    vector: list[float] = []
+    for component in value:
+        if isinstance(component, bool) or not isinstance(component, (int, float)):
+            raise EmbeddingError("embedding contains a non-numeric value")
+        try:
+            number = float(component)
+        except (OverflowError, ValueError):
+            raise EmbeddingError("embedding contains an invalid numeric value") from None
+        if not math.isfinite(number):
+            raise EmbeddingError("embedding contains a non-finite value")
+        vector.append(number)
+    return vector
+
+
+def _ordered_vectors(body: object, expected_count: int) -> list[list[float]]:
+    if not isinstance(body, dict):
+        raise EmbeddingError("unexpected response shape")
+    data = body.get("data")
+    if not isinstance(data, list) or len(data) != expected_count:
+        raise EmbeddingError("embedding response count does not match request")
+
+    ordered: list[list[float] | None] = [None] * expected_count
+    for item in data:
+        if not isinstance(item, dict):
+            raise EmbeddingError("unexpected embedding response item")
+        index = item.get("index")
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise EmbeddingError("embedding response index must be an integer")
+        if index < 0 or index >= expected_count:
+            raise EmbeddingError("embedding response index is out of range")
+        if ordered[index] is not None:
+            raise EmbeddingError("embedding response index is duplicated")
+        ordered[index] = _validated_vector(item.get("embedding"))
+
+    if any(vector is None for vector in ordered):
+        raise EmbeddingError("embedding response index is missing")
+    return [vector for vector in ordered if vector is not None]
+
+
 def _request_batch(texts: list[str], api_key: str) -> list[list[float]]:
+    _validate_request_batch(texts)
     payload = {
         "model": MODEL,
         "dimensions": DIMENSIONS,
@@ -68,7 +188,7 @@ def _request_batch(texts: list[str], api_key: str) -> list[list[float]]:
     }
     req = urllib.request.Request(
         EMBEDDINGS_URL,
-        data=json.dumps(payload).encode("utf-8"),
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -79,53 +199,33 @@ def _request_batch(texts: list[str], api_key: str) -> list[list[float]]:
     )
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
+            body = _decode_response(resp)
     except urllib.error.HTTPError as error:
-        raise EmbeddingError(f"HTTP {error.code}") from error
-    except OSError as error:
-        raise EmbeddingError(f"network error: {error}") from error
+        raise EmbeddingError(f"HTTP {error.code}") from None
+    except OSError:
+        raise EmbeddingError("network error") from None
 
-    data = body.get("data")
-    if not isinstance(data, list) or len(data) != len(texts):
-        raise EmbeddingError("unexpected response shape")
-    vectors: list[list[float]] = []
-    for item in data:
-        emb = item.get("embedding")
-        if not isinstance(emb, list) or len(emb) != DIMENSIONS:
-            raise EmbeddingError(f"embedding dim != {DIMENSIONS}")
-        vectors.append([float(x) for x in emb])
-    return vectors
-
-
-# Max chars per embedded string. text-embedding-3-small caps at 8191 tokens;
-# truncating long events keeps batch calls under the token ceiling that
-# otherwise returns HTTP 400 for huge prompts (e.g. agent system prompts).
-MAX_TEXT_LEN = 8000
+    return _ordered_vectors(body, len(texts))
 
 
 def embed(texts: list[str]) -> list[list[float]]:
-    """Embed a list of strings via OpenRouter. Raises EmbeddingError on failure.
+    """Return one ordered vector per non-empty input via OpenRouter.
 
-    A caller that needs strict ordering should pass unique texts; otherwise an
-    empty-string input yields a zero vector (OpenRouter still returns a row).
+    An empty input list returns immediately. Empty strings and strings larger
+    than the chunking byte cap fail before any key lookup or network request.
     """
+    if not texts:
+        return []
+    sizes = _input_utf8_sizes(texts)
     key = _api_key()
     if not key:
         raise EmbeddingError(
             f"{API_KEY_ENV} is not set — set it to enable semantic recall"
         )
-    # drop empties to avoid wasted/errored rows, keep index mapping; truncate
-    # overlong strings so batches stay under the model token limit.
-    indexed = [(i, t[:MAX_TEXT_LEN]) for i, t in enumerate(texts) if t]
-    if not indexed:
-        return []
-    idx = [i for i, _ in indexed]
-    batch_texts = [t for _, t in indexed]
-    vectors_map: dict[int, list[float]] = {}
-    for start in range(0, len(batch_texts), _PER_BATCH):
-        chunk = batch_texts[start : start + _PER_BATCH]
-        for i, vec in zip(
-            idx[start : start + _PER_BATCH], _request_batch(chunk, key)
-        ):
-            vectors_map[i] = vec
-    return [vectors_map.get(i, [0.0] * DIMENSIONS) for i in range(len(texts))]
+
+    vectors: list[list[float]] = []
+    for batch in _request_batches(texts, sizes):
+        vectors.extend(_request_batch(batch, key))
+    if len(vectors) != len(texts):
+        raise EmbeddingError("embedding result count does not match request")
+    return vectors
