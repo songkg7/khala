@@ -10,8 +10,23 @@ from pathlib import Path
 from typing import Any
 
 from khala.adjacency import validate_neighbor_limit
+from khala.identifier_graph import (
+    GraphCoverage,
+    GraphEvidence,
+    GraphRelated,
+    GraphResolution,
+    IdentifierGraphQuery,
+    IdentifierGraphReport,
+    assemble_identifier_graph,
+)
 from khala.identity import User
 from khala.local_adjacency import load_local_event_neighbors
+from khala.local_identifiers import (
+    backfill_local_identifiers,
+    index_local_event_identifiers,
+    load_local_identifier_graph,
+    migrate_local_identifiers,
+)
 from khala.local_recall_usage import (
     load_local_usage,
     migrate_local_recall_usage,
@@ -146,6 +161,7 @@ class Store:
             migrate_sessions(self.db)
             migrate_sync_ledger(self.db)
             migrate_local_recall_usage(self.db)
+            migrate_local_identifiers(self.db)
             self.db.commit()
         except BaseException:
             self._rollback_quietly()
@@ -337,6 +353,7 @@ class Store:
                 "INSERT INTO remote_outbox(event_id, queued_at, next_attempt_at) VALUES (?, ?, ?)",
                 (event_id, _now(), _now()),
             )
+            index_local_event_identifiers(self.db, event_id)
         except sqlite3.IntegrityError as error:
             raise ValueError(f"event insert failed for session: {session_id}") from error
         return event_id
@@ -735,6 +752,71 @@ class Store:
             },
             "same_session": neighbors,
         }
+
+    def backfill_identifiers(self, limit: int = 200) -> int:
+        """Index one explicit, bounded batch of legacy active events."""
+        with self.transaction():
+            return backfill_local_identifiers(self.db, limit)
+
+    def identifier_graph(
+        self, query: IdentifierGraphQuery
+    ) -> IdentifierGraphReport:
+        """Return bounded file-reference evidence from one SQLite snapshot."""
+        if not isinstance(query, IdentifierGraphQuery):
+            raise TypeError("identifier graph query is required")
+        with self._read_transaction():
+            rows = load_local_identifier_graph(
+                self.db,
+                query.file,
+                evidence_limit=query.limit,
+                coreference_limit=query.limit,
+            )
+            contexts: dict[str, list[dict[str, Any]]] = {}
+            if query.context_limit:
+                for evidence in rows.evidence:
+                    loaded = load_local_event_neighbors(
+                        self.db,
+                        evidence.event_id,
+                        query.context_limit,
+                        expected_session_id=evidence.session_id,
+                    )
+                    if loaded is None:
+                        raise RuntimeError("identifier evidence disappeared during snapshot")
+                    contexts[evidence.event_id] = loaded[1]
+
+        return assemble_identifier_graph(
+            "local",
+            query,
+            resolution=GraphResolution(
+                rows.resolution.status,
+                rows.resolution.value,
+                rows.resolution.candidates,
+                rows.resolution.candidates_truncated,
+            ),
+            evidence=tuple(
+                GraphEvidence(
+                    row.event_id,
+                    row.session_id,
+                    row.role,
+                    row.content,
+                    row.created_at,
+                    row.mention_count,
+                )
+                for row in rows.evidence
+            ),
+            related=tuple(
+                GraphRelated(row.value, row.basename, row.event_count)
+                for row in rows.coreferences
+            ),
+            coverage=GraphCoverage(
+                rows.coverage.current_events,
+                rows.coverage.pending_events,
+                rows.coverage.truncated_events,
+            ),
+            evidence_has_more=rows.evidence_has_more,
+            related_has_more=rows.related_has_more,
+            contexts=contexts,
+        )
 
     def attach_neighbors(
         self, hits: list[dict[str, Any]], per_hit: int = 3

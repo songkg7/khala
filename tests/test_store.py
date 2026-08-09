@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from khala import Store, load_adapter, read_jsonl, redact
+from khala.identifier_graph import IdentifierGraphQuery
 
 
 class KhalaStoreTest(unittest.TestCase):
@@ -124,6 +125,95 @@ class KhalaStoreTest(unittest.TestCase):
     def test_graph_missing_event(self):
         g = self.store.graph("no-such-event")
         self.assertFalse(g["found"])
+
+    def test_identifier_graph_indexes_new_events_and_reports_bounded_evidence(self):
+        session = self.store.add_session("test")
+        self.store.add_event(
+            session,
+            "user",
+            "why change the remote store?",
+            created_at="2026-01-01T00:00:00Z",
+        )
+        first = self.store.add_event(
+            session,
+            "assistant",
+            "changed khala/remote.py with khala/store.py and khala/cli.py",
+            created_at="2026-01-01T00:00:01Z",
+        )
+        self.store.add_event(
+            session,
+            "user",
+            "verify the change",
+            created_at="2026-01-01T00:00:02Z",
+        )
+        second = self.store.add_event(
+            session,
+            "assistant",
+            "rechecked khala/remote.py:42",
+            created_at="2026-01-01T00:00:03Z",
+        )
+
+        report = self.store.identifier_graph(
+            IdentifierGraphQuery("./khala\\remote.py", limit=1, context_limit=1)
+        )
+
+        self.assertTrue(report["found"])
+        self.assertEqual(report["resolution"]["status"], "exact")
+        self.assertEqual(report["evidence"][0]["event_id"], second)
+        self.assertEqual(len(report["evidence"][0]["same_session"]), 1)
+        self.assertTrue(report["coverage"]["has_more"])
+        self.assertTrue(report["coverage"]["evidence_has_more"])
+        self.assertTrue(report["coverage"]["related_has_more"])
+        self.assertFalse(report["coverage"]["complete"])
+        self.assertEqual(report["coverage"]["indexed_active_events"], 4)
+        self.assertEqual(
+            [(row["value"], row["co_referenced_events"]) for row in report["related"]],
+            [("khala/cli.py", 1)],
+        )
+        self.assertNotIn("depends_on", repr(report))
+        self.assertNotEqual(first, second)
+
+    def test_identifier_index_failure_rolls_back_event_and_outbox(self):
+        session = self.store.add_session("test")
+        self.store.db.execute(
+            """
+            CREATE TRIGGER reject_identifier_state
+            BEFORE INSERT ON identifier_index_state BEGIN
+                SELECT RAISE(ABORT, 'identifier indexing failed');
+            END
+            """
+        )
+        self.store.db.commit()
+
+        with self.assertRaisesRegex(ValueError, "event insert failed") as caught:
+            self.store.add_event(session, "assistant", "changed khala/store.py")
+
+        self.assertIsInstance(caught.exception.__cause__, sqlite3.IntegrityError)
+        self.assertEqual(self.store.replay(session), [])
+        self.assertEqual(self.store.status()["pending_push_total"], 0)
+
+    def test_identifier_backfill_is_explicit_and_bounded(self):
+        session = self.store.add_session("legacy")
+        self.store.db.execute(
+            """
+            INSERT INTO events(id, session_id, role, content, created_at, metadata)
+            VALUES ('legacy-file-event', ?, 'assistant', 'read legacy.py',
+                    '2026-01-01T00:00:00Z', '{}')
+            """,
+            (session,),
+        )
+        self.store.db.commit()
+
+        before = self.store.identifier_graph(IdentifierGraphQuery("legacy.py"))
+        self.assertFalse(before["found"])
+        self.assertEqual(before["coverage"]["pending_active_events"], 1)
+
+        self.assertEqual(self.store.backfill_identifiers(limit=1), 1)
+        after = self.store.identifier_graph(IdentifierGraphQuery("legacy.py"))
+
+        self.assertTrue(after["found"])
+        self.assertEqual(after["coverage"]["pending_active_events"], 0)
+        self.assertEqual(self.store.backfill_identifiers(limit=1), 0)
 
     def test_graph_and_attach_bound_neighbor_content(self):
         session = self.store.add_session("test")

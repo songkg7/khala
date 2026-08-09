@@ -18,6 +18,7 @@ from khala.embedding_chunks import CHUNKER_VERSION, chunk_text
 from khala.embedding_pipeline import ChunkEmbeddingRow
 from khala.embeddings import DIMENSIONS, MODEL, PROVIDER
 from khala.evaluation.backends import RemoteEvalBackend
+from khala.identifier_graph import IdentifierGraphQuery
 from khala.identity import User
 from khala.models import ArchivedSession
 from khala.recall_usage import UsageQuery, build_recall_usage
@@ -262,6 +263,9 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
                 "recalls",
                 "recall_requests",
                 "recall_usage_metadata",
+                "identifiers",
+                "event_identifiers",
+                "identifier_index_state",
                 "event_embeddings",
                 "event_embedding_chunks",
                 "embedding_jobs",
@@ -272,6 +276,9 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
                 "events_session_created",
                 "events_session_created_id",
                 "event_embedding_chunks_generation_lookup",
+                "event_identifiers_kind_value_event",
+                "identifiers_kind_basename_value",
+                "identifier_index_state_version_event",
             }
             <= indexes
         )
@@ -942,6 +949,167 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
             {row["actor_key"] for row in report["by_actor"]},
             {"email:ΟΣ@example.com", "email:Ος@example.com"},
         )
+
+    def test_identifier_graph_indexes_persisted_content_and_bounded_context(self) -> None:
+        session = session_row("identifier-session")
+        events = [
+            event_row(
+                "identifier-before",
+                session_id="identifier-session",
+                content="why change the remote store?",
+                created_at="2026-08-09T00:00:00Z",
+            ),
+            event_row(
+                "identifier-first",
+                session_id="identifier-session",
+                content="changed khala/remote.py with khala/store.py and khala/cli.py",
+                created_at="2026-08-09T00:00:01Z",
+            ),
+            event_row(
+                "identifier-after",
+                session_id="identifier-session",
+                content="verify the change",
+                created_at="2026-08-09T00:00:02Z",
+            ),
+            event_row(
+                "identifier-second",
+                session_id="identifier-session",
+                content="rechecked khala/remote.py:42",
+                created_at="2026-08-09T00:00:03Z",
+            ),
+        ]
+        self.remote.push_batch([session], events, [])
+        conflicting = {
+            **events[-1],
+            "content": "caller conflict private/secrets.py",
+        }
+        self.remote.push_batch([session], [conflicting], [])
+
+        report = self.remote.identifier_graph(
+            IdentifierGraphQuery("remote.py", limit=1, context_limit=1)
+        )
+        absent = self.remote.identifier_graph(
+            IdentifierGraphQuery("private/secrets.py", context_limit=0)
+        )
+
+        self.assertTrue(report["found"])
+        self.assertEqual(report["resolution"]["status"], "basename")
+        self.assertEqual(report["resolution"]["value"], "khala/remote.py")
+        self.assertEqual(report["evidence"][0]["event_id"], "identifier-second")
+        self.assertEqual(
+            [row["id"] for row in report["evidence"][0]["same_session"]],
+            ["identifier-after"],
+        )
+        self.assertTrue(report["coverage"]["has_more"])
+        self.assertTrue(report["coverage"]["evidence_has_more"])
+        self.assertTrue(report["coverage"]["related_has_more"])
+        self.assertFalse(report["coverage"]["complete"])
+        self.assertEqual(report["coverage"]["indexed_active_events"], 4)
+        self.assertEqual(
+            [(row["value"], row["co_referenced_events"]) for row in report["related"]],
+            [("khala/cli.py", 1)],
+        )
+        self.assertFalse(absent["found"])
+        self.assertNotIn("private/secrets.py", repr(report))
+        self.assertNotIn("depends_on", repr(report))
+
+    def test_identifier_backfill_is_explicit_bounded_and_archive_safe(self) -> None:
+        with self.sandbox.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO sessions(
+                    id, agent, external_id, created_at, metadata,
+                    user_name, user_email
+                ) VALUES (
+                    'legacy-identifier-session', 'legacy', NULL,
+                    '2026-08-09T00:00:00Z', '{}', NULL, NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO events(id, session_id, role, content, created_at, metadata)
+                VALUES (
+                    'legacy-identifier-event', 'legacy-identifier-session',
+                    'assistant', 'read legacy/path.py',
+                    '2026-08-09T00:00:01Z', '{}'
+                )
+                """
+            )
+
+        before = self.remote.identifier_graph(
+            IdentifierGraphQuery("legacy/path.py", context_limit=0)
+        )
+        self.assertFalse(before["found"])
+        self.assertEqual(before["coverage"]["pending_active_events"], 1)
+
+        self.assertEqual(self.remote.backfill_identifiers(limit=1), 1)
+        after = self.remote.identifier_graph(
+            IdentifierGraphQuery("legacy/path.py", context_limit=0)
+        )
+        self.assertTrue(after["found"])
+        self.assertEqual(after["coverage"]["pending_active_events"], 0)
+        self.assertEqual(self.remote.backfill_identifiers(limit=1), 0)
+
+        with self.sandbox.connection() as connection:
+            connection.execute(
+                """
+                UPDATE events
+                SET content = 'read legacy/new-path.py'
+                WHERE id = 'legacy-identifier-event'
+                """
+            )
+
+        stale = self.remote.identifier_graph(
+            IdentifierGraphQuery("legacy/path.py", context_limit=0)
+        )
+        self.assertFalse(stale["found"])
+        self.assertEqual(stale["coverage"]["pending_active_events"], 1)
+
+        self.assertEqual(self.remote.backfill_identifiers(limit=1), 1)
+        refreshed = self.remote.identifier_graph(
+            IdentifierGraphQuery("legacy/new-path.py", context_limit=0)
+        )
+        self.assertTrue(refreshed["found"])
+        self.assertEqual(refreshed["coverage"]["pending_active_events"], 0)
+
+        self.remote.archive_sessions(
+            [
+                {
+                    "id": "legacy-identifier-session",
+                    "archived_at": "2026-08-10T00:00:00Z",
+                    "duplicate_of": None,
+                }
+            ]
+        )
+        archived = self.remote.identifier_graph(
+            IdentifierGraphQuery("legacy/new-path.py", context_limit=0)
+        )
+        self.assertFalse(archived["found"])
+        self.assertEqual(archived["coverage"]["indexed_active_events"], 0)
+
+    def test_identifier_index_failure_rolls_back_remote_event_delivery(self) -> None:
+        with self.sandbox.connection() as connection:
+            connection.execute(
+                """
+                ALTER TABLE identifier_index_state
+                ADD CONSTRAINT reject_identifier_state CHECK (FALSE) NOT VALID
+                """
+            )
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            self.remote.push_batch(
+                [session_row("rejected-identifier-session")],
+                [
+                    event_row(
+                        "rejected-identifier-event",
+                        session_id="rejected-identifier-session",
+                        content="changed khala/remote.py",
+                    )
+                ],
+                [],
+            )
+
+        self.assertEqual(self._counts("sessions", "events"), {"sessions": 0, "events": 0})
 
     def test_semantic_search_deduplicates_canonical_events_before_limit(self) -> None:
         query_vector = fixed_vector(1.0)

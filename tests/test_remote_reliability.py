@@ -42,7 +42,9 @@ class RemoteTransactionTest(unittest.TestCase):
     def test_push_batch_uses_one_transaction_in_dependency_order(self):
         connection, cursor = self._connection()
         session, event, job = self._rows()
-        with patch("khala.remote.psycopg.connect", return_value=connection):
+        with patch(
+            "khala.remote.psycopg.connect", return_value=connection
+        ), patch("khala.remote.index_remote_event_identifiers") as index_identifiers:
             RemoteStore("postgresql://example/db").push_batch([session], [event], [job])
 
         statements = [str(call.args[0]) for call in cursor.executemany.call_args_list]
@@ -54,6 +56,7 @@ class RemoteTransactionTest(unittest.TestCase):
         self.assertIn("JOIN sessions session ON session.id = event.session_id", statements[2])
         self.assertIn("(to_jsonb(session)->>'archived_at') IS NULL", statements[2])
         self.assertEqual(schema_statements, [])
+        index_identifiers.assert_called_once_with(cursor, "event-1")
         connection.commit.assert_called_once_with()
         connection.close.assert_called_once_with()
 
@@ -312,7 +315,9 @@ class RemoteTransactionTest(unittest.TestCase):
         connection, cursor = self._connection()
         session, event, job = self._rows()
 
-        with patch("khala.remote.psycopg.connect", return_value=connection):
+        with patch(
+            "khala.remote.psycopg.connect", return_value=connection
+        ), patch("khala.remote.index_remote_event_identifiers") as index_identifiers:
             RemoteStore("postgresql://example/db").push_batch([session], [event], [job])
 
         job_statement = str(cursor.executemany.call_args_list[2].args[0])
@@ -324,6 +329,7 @@ class RemoteTransactionTest(unittest.TestCase):
         self.assertIn("last_error = %(orphan_error)s", job_statement)
         job_rows = cursor.executemany.call_args_list[2].args[1]
         self.assertIn("orphan embedding job", job_rows[0]["orphan_error"])
+        index_identifiers.assert_called_once_with(cursor, "event-1")
 
     def test_embedding_insert_and_job_ack_share_one_transaction(self):
         connection, cursor = self._connection()

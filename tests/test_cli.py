@@ -168,6 +168,102 @@ class KhalaCLIIntegrationTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("limit must be positive", err)
 
+    def test_local_file_graph_and_explicit_identifier_backfill(self):
+        code, out, error = self._run("start", "--agent", "test")
+        self.assertEqual(code, 0, error)
+        session = json.loads(out)["session_id"]
+        code, _, error = self._run(
+            "record", session, "assistant", "changed khala/remote.py"
+        )
+        self.assertEqual(code, 0, error)
+
+        code, out, error = self._run(
+            "graph",
+            "--file",
+            "remote.py",
+            "--limit",
+            "2",
+            "--context-limit",
+            "0",
+        )
+
+        self.assertEqual(code, 0, error)
+        report = json.loads(out)
+        self.assertTrue(report["found"])
+        self.assertEqual(report["resolution"]["status"], "basename")
+        self.assertEqual(report["resolution"]["value"], "khala/remote.py")
+
+        code, out, error = self._run("identifiers", "backfill", "--limit", "1")
+        self.assertEqual(code, 0, error)
+        self.assertEqual(
+            json.loads(out),
+            {"backend": "local", "indexed": 0, "limit": 1},
+        )
+
+    def test_identifier_cli_bounds_and_graph_target_fail_before_store_lookup(self):
+        cases = (
+            ("identifiers", "backfill", "--limit", "0"),
+            ("identifiers", "backfill", "--limit", "1001"),
+            ("graph",),
+            ("graph", "event-1", "--file", "a.py"),
+            ("graph", "event-1", "--context-limit", "1"),
+            ("graph", "--file", "../secret.py"),
+            ("graph", "--file", "a.py", "--limit", "101"),
+            ("graph", "--file", "a.py", "--context-limit", "21"),
+        )
+        for arguments in cases:
+            with self.subTest(arguments=arguments), patch("khala.cli.Store") as store:
+                code, _, _ = self._run(*arguments)
+
+                self.assertEqual(code, 2)
+                store.assert_not_called()
+
+    def test_remote_file_graph_and_backfill_converge_archives(self):
+        tombstones = self._seed_archived_session()
+        self.config.save_config(
+            {"workspaces": [], "remote": "postgresql://example.invalid/khala"}
+        )
+        calls = []
+        with patch("khala.remote.RemoteStore") as remote_store:
+            remote = remote_store.return_value
+            remote.ensure_schema.side_effect = lambda: calls.append("schema")
+            remote.archive_sessions.side_effect = (
+                lambda sessions: calls.append(("archive", sessions))
+            )
+            remote.identifier_graph.side_effect = lambda query: (
+                calls.append(("graph", query.file, query.limit, query.context_limit))
+                or {"backend": "remote"}
+            )
+
+            code, out, error = self._run(
+                "graph", "--file", "khala/remote.py", "--limit", "7"
+            )
+
+        self.assertEqual(code, 0, error)
+        self.assertEqual(json.loads(out), {"backend": "remote"})
+        self.assertEqual(
+            calls,
+            [
+                "schema",
+                ("archive", tombstones),
+                ("graph", "khala/remote.py", 7, 3),
+            ],
+        )
+
+        with patch("khala.remote.RemoteStore") as remote_store:
+            remote = remote_store.return_value
+            remote.backfill_identifiers.return_value = 2
+            code, out, error = self._run(
+                "identifiers", "backfill", "--limit", "2"
+            )
+
+        self.assertEqual(code, 0, error)
+        self.assertEqual(
+            json.loads(out),
+            {"backend": "remote", "indexed": 2, "limit": 2},
+        )
+        remote.backfill_identifiers.assert_called_once_with(2)
+
     def test_remote_recall_and_graph_converge_archives_before_same_instance_read(self):
         tombstones = self._seed_archived_session()
         self.config.save_config(

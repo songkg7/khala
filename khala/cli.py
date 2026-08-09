@@ -12,6 +12,7 @@ import psycopg
 
 from khala.adapter import ingest_events
 from khala.errors import public_error_message
+from khala.identifier_graph import IdentifierGraphQuery
 from khala.identity import resolve_user
 from khala.store import Store
 
@@ -37,6 +38,10 @@ def _usage_days(value: str) -> int:
 
 def _usage_top_actors(value: str) -> int:
     return _bounded_integer(value, name="top actors", minimum=0, maximum=100)
+
+
+def _identifier_backfill_limit(value: str) -> int:
+    return _bounded_integer(value, name="backfill limit", minimum=1, maximum=1000)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -69,9 +74,31 @@ def parser() -> argparse.ArgumentParser:
     )
     replay = commands.add_parser("replay")
     replay.add_argument("session_id")
-    graph = commands.add_parser("graph", help="Show an event's associative neighbors")
-    graph.add_argument("event_id")
+    graph = commands.add_parser(
+        "graph", help="Show event context or file-reference evidence"
+    )
+    graph_target = graph.add_mutually_exclusive_group(required=True)
+    graph_target.add_argument("event_id", nargs="?")
+    graph_target.add_argument("--file", dest="file_identifier")
     graph.add_argument("--limit", type=int, default=5)
+    graph.add_argument(
+        "--context-limit",
+        type=int,
+        default=None,
+        help="Same-session events attached to each --file result",
+    )
+    identifiers = commands.add_parser(
+        "identifiers", help="Maintain the bounded identifier evidence index"
+    )
+    identifier_actions = identifiers.add_subparsers(
+        dest="identifier_action", required=True
+    )
+    identifier_backfill = identifier_actions.add_parser(
+        "backfill", help="Index one bounded batch of legacy events"
+    )
+    identifier_backfill.add_argument(
+        "--limit", type=_identifier_backfill_limit, default=200
+    )
     connect = commands.add_parser("connect", help="Connect to a remote khala store (Khalai mode)")
     connect.add_argument(
         "dsn",
@@ -182,6 +209,26 @@ def output(value: Any) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     database_path = args.db.expanduser()
+    file_graph_query: IdentifierGraphQuery | None = None
+    if args.command == "graph" and args.file_identifier is not None:
+        try:
+            file_graph_query = IdentifierGraphQuery(
+                args.file_identifier,
+                limit=args.limit,
+                context_limit=(
+                    args.context_limit if args.context_limit is not None else 3
+                ),
+            )
+        except (TypeError, ValueError) as error:
+            print(f"khala: {error}", file=sys.stderr)
+            return 2
+    if (
+        args.command == "graph"
+        and args.file_identifier is None
+        and args.context_limit is not None
+    ):
+        print("khala: --context-limit requires --file", file=sys.stderr)
+        return 2
     if args.command == "eval":
         from khala.eval_cli import run_eval_command
 
@@ -276,10 +323,34 @@ def main(argv: list[str] | None = None) -> int:
             if args.limit < 1:
                 raise ValueError("limit must be positive")
             dsn = _remote_dsn()
-            if dsn:
+            if args.file_identifier is not None:
+                if file_graph_query is None:
+                    raise RuntimeError("file graph query was not validated")
+                if dsn:
+                    output(
+                        _converged_remote(store, dsn).identifier_graph(
+                            file_graph_query
+                        )
+                    )
+                else:
+                    output(store.identifier_graph(file_graph_query))
+            elif dsn:
                 output(_converged_remote(store, dsn).graph(args.event_id, args.limit))
             else:
                 output(store.graph(args.event_id, args.limit))
+        elif args.command == "identifiers":
+            if args.identifier_action != "backfill":
+                raise ValueError("unsupported identifier action")
+            dsn = _remote_dsn()
+            if dsn:
+                indexed = _converged_remote(store, dsn).backfill_identifiers(
+                    args.limit
+                )
+                backend = "remote"
+            else:
+                indexed = store.backfill_identifiers(args.limit)
+                backend = "local"
+            output({"backend": backend, "indexed": indexed, "limit": args.limit})
         elif args.command == "ingest":
             events = ingest_events(args.adapter, args.source, sys.stdin)
             output(

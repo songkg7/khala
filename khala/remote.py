@@ -14,6 +14,15 @@ from khala.adjacency import validate_neighbor_limit
 from khala.embedding_chunks import CHUNKER_VERSION, MAX_CHUNK_UTF8_BYTES
 from khala.embedding_pipeline import ChunkEmbeddingRow
 from khala.embeddings import MODEL, PROVIDER
+from khala.identifier_graph import (
+    GraphCoverage,
+    GraphEvidence,
+    GraphRelated,
+    GraphResolution,
+    IdentifierGraphQuery,
+    IdentifierGraphReport,
+    assemble_identifier_graph,
+)
 from khala.identity import User
 from khala.models import ArchivedSession
 from khala.recall_usage import (
@@ -34,6 +43,12 @@ from khala.remote_embeddings import (
 )
 from khala.remote_embeddings import enqueue_missing_embed_jobs as enqueue_missing_chunk_jobs
 from khala.remote_embeddings import search_semantic as search_chunk_semantic
+from khala.remote_identifiers import (
+    backfill_remote_identifiers,
+    ensure_remote_identifier_schema,
+    index_remote_event_identifiers,
+    load_remote_identifier_graph,
+)
 from khala.remote_recall_usage import (
     ensure_remote_recall_usage_schema,
     load_remote_usage,
@@ -297,6 +312,7 @@ class RemoteStore:
         cur.execute(_SCHEMA_EVENTS)
         cur.execute(_SCHEMA_RECALLS)
         ensure_remote_recall_usage_schema(cur)
+        ensure_remote_identifier_schema(cur)
         cur.execute(_SCHEMA_EMBEDDINGS)
         ensure_chunk_schema(cur)
         cur.execute(_SCHEMA_EMBED_JOBS)
@@ -383,6 +399,8 @@ class RemoteStore:
                     """,
                     events,
                 )
+                for event in events:
+                    index_remote_event_identifiers(cur, str(event["id"]))
             if embedding_jobs:
                 cur.executemany(
                     """
@@ -436,6 +454,8 @@ class RemoteStore:
                 """,
                 event_rows,
             )
+            for event in event_rows:
+                index_remote_event_identifiers(cur, str(event["id"]))
 
     # --- embeddings ------------------------------------------------------
 
@@ -980,3 +1000,73 @@ class RemoteStore:
             },
             "same_session": neighbors,
         }
+
+    def backfill_identifiers(self, limit: int = 200) -> int:
+        """Index one explicit, bounded batch of legacy active events."""
+        with self._cursor() as cur:
+            return backfill_remote_identifiers(cur, limit)
+
+    def identifier_graph(
+        self, query: IdentifierGraphQuery
+    ) -> IdentifierGraphReport:
+        """Return bounded file-reference evidence from one remote snapshot."""
+        if not isinstance(query, IdentifierGraphQuery):
+            raise TypeError("identifier graph query is required")
+        with self._read_cursor() as cur:
+            rows = load_remote_identifier_graph(
+                cur,
+                query.file,
+                evidence_limit=query.limit,
+                coreference_limit=query.limit,
+            )
+            contexts: dict[str, list[dict[str, Any]]] = {}
+            if query.context_limit and rows.evidence:
+                adjacent_by_index = load_remote_event_neighbors(
+                    cur,
+                    [
+                        (evidence.event_id, evidence.session_id)
+                        for evidence in rows.evidence
+                    ],
+                    query.context_limit,
+                )
+                for index, evidence in enumerate(rows.evidence):
+                    loaded = adjacent_by_index.get(index)
+                    if loaded is None:
+                        raise RuntimeError(
+                            "identifier evidence disappeared during snapshot"
+                        )
+                    contexts[evidence.event_id] = loaded[1]
+
+        return assemble_identifier_graph(
+            "remote",
+            query,
+            resolution=GraphResolution(
+                rows.resolution.status,
+                rows.resolution.value,
+                rows.resolution.candidates,
+                rows.resolution.candidates_truncated,
+            ),
+            evidence=tuple(
+                GraphEvidence(
+                    row.event_id,
+                    row.session_id,
+                    row.role,
+                    row.content,
+                    row.created_at,
+                    row.mention_count,
+                )
+                for row in rows.evidence
+            ),
+            related=tuple(
+                GraphRelated(row.value, row.basename, row.event_count)
+                for row in rows.coreferences
+            ),
+            coverage=GraphCoverage(
+                rows.coverage.current_events,
+                rows.coverage.pending_events,
+                rows.coverage.truncated_events,
+            ),
+            evidence_has_more=rows.evidence_has_more,
+            related_has_more=rows.related_has_more,
+            contexts=contexts,
+        )

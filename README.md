@@ -65,6 +65,8 @@ khala start --agent <name>       # start a session, returns session_id
 khala record <sid> <role> [txt]  # add a user/assistant/system/tool event
 khala recall <query> [--limit] [--mode lexical|semantic|hybrid]
 khala graph <event-id> [--limit]  # centered same-session context
+khala graph --file <path> [--limit N] [--context-limit N]  # file evidence
+khala identifiers backfill [--limit N]  # bounded legacy identifier indexing
 khala replay <sid>               # dump a session's events
 khala ingest --agent <a> [--adapter M:C]   # bulk import (stdin JSONL by default)
 khala sync [--adapter hermes|codex] [--session-id X] [--name/--email]
@@ -138,6 +140,25 @@ khala recall "how do I sync agent sessions" --mode hybrid     # RRF fusion (defa
   `(created_at, id)`, center it around each hit, and backfill at session edges.
   Neighbor snippets are capped at 500 characters. Remote graph reads use one
   repeatable-read, read-only snapshot and batch all recall hits in one query.
+
+### File identifier evidence graph
+
+`khala graph --file khala/remote.py` resolves an exact repository-relative
+file first, then falls back to its basename only when that basename identifies
+one file unambiguously. The response contains the events that referenced the
+file, bounded same-session context, and files co-referenced by those events.
+These edges are reported as `references` and `co_referenced`; Khala does not
+claim a directed `depends_on` relationship without stronger evidence.
+
+New events are indexed atomically from their stored, redacted content. Existing
+databases are not scanned during startup: run `khala identifiers backfill` to
+process at most one explicitly bounded batch. `coverage` reports pending active
+events, extraction truncation, and whether evidence, co-references, or
+resolution candidates were omitted by a result bound. The aggregate
+`has_more` flag is accompanied by `evidence_has_more` and `related_has_more`;
+any omitted result makes `complete` false. File values are NFC-normalized
+relative paths; absolute, home, drive, URI, traversal, control-character, and
+oversized values are rejected.
 
 ### OpenRouter API key
 
