@@ -5,6 +5,25 @@ composition, while :mod:`khala.remote_embeddings` owns validation and cursor
 orchestration.
 """
 
+from __future__ import annotations
+
+from khala.roles import RoleFilter
+
+
+def with_event_role_filter(statement: str, role: RoleFilter | None) -> str:
+    """Add a validated event-role predicate to a semantic search statement."""
+    if role is None:
+        return statement
+    active_session_filter = "WHERE (to_jsonb(session)->>'archived_at') IS NULL"
+    if statement.count(active_session_filter) != 1:
+        raise ValueError("semantic search statement has no unique active-session filter")
+    return statement.replace(
+        active_session_filter,
+        "WHERE event.role = %(role)s\n"
+        "  AND (to_jsonb(session)->>'archived_at') IS NULL",
+        1,
+    )
+
 CHUNK_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS event_embedding_chunks (
     event_id TEXT NOT NULL REFERENCES events(id),

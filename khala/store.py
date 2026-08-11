@@ -44,6 +44,7 @@ from khala.recall_usage import (
     validate_recall_mode,
 )
 from khala.redact import redact
+from khala.roles import RoleFilter, validate_role_filter
 from khala.secure_files import prepare_private_file
 from khala.session_migrations import migrate_sessions
 from khala.sync_ledger import (
@@ -569,9 +570,15 @@ class Store:
                 raise ValueError(f"unsupported role: {event.role}")
             previous_source_id = event.source_id
 
-    def search(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        limit: int = 5,
+        *,
+        role: RoleFilter | None = None,
+    ) -> list[dict[str, Any]]:
         """Read-only lexical search used by evaluation and recall."""
-        return lexical_search(self.db, query, limit)
+        return lexical_search(self.db, query, limit, role=role)
 
     def _record_recall_usage(
         self,
@@ -599,11 +606,13 @@ class Store:
         *,
         requested_mode: RecallMode = "lexical",
         user: User | None = None,
+        role: RoleFilter | None = None,
     ) -> list[dict[str, Any]]:
         """Search and record returned events as real product usage."""
         validated_limit = validate_recall_limit(limit)
         validated_mode = validate_recall_mode(requested_mode)
-        rows = self.search(query, validated_limit)
+        validated_role = validate_role_filter(role)
+        rows = self.search(query, validated_limit, role=validated_role)
         self._record_recall_usage(
             (str(row["id"]) for row in rows),
             requested_mode=validated_mode,
@@ -722,15 +731,26 @@ class Store:
         with self.transaction():
             self.worker_state.finished(run_id, status, error)
 
-    def replay(self, session_id: str) -> list[dict[str, Any]]:
+    def replay(
+        self, session_id: str, *, role: RoleFilter | None = None
+    ) -> list[dict[str, Any]]:
+        validated_role = validate_role_filter(role)
+        role_clause = ""
+        parameters: tuple[Any, ...]
+        if validated_role is None:
+            parameters = (session_id,)
+        else:
+            role_clause = " AND e.role = ?"
+            parameters = (session_id, validated_role)
         return [
             dict(row)
             for row in self.db.execute(
                 "SELECT e.id, e.role, e.content, e.created_at, e.metadata, "
                 "s.user_name, s.user_email "
-                "FROM events e JOIN sessions s ON s.id = e.session_id " 
-                "WHERE e.session_id = ? ORDER BY e.created_at, e.rowid",
-                (session_id,),
+                "FROM events e JOIN sessions s ON s.id = e.session_id "
+                "WHERE e.session_id = ?" + role_clause
+                + " ORDER BY e.created_at, e.rowid",
+                parameters,
             )
         ]
 

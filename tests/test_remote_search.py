@@ -93,6 +93,20 @@ class RemoteSearchTest(unittest.TestCase):
             "%100\\%\\_done\\\\path%",
         )
 
+    def test_lexical_search_applies_role_filter(self) -> None:
+        connection, cursor = self._connection()
+        store = RemoteStore("postgresql://example/db")
+
+        with patch("khala.remote.psycopg.connect", return_value=connection):
+            store.search_lexical("deploy", limit=3, role="user")
+
+        select_call = cursor.execute.call_args_list[1]
+        self.assertIn("e.role = %(role)s", str(select_call.args[0]))
+        self.assertEqual(
+            select_call.args[1],
+            {"pattern": "%deploy%", "limit": 3, "role": "user"},
+        )
+
     def test_read_only_transaction_rolls_back_and_closes_on_search_failure(self) -> None:
         connection, cursor = self._connection()
         cursor.execute.side_effect = [None, RuntimeError("query failed")]
@@ -246,6 +260,23 @@ class RemoteSearchTest(unittest.TestCase):
         record_usage.assert_not_called()
         connection.rollback.assert_called_once_with()
         connection.commit.assert_not_called()
+
+    def test_semantic_search_applies_role_filter(self) -> None:
+        connection, cursor = self._connection()
+        cursor.execute.return_value.fetchone.return_value = {
+            "chunk_table_exists": True
+        }
+        store = RemoteStore("postgresql://example/db")
+
+        with (
+            patch("khala.remote.psycopg.connect", return_value=connection),
+            patch("khala.embeddings.embed", return_value=[[0.25, 0.5]]),
+        ):
+            store.search_semantic("deploy", limit=3, role="assistant")
+
+        select_call = cursor.execute.call_args_list[2]
+        self.assertIn("event.role = %(role)s", str(select_call.args[0]))
+        self.assertEqual(select_call.args[1]["role"], "assistant")
 
     def test_semantic_search_rejects_invalid_limit_before_api_or_database(self) -> None:
         store = RemoteStore("postgresql://example/db")
@@ -553,6 +584,23 @@ class RemoteSearchTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported recall mode"):
             recall_by_mode(remote, "query", "automatic")
         remote.assert_not_called()
+
+    def test_mode_dispatch_forwards_role_filter(self) -> None:
+        remote = MagicMock()
+        remote.search_lexical.return_value = []
+        remote.recall_lexical.return_value = []
+
+        self.assertEqual(
+            search_by_mode(remote, "query", "lexical", 2, role="user"), []
+        )
+        self.assertEqual(
+            recall_by_mode(remote, "query", "lexical", 2, role="assistant"), []
+        )
+
+        remote.search_lexical.assert_called_once_with("query", 2, role="user")
+        remote.recall_lexical.assert_called_once_with(
+            "query", 2, user=None, role="assistant"
+        )
 
 
 if __name__ == "__main__":

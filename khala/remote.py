@@ -55,6 +55,7 @@ from khala.remote_recall_usage import (
     record_remote_recall_usage,
 )
 from khala.retry import DEFAULT_RETRY_POLICY, RetryPolicy
+from khala.roles import RoleFilter, validate_role_filter
 
 _SCHEMA_SESSIONS = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -145,6 +146,12 @@ def _literal_ilike_pattern(query: str) -> str:
     return f"%{escaped}%"
 
 
+def _role_kwargs(role: RoleFilter | None) -> dict[str, RoleFilter]:
+    if role is None:
+        return {}
+    return {"role": role}
+
+
 def recall_by_mode(
     remote: Any,
     query: str,
@@ -152,28 +159,46 @@ def recall_by_mode(
     limit: int = 5,
     *,
     user: User | None = None,
+    role: RoleFilter | None = None,
 ) -> list[dict[str, Any]]:
     """Dispatch remote recall by mode; hybrid falls back to lexical automatically."""
     validated_mode = validate_recall_mode(mode)
     validated_limit = validate_recall_limit(limit)
+    validated_role = validate_role_filter(role)
     if validated_mode == "semantic":
-        return remote.recall_semantic(query, validated_limit, user=user)
+        return remote.recall_semantic(
+            query, validated_limit, user=user, **_role_kwargs(validated_role)
+        )
     if validated_mode == "lexical":
-        return remote.recall_lexical(query, validated_limit, user=user)
-    return remote.recall_hybrid(query, validated_limit, user=user)
+        return remote.recall_lexical(
+            query, validated_limit, user=user, **_role_kwargs(validated_role)
+        )
+    return remote.recall_hybrid(
+        query, validated_limit, user=user, **_role_kwargs(validated_role)
+    )
 
 
 def search_by_mode(
-    remote: Any, query: str, mode: str, limit: int = 5
+    remote: Any,
+    query: str,
+    mode: str,
+    limit: int = 5,
+    *,
+    role: RoleFilter | None = None,
 ) -> list[dict[str, Any]]:
     """Dispatch read-only remote search without usage-stat mutations."""
     validated_mode = validate_recall_mode(mode)
     validated_limit = validate_recall_limit(limit)
+    validated_role = validate_role_filter(role)
     if validated_mode == "semantic":
-        return remote.search_semantic(query, validated_limit)
+        return remote.search_semantic(
+            query, validated_limit, **_role_kwargs(validated_role)
+        )
     if validated_mode == "lexical":
-        return remote.search_lexical(query, validated_limit)
-    return remote.search_hybrid(query, validated_limit)
+        return remote.search_lexical(
+            query, validated_limit, **_role_kwargs(validated_role)
+        )
+    return remote.search_hybrid(query, validated_limit, **_role_kwargs(validated_role))
 
 
 def _fuse_hybrid_results(
@@ -820,24 +845,56 @@ class RemoteStore:
         with self._cursor() as cur:
             record_remote_recall_usage(cur, usage)
 
-    def search(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        limit: int = 5,
+        *,
+        role: RoleFilter | None = None,
+    ) -> list[dict[str, Any]]:
         """Full-text search over the shared store, ordered by recency.
 
         ponytail: simple ILIKE matches (no PG FTS setup needed for Phase 2).
         Upgrade to tsvector/to_tsquery when recall volume or ranking matters.
         """
-        return self.search_lexical(query, limit=limit)
+        validated_role = validate_role_filter(role)
+        return self.search_lexical(
+            query, limit=limit, **_role_kwargs(validated_role)
+        )
 
     def recall(
-        self, query: str, limit: int = 5, *, user: User | None = None
+        self,
+        query: str,
+        limit: int = 5,
+        *,
+        user: User | None = None,
+        role: RoleFilter | None = None,
     ) -> list[dict[str, Any]]:
-        return self.recall_lexical(query, limit, user=user)
+        validated_role = validate_role_filter(role)
+        return self.recall_lexical(
+            query, limit, user=user, **_role_kwargs(validated_role)
+        )
 
-    def search_lexical(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+    def search_lexical(
+        self,
+        query: str,
+        limit: int = 5,
+        *,
+        role: RoleFilter | None = None,
+    ) -> list[dict[str, Any]]:
         validated_limit = validate_recall_limit(limit)
+        validated_role = validate_role_filter(role)
+        role_clause = ""
+        parameters: dict[str, object] = {
+            "pattern": _literal_ilike_pattern(query),
+            "limit": validated_limit,
+        }
+        if validated_role is not None:
+            role_clause = "\n                  AND e.role = %(role)s"
+            parameters["role"] = validated_role
         with self._read_cursor() as cur:
             rows = cur.execute(
-                """
+                f"""
                 SELECT e.id, e.session_id, e.role, e.content, e.created_at,
                        s.agent, s.user_name, s.user_email,
                        COALESCE(r.count, 0) AS recall_count,
@@ -847,19 +904,28 @@ class RemoteStore:
                 JOIN sessions s ON s.id = e.session_id
                 LEFT JOIN recalls r ON r.event_id = e.id
                 WHERE e.content ILIKE %(pattern)s ESCAPE E'\\\\'
+                  {role_clause}
                   AND (to_jsonb(s)->>'archived_at') IS NULL
                 ORDER BY e.created_at DESC, e.id
                 LIMIT %(limit)s
                 """,
-                {"pattern": _literal_ilike_pattern(query), "limit": validated_limit},
+                parameters,
             ).fetchall()
             return [dict(row) for row in rows]
 
     def recall_lexical(
-        self, query: str, limit: int = 5, *, user: User | None = None
+        self,
+        query: str,
+        limit: int = 5,
+        *,
+        user: User | None = None,
+        role: RoleFilter | None = None,
     ) -> list[dict[str, Any]]:
         validated_limit = validate_recall_limit(limit)
-        rows = self.search_lexical(query, validated_limit)
+        validated_role = validate_role_filter(role)
+        rows = self.search_lexical(
+            query, validated_limit, **_role_kwargs(validated_role)
+        )
         self._record_recall_usage(
             [str(row["id"]) for row in rows],
             requested_mode="lexical",
@@ -869,11 +935,18 @@ class RemoteStore:
         )
         return rows
 
-    def search_semantic(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+    def search_semantic(
+        self,
+        query: str,
+        limit: int = 5,
+        *,
+        role: RoleFilter | None = None,
+    ) -> list[dict[str, Any]]:
         """Embed the query and return nearest events by cosine distance."""
         from khala.embeddings import embed
 
         validated_limit = validate_recall_limit(limit)
+        validated_role = validate_role_filter(role)
         try:
             vectors = embed([query])
         except Exception as exc:
@@ -889,13 +962,22 @@ class RemoteStore:
                 model=MODEL,
                 chunker_version=CHUNKER_VERSION,
                 limit=validated_limit,
+                role=validated_role,
             )
 
     def recall_semantic(
-        self, query: str, limit: int = 5, *, user: User | None = None
+        self,
+        query: str,
+        limit: int = 5,
+        *,
+        user: User | None = None,
+        role: RoleFilter | None = None,
     ) -> list[dict[str, Any]]:
         validated_limit = validate_recall_limit(limit)
-        rows = self.search_semantic(query, validated_limit)
+        validated_role = validate_role_filter(role)
+        rows = self.search_semantic(
+            query, validated_limit, **_role_kwargs(validated_role)
+        )
         self._record_recall_usage(
             [str(row["id"]) for row in rows],
             requested_mode="semantic",
@@ -905,20 +987,43 @@ class RemoteStore:
         )
         return rows
 
-    def search_hybrid(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+    def search_hybrid(
+        self,
+        query: str,
+        limit: int = 5,
+        *,
+        role: RoleFilter | None = None,
+    ) -> list[dict[str, Any]]:
         """Strict RRF fusion for evaluation; semantic failure is surfaced."""
         validated_limit = validate_recall_limit(limit)
-        lex = self.search_lexical(query, limit=validated_limit * 2)
-        sem = self.search_semantic(query, limit=validated_limit * 2)
+        validated_role = validate_role_filter(role)
+        role_kwargs = _role_kwargs(validated_role)
+        lex = self.search_lexical(
+            query, limit=validated_limit * 2, **role_kwargs
+        )
+        sem = self.search_semantic(
+            query, limit=validated_limit * 2, **role_kwargs
+        )
         return _fuse_hybrid_results(lex, sem, validated_limit)
 
     def recall_hybrid(
-        self, query: str, limit: int = 5, *, user: User | None = None
+        self,
+        query: str,
+        limit: int = 5,
+        *,
+        user: User | None = None,
+        role: RoleFilter | None = None,
     ) -> list[dict[str, Any]]:
         validated_limit = validate_recall_limit(limit)
-        lex = self.search_lexical(query, limit=validated_limit * 2)
+        validated_role = validate_role_filter(role)
+        role_kwargs = _role_kwargs(validated_role)
+        lex = self.search_lexical(
+            query, limit=validated_limit * 2, **role_kwargs
+        )
         try:
-            sem = self.search_semantic(query, limit=validated_limit * 2)
+            sem = self.search_semantic(
+                query, limit=validated_limit * 2, **role_kwargs
+            )
         except ValueError:
             rows = lex[:validated_limit]
             effective_mode: RecallMode = "lexical"

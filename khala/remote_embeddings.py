@@ -19,7 +19,9 @@ from khala.remote_embedding_sql import (
     LEGACY_SAMPLE_SQL,
     LEGACY_SEMANTIC_SEARCH_SQL,
     LEGACY_STATUS_SQL,
+    with_event_role_filter,
 )
+from khala.roles import RoleFilter, validate_role_filter
 
 VECTOR_DIMENSIONS = 1536
 
@@ -171,9 +173,11 @@ def search_semantic(
     model: str,
     chunker_version: str,
     limit: int,
+    role: RoleFilter | None = None,
 ) -> list[dict[str, Any]]:
     """Search by each event's best chunk, with canonical legacy fallback."""
     _validate_read_arguments(provider, model, chunker_version, limit)
+    validated_role = validate_role_filter(role)
     if not query_vector:
         raise ValueError("query vector cannot be empty")
     parameters: dict[str, object] = {
@@ -183,11 +187,14 @@ def search_semantic(
         "chunker_version": chunker_version,
         "limit": limit,
     }
+    if validated_role is not None:
+        parameters["role"] = validated_role
     statement = (
         CHUNK_SEMANTIC_SEARCH_SQL
         if chunk_table_exists(cursor)
         else LEGACY_SEMANTIC_SEARCH_SQL
     )
+    statement = with_event_role_filter(statement, validated_role)
     return [dict(row) for row in cursor.execute(statement, parameters).fetchall()]
 
 

@@ -68,11 +68,11 @@ khala status                     # backlog/retry/dead-letter + worker health
 khala usage [--days N] [--top-actors N]  # recall + event-creation statistics
 khala start --agent <name>       # start a session, returns session_id
 khala record <sid> <role> [txt]  # add a user/assistant/system/tool event
-khala recall <query> [--limit] [--mode lexical|semantic|hybrid]
+khala recall <query> [--limit] [--mode lexical|semantic|hybrid] [--role user|assistant]
 khala graph <event-id> [--limit]  # centered same-session context
 khala graph --file <path> [--limit N] [--context-limit N]  # file evidence
 khala identifiers backfill [--limit N]  # bounded legacy identifier indexing
-khala replay <sid>               # dump a session's events
+khala replay <sid> [--role user|assistant]  # dump a session's events
 khala ingest --agent <a> [--adapter M:C]   # bulk import (stdin JSONL by default)
 khala sync [--adapter hermes|codex] [--session-id X] [--name/--email]
 khala hook <adapter>             # vendor hook entrypoint (reads stdin JSON)
@@ -124,6 +124,7 @@ When connected to a remote, `khala recall` supports three modes:
 khala recall "how do I sync agent sessions" --mode lexical    # keyword only
 khala recall "how do I sync agent sessions" --mode semantic   # embedding similarity
 khala recall "how do I sync agent sessions" --mode hybrid     # RRF fusion (default)
+khala recall "how do I sync agent sessions" --role user       # only user events
 ```
 
 - Events with `user`/`assistant` roles are embedded with

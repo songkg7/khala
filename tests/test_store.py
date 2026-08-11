@@ -107,6 +107,38 @@ class KhalaStoreTest(unittest.TestCase):
         hits = self.store.recall("cross-agent")
         self.assertTrue(any("cross-agent" in h["content"] for h in hits))
 
+    def test_role_filter_limits_recall_and_replay(self):
+        session = self.store.add_session("test")
+        user_event = self.store.add_event(session, "user", "role filter needle")
+        assistant_event = self.store.add_event(
+            session, "assistant", "role filter needle"
+        )
+        self.store.add_event(session, "system", "role filter needle")
+
+        self.assertEqual(
+            [row["id"] for row in self.store.recall("role filter", role="user")],
+            [user_event],
+        )
+        self.assertEqual(
+            [row["id"] for row in self.store.recall("role filter", role="assistant")],
+            [assistant_event],
+        )
+        self.assertEqual(
+            [row["role"] for row in self.store.replay(session, role="user")],
+            ["user"],
+        )
+        self.assertEqual(
+            [row["role"] for row in self.store.replay(session, role="assistant")],
+            ["assistant"],
+        )
+
+    def test_invalid_role_filter_fails_before_query(self):
+        session = self.store.add_session("test")
+        with self.assertRaisesRegex(ValueError, "unsupported role filter"):
+            self.store.replay(session, role="system")  # type: ignore[arg-type]
+        with self.assertRaisesRegex(ValueError, "unsupported role filter"):
+            self.store.recall("needle", role="system")  # type: ignore[arg-type]
+
     def test_replay_empty_and_nonexistent(self):
         self.assertEqual(self.store.replay("no-such"), [])
         session = self.store.add_session("test")

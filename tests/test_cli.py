@@ -163,6 +163,31 @@ class KhalaCLIIntegrationTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("limit must be positive", err)
 
+    def test_recall_and_replay_support_role_filter(self):
+        code, out, error = self._run("start", "--agent", "test")
+        self.assertEqual(code, 0, error)
+        session = json.loads(out)["session_id"]
+        for role in ("user", "assistant", "system"):
+            code, _, error = self._run(
+                "record", session, role, "role-filter needle"
+            )
+            self.assertEqual(code, 0, error)
+
+        code, out, error = self._run("replay", session, "--role", "user")
+        self.assertEqual(code, 0, error)
+        self.assertEqual([row["role"] for row in json.loads(out)], ["user"])
+
+        code, out, error = self._run("recall", "role-filter", "--role", "assistant")
+        self.assertEqual(code, 0, error)
+        self.assertEqual([row["role"] for row in json.loads(out)], ["assistant"])
+
+    def test_role_filter_rejects_unsupported_roles(self):
+        for command in (("recall", "needle"), ("replay", "session")):
+            with self.subTest(command=command):
+                code, _, error = self._run(*command, "--role", "system")
+                self.assertEqual(code, 2)
+                self.assertIn("invalid choice", error)
+
     def test_graph_with_negative_limit(self):
         code, _, err = self._run("graph", "event", "--limit", "-1")
         self.assertEqual(code, 2)
@@ -321,6 +346,22 @@ class KhalaCLIIntegrationTest(unittest.TestCase):
                 self.assertIn("archive convergence failed", error)
                 recall_by_mode.assert_not_called()
                 remote.graph.assert_not_called()
+
+    def test_remote_recall_receives_role_filter(self):
+        self.config.save_config(
+            {"workspaces": [], "remote": "postgresql://example.invalid/khala"}
+        )
+        with patch("khala.remote.RemoteStore") as remote_store, patch(
+            "khala.remote.recall_by_mode", return_value=[]
+        ) as recall_by_mode:
+            code, output_text, error = self._run(
+                "recall", "needle", "--role", "user"
+            )
+
+        self.assertEqual(code, 0, error)
+        self.assertEqual(json.loads(output_text), [])
+        self.assertIs(recall_by_mode.call_args.args[0], remote_store.return_value)
+        self.assertEqual(recall_by_mode.call_args.kwargs["role"], "user")
 
     def test_embedding_commands_converge_archives_before_remote_work(self):
         tombstones = self._seed_archived_session()

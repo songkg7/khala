@@ -15,6 +15,7 @@ from khala.errors import public_error_message
 from khala.identifier_graph import IdentifierGraphQuery
 from khala.identity import resolve_user
 from khala.redact import redact
+from khala.roles import ROLE_FILTER_CHOICES
 from khala.store import Store
 
 CANONICAL_DB = Path("~/.khala/khala.db").expanduser()
@@ -73,8 +74,20 @@ def parser() -> argparse.ArgumentParser:
         "--graph", action="store_true",
         help="Attach same-session adjacent context to each hit (RAG-style)",
     )
+    recall.add_argument(
+        "--role",
+        choices=ROLE_FILTER_CHOICES,
+        default=None,
+        help="Only return events with this role",
+    )
     replay = commands.add_parser("replay")
     replay.add_argument("session_id")
+    replay.add_argument(
+        "--role",
+        choices=ROLE_FILTER_CHOICES,
+        default=None,
+        help="Only return events with this role",
+    )
     graph = commands.add_parser(
         "graph", help="Show event context or file-reference evidence"
     )
@@ -370,6 +383,7 @@ def main(argv: list[str] | None = None) -> int:
                     mode=args.mode,
                     limit=args.limit,
                     user=user,
+                    role=args.role,
                 )
                 if args.graph:
                     results = remote.attach_neighbors(results)
@@ -379,12 +393,13 @@ def main(argv: list[str] | None = None) -> int:
                     args.limit,
                     requested_mode=args.mode,
                     user=user,
+                    role=args.role,
                 )
                 if args.graph:
                     results = store.attach_neighbors(results)
             output(results)
         elif args.command == "replay":
-            output(store.replay(args.session_id))
+            output(store.replay(args.session_id, role=args.role))
         elif args.command == "graph":
             if args.limit < 1:
                 raise ValueError("limit must be positive")

@@ -4,6 +4,8 @@ import re
 import sqlite3
 from typing import Any
 
+from khala.roles import RoleFilter, validate_role_filter
+
 _QUESTION_STOP_WORDS = frozenset(
     {
         "a",
@@ -68,15 +70,27 @@ def build_match_query(query: str) -> str | None:
 
 
 def lexical_search(
-    db: sqlite3.Connection, query: str, limit: int = 5
+    db: sqlite3.Connection,
+    query: str,
+    limit: int = 5,
+    *,
+    role: RoleFilter | None = None,
 ) -> list[dict[str, Any]]:
+    validated_role = validate_role_filter(role)
     if limit < 1:
         return []
     match_query = build_match_query(query)
     if match_query is None:
         return []
+    role_clause = ""
+    parameters: tuple[Any, ...]
+    if validated_role is None:
+        parameters = (match_query, limit)
+    else:
+        role_clause = " AND e.role = ?"
+        parameters = (match_query, validated_role, limit)
     rows = db.execute(
-        """
+        f"""
         SELECT e.id, e.session_id, e.role, e.content, e.created_at, s.agent,
                s.user_name, s.user_email,
                COALESCE(r.count, 0) AS recall_count,
@@ -85,11 +99,11 @@ def lexical_search(
         JOIN events e ON e.rowid = events_fts.rowid
         JOIN sessions s ON s.id = e.session_id
         LEFT JOIN recalls r ON r.event_id = e.id
-        WHERE events_fts MATCH ? AND s.archived_at IS NULL
+        WHERE events_fts MATCH ? AND s.archived_at IS NULL{role_clause}
         ORDER BY rank, e.created_at DESC, e.rowid
         LIMIT ?
         """,
-        (match_query, limit),
+        parameters,
     ).fetchall()
     return [dict(row) for row in rows]
 
