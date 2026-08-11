@@ -1,5 +1,4 @@
 import io
-import os
 import sqlite3
 import sys
 import tempfile
@@ -225,6 +224,7 @@ class KhalaHookDispatchTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmp.name)
+        self.db = self.dir / "khala.db"
         self.state_path = self.dir / "state.db"
         make_hermes_state_db(self.state_path)
         from khala.adapters.hermes import HermesAdapter
@@ -245,27 +245,33 @@ class KhalaHookDispatchTest(unittest.TestCase):
         self.assertEqual(cwd, "/ws")
 
     def test_hook_command_integration(self):
-        db = self.dir / "khala.db"
-        with patch.dict(
-            os.environ,
-            {
-                "KHALA_DB": str(db),
-                "KHALA_CONFIG_DIR": str(self.dir / "cfg"),
-                "HERMES_STATE_DB": str(self.state_path),
-            },
+        from khala import config
+        from khala.adapters import ADAPTERS
+
+        config_dir = self.dir / "cfg"
+        with (
+            patch.object(config, "CONFIG_DIR", config_dir),
+            patch.object(config, "CONFIG_FILE", config_dir / "config.json"),
+            patch.dict(ADAPTERS, {"hermes": self.adapter}),
         ):
-            code, out, _ = self._run("workspace", "add", str(self.dir))
-            self.assertEqual(code, 0)
+            code, out, error = self._run("workspace", "add", str(self.dir))
+            self.assertEqual(code, 0, error)
             payload = f'{{"session_id":"sess-1","cwd": "{self.dir}"}}'
-            code, out, _ = self._run("hook", "hermes", stdin=payload)
-            self.assertEqual(code, 0)
+            code, out, error = self._run(
+                "hook",
+                "hermes",
+                "--workspace",
+                str(self.dir),
+                stdin=payload,
+            )
+            self.assertEqual(code, 0, error)
             self.assertIn('"status": "synced"', out)
-            code, out, _ = self._run(
+            code, out, error = self._run(
                 "hook",
                 "hermes",
                 stdin='{"session_id":"sess-1","cwd": "/tmp/elsewhere"}',
             )
-            self.assertEqual(code, 0)
+            self.assertEqual(code, 0, error)
             self.assertIn("workspace not enabled", out)
 
     def _run(self, *args, stdin=""):
@@ -274,7 +280,7 @@ class KhalaHookDispatchTest(unittest.TestCase):
         prev_err, sys.stderr = sys.stderr, io.StringIO()
         try:
             try:
-                code = main(list(args))
+                code = main(["--db", str(self.db), *list(args)])
             except SystemExit as exc:
                 code = exc.code or 0
             out = sys.stdout.getvalue()
