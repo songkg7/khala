@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -111,6 +113,37 @@ class GitWorktreeConfigTest(unittest.TestCase):
         loaded = config.load_config()
         self.assertNotIn(WORKSPACE_GIT_COMMON_DIRS_KEY, loaded)
         self.assertTrue(config.is_enabled_workspace(str(sibling)))
+
+    def test_readding_legacy_workspace_backfills_git_identity(self) -> None:
+        from khala import main
+
+        registered = self._add_worktree("legacy-readded")
+        config.ensure_config_directory()
+        config.CONFIG_FILE.write_text(
+            json.dumps({"workspaces": [str(registered.resolve())], "remote": None})
+        )
+
+        with patch.object(sys, "stdout", io.StringIO()) as stdout:
+            code = main(
+                [
+                    "--db",
+                    str(self.root / "khala.db"),
+                    "workspace",
+                    "add",
+                    str(registered),
+                ]
+            )
+
+        stored = config.load_config()
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            json.loads(stdout.getvalue())["workspaces"],
+            [str(registered.resolve())],
+        )
+        self.assertEqual(
+            stored[WORKSPACE_GIT_COMMON_DIRS_KEY],
+            {str(registered.resolve()): str((self.repository / ".git").resolve())},
+        )
 
     def test_registration_survives_deletion_of_original_worktree(self) -> None:
         registered = self._add_worktree("ephemeral")

@@ -26,8 +26,10 @@ class CodexHookInstallResult:
             "integration": "codex",
             "status": "installed" if self.changed else "already_installed",
             "hooks_file": str(self.path),
-            "restart_required": self.changed,
-            "trust_required": self.changed,
+            # Installation cannot observe whether every running Codex client
+            # reloaded this file or whether the exact handler hash was trusted.
+            "restart_required": True,
+            "trust_required": True,
         }
 
 
@@ -77,7 +79,7 @@ def _validated_executable(executable: Path) -> Path:
 
 
 def _handler(executable: Path) -> dict[str, Any]:
-    arguments = [str(executable), "hook", "codex"]
+    arguments = [str(executable), "hook", "codex", "--codex-stop"]
     return {
         "type": "command",
         "command": " ".join(shlex.quote(argument) for argument in arguments),
@@ -127,6 +129,10 @@ def _merge_stop_hook(document: dict[str, Any], handler: dict[str, Any]) -> bool:
 
     first_handlers, first_index = matches[0]
     first_handlers[first_index] = handler
+    # Remove duplicates back-to-front so unrelated handler ordering and the
+    # trust indexes before the first Khala handler remain unchanged. Empty
+    # matcher groups are deliberately retained: deleting a group would shift
+    # every later Stop hook's persisted trust index.
     for handlers, index in reversed(matches[1:]):
         handlers.pop(index)
     return True

@@ -14,6 +14,7 @@ from khala.adapter import ingest_events
 from khala.errors import public_error_message
 from khala.identifier_graph import IdentifierGraphQuery
 from khala.identity import resolve_user
+from khala.redact import redact
 from khala.store import Store
 
 CANONICAL_DB = Path("~/.khala/khala.db").expanduser()
@@ -161,6 +162,14 @@ def parser() -> argparse.ArgumentParser:
         default=None,
         help="Workspace whose sessions to sync (default: payload cwd if enabled)",
     )
+    hook.add_argument(
+        "--codex-stop",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    install = commands.add_parser("install", help="Install agent integrations")
+    install_targets = install.add_subparsers(dest="install_target", required=True)
+    install_targets.add_parser("codex", help="Install per-turn Codex synchronization")
     ws = commands.add_parser("workspace", help="Manage khala-enabled workspaces")
     ws_sub = ws.add_subparsers(dest="ws_action", required=True)
     ws_add = ws_sub.add_parser("add", help="Enable a workspace for auto-sync")
@@ -204,6 +213,53 @@ def _converged_remote(store: Store, dsn: str) -> Any:
 
 def output(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def _open_store(database_path: Path) -> Store:
+    from khala.config import ensure_config_directory
+    from khala.secure_files import ensure_private_directory
+
+    ensure_config_directory()
+    if database_path.absolute() == CANONICAL_DB.absolute():
+        ensure_private_directory(database_path.parent)
+    return Store(database_path)
+
+
+def _run_codex_stop_hook(args: argparse.Namespace, database_path: Path) -> int:
+    """Run a best-effort Codex Stop hook without affecting the agent turn.
+
+    Codex treats exit code 2 from a Stop hook as a request to continue the
+    agent. Khala synchronization must never accidentally trigger that control
+    flow, so every ordinary initialization, payload, database, and sync failure
+    is reported on stderr while stdout remains one neutral JSON object.
+    """
+    store: Store | None = None
+    try:
+        from khala.hooks import read_hook_payload, sync_hook
+
+        store = _open_store(database_path)
+        payload = read_hook_payload(sys.stdin)
+        sync_hook(
+            store,
+            adapter_name="codex",
+            payload=payload,
+            database_path=database_path,
+            workspace_override=args.workspace,
+        )
+    except Exception as error:
+        message = redact(public_error_message(error))
+        print(f"khala: Codex Stop sync failed: {message}", file=sys.stderr)
+    finally:
+        if store is not None:
+            try:
+                store.close()
+            except Exception as error:
+                print(
+                    f"khala: Codex Stop store close failed: {redact(str(error))}",
+                    file=sys.stderr,
+                )
+        output({})
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -254,13 +310,23 @@ def main(argv: list[str] | None = None) -> int:
         ) as error:
             print(f"khala: {error}", file=sys.stderr)
             return 2
-    from khala.config import ensure_config_directory
-    from khala.secure_files import ensure_private_directory
+    if args.command == "install":
+        try:
+            if args.install_target != "codex":
+                raise ValueError(f"unsupported install target: {args.install_target}")
+            from khala.codex_hooks import install_codex_stop_hook
 
-    ensure_config_directory()
-    if database_path.absolute() == CANONICAL_DB.absolute():
-        ensure_private_directory(database_path.parent)
-    store = Store(database_path)
+            output(install_codex_stop_hook().public_report())
+            return 0
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            print(f"khala: {error}", file=sys.stderr)
+            return 2
+    if args.command == "hook" and args.codex_stop:
+        if args.adapter != "codex":
+            print("khala: --codex-stop requires the codex adapter", file=sys.stderr)
+            return 2
+        return _run_codex_stop_hook(args, database_path)
+    store = _open_store(database_path)
     try:
         if args.command == "status":
             mode = "khalai" if _remote_dsn() else "nerazim"
@@ -383,32 +449,17 @@ def main(argv: list[str] | None = None) -> int:
                 spawn_worker(database_path, dsn)
             output(result)
         elif args.command == "hook":
-            from khala.adapters import get_adapter
-            from khala.config import is_enabled_workspace
-            from khala.sync import sync_session as sync_one
+            from khala.hooks import read_hook_payload, sync_hook
 
-            adapter = get_adapter(args.adapter)
-            payload = json.loads(sys.stdin.read()) if not sys.stdin.isatty() else {}
-            if not isinstance(payload, dict):
-                payload = {}
-            session_id, cwd = adapter.handle_hook(payload)
-            workspace = args.workspace or cwd
-            if not is_enabled_workspace(workspace):
-                output({"status": "skipped", "reason": "workspace not enabled"})
-                return 0
-            if not session_id:
-                output({"status": "skipped", "reason": "no session_id"})
-                return 0
-            result = sync_one(
-                store, adapter, session_id,
-                cwd=Path(cwd) if cwd else None,
+            output(
+                sync_hook(
+                    store,
+                    adapter_name=args.adapter,
+                    payload=read_hook_payload(sys.stdin),
+                    database_path=database_path,
+                    workspace_override=args.workspace,
+                )
             )
-            dsn = _remote_dsn()
-            if dsn:
-                from khala.worker import spawn_worker
-
-                spawn_worker(database_path, dsn)
-            output({"status": "synced", **result})
         elif args.command == "workspace":
             from khala.config import load_config, save_config
 
@@ -417,7 +468,9 @@ def main(argv: list[str] | None = None) -> int:
                 path_str = str(args.path.resolve())
                 if path_str not in config_data["workspaces"]:
                     config_data["workspaces"].append(path_str)
-                    save_config(config_data)
+                # Save even when the path was already registered so legacy
+                # path-only configs gain repository/worktree identity metadata.
+                save_config(config_data)
                 output({"ok": True, "workspace": path_str, "workspaces": config_data["workspaces"]})
             elif args.ws_action == "remove":
                 path_str = str(args.path.resolve())
