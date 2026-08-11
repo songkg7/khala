@@ -68,7 +68,7 @@ jobs:
         run: .venv/bin/ruff check .
 
       - name: Type check
-        run: .venv/bin/pyright
+        run: .venv/bin/pyright --pythonpath .venv/bin/python
 
       - name: Run PostgreSQL integration tests
         run: .venv/bin/python -m unittest -v tests.test_postgres_integration
