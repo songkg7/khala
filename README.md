@@ -9,6 +9,7 @@ vendors — everyone on the network shares one "thoughtstream".
 ```bash
 uv sync                          # install into .venv
 uv tool install . --force        # install `khala` on PATH globally
+khala install codex              # install the user-level Codex Stop hook
 ```
 
 Run the test suite:
@@ -56,6 +57,10 @@ Enable a workspace for auto-sync:
 khala workspace add /path/to/workspace
 ```
 
+For a Git repository, register any one checkout once. Khala records Git's
+common repository directory, so existing and future sibling worktrees are
+enabled automatically. Non-Git workspaces retain path-prefix behavior.
+
 ## CLI
 
 ```
@@ -71,6 +76,7 @@ khala replay <sid>               # dump a session's events
 khala ingest --agent <a> [--adapter M:C]   # bulk import (stdin JSONL by default)
 khala sync [--adapter hermes|codex] [--session-id X] [--name/--email]
 khala hook <adapter>             # vendor hook entrypoint (reads stdin JSON)
+khala install codex              # merge the per-turn hook into Codex user config
 khala workspace add|remove|list  # manage auto-sync workspaces
 khala connect <postgres dsn>     # Khalai: connect to a shared store (pgvector)
 khala disconnect                 # back to Nerazim (local-only)
@@ -227,6 +233,41 @@ network or output workload, judging is capped at 1,000 possible results,
 `--read` at 10,000 results, and remote semantic/hybrid evaluation at 1,000
 queries per run.
 
+## Codex hook (auto record every turn)
+
+Codex can call Khala's user-level `Stop` hook after every completed turn. The
+hook resolves Codex's bare session UUID through its validated transcript path,
+then incrementally stores complete prompt and response events. Repeated hooks
+are idempotent, and an incomplete final JSONL record is left for the next turn.
+
+### 1. Install and enable one checkout
+
+```bash
+uv tool install . --force
+khala workspace add /path/to/any/worktree
+khala install codex
+```
+
+One workspace registration enables every worktree that shares the same Git
+common directory. Re-running `workspace add` is safe and upgrades legacy
+path-only registrations with durable repository identity metadata.
+
+`khala install codex` merges one Khala handler at the end of
+`$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`). It preserves existing
+hooks and is idempotent.
+
+### 2. Restart and trust the hook
+
+Restart Codex so it reloads the user hook file. In the interactive client, run
+`/hooks`, review the exact Khala command, and trust it. Codex stores trust for
+the exact hook definition, so repeat this review after the installed executable
+path or handler changes.
+
+The installed command uses a Codex-specific fail-open boundary: even if Khala's
+database or synchronization fails, the hook exits successfully and writes only
+a neutral JSON object to stdout. Diagnostics go to stderr, so a memory outage
+cannot accidentally ask Codex to continue the agent turn.
+
 ## Hermes hook (auto record every turn)
 
 Hermes can call `khala hook hermes` on `post_llm_call` (every turn),
@@ -238,7 +279,7 @@ enabled workspace.
 
 ```bash
 uv tool install . --force
-khala workspace add /Users/haril/orca/workspaces/khala/goblin
+khala workspace add /path/to/any/worktree
 ```
 
 ### 2. Register the hooks in `~/.hermes/config.yaml`
