@@ -5,10 +5,40 @@ import os
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from khala.models import AdapterBatch
 
-CODEX_SESSIONS_DIR = Path(os.environ.get("CODEX_SESSIONS_DIR", Path.home() / ".codex" / "sessions"))
+
+def codex_sessions_dir(environ: Mapping[str, str] | None = None) -> Path:
+    """Resolve Codex's rollout directory, honoring standard environment overrides."""
+    values = os.environ if environ is None else environ
+    configured_sessions = values.get("CODEX_SESSIONS_DIR")
+    if configured_sessions:
+        return Path(configured_sessions).expanduser().absolute()
+    configured_home = values.get("CODEX_HOME")
+    codex_home = (
+        Path(configured_home).expanduser().absolute()
+        if configured_home
+        else (Path.home() / ".codex").absolute()
+    )
+    return codex_home / "sessions"
+
+
+def _string_field(payload: Mapping[str, Any], key: str) -> str:
+    value = payload.get(key)
+    return value if isinstance(value, str) else ""
+
+
+def _matches_hook_session(external_id: str, hook_session_id: str) -> bool:
+    """Return whether a rollout stem belongs to the hook's claimed session."""
+    if external_id == hook_session_id:
+        return True
+    try:
+        normalized_id = str(UUID(hook_session_id))
+    except (AttributeError, ValueError):
+        return False
+    return external_id.lower().endswith(f"-{normalized_id}")
 
 
 def _extract_text(content: Any) -> str:
@@ -52,18 +82,29 @@ class CodexAdapter:
 
     name = "codex"
 
-    def __init__(self, sessions_dir: Path = CODEX_SESSIONS_DIR) -> None:
-        self.sessions_dir = sessions_dir
+    def __init__(self, sessions_dir: Path | None = None) -> None:
+        self.sessions_dir = codex_sessions_dir() if sessions_dir is None else sessions_dir
 
     def handle_hook(self, payload: Mapping[str, Any]) -> tuple[str | None, str]:
-        """Extract (session_id, cwd) from a Codex hook payload.
+        """Resolve a Codex hook payload to its canonical rollout external id.
 
-        Codex hook payloads schema is TBD — unblocked by the rollout-id from the
-        payload's session metadata when available. Empty → caller skips (no-op).
+        Stop hooks provide a bare session UUID and the full rollout transcript
+        path. The store identity is the rollout filename stem, so validate the
+        path before translating the UUID. Older payloads without a transcript
+        remain supported when their identifier resolves to exactly one rollout.
         """
-        session_id = str(payload.get("session_id") or payload.get("rollout_id") or "")
-        cwd = str(payload.get("cwd") or "")
-        return (session_id or None, cwd)
+        hook_session_id = _string_field(payload, "session_id")
+        rollout_id = _string_field(payload, "rollout_id")
+        claimed_id = hook_session_id or rollout_id
+        cwd = _string_field(payload, "cwd")
+
+        if "transcript_path" in payload:
+            external_id = self._external_id_from_transcript(
+                payload.get("transcript_path"), claimed_id
+            )
+            return external_id, cwd
+
+        return self._resolve_legacy_external_id(claimed_id), cwd
 
     def _rollout_paths(self) -> list[Path]:
         paths: list[Path] = []
@@ -92,10 +133,10 @@ class CodexAdapter:
         """Read complete JSONL records; leave a partial final line for the next pass."""
         path = self._find_rollout(session_id)
         if path is None:
-            return AdapterBatch((), after_id)
+            raise FileNotFoundError(f"Codex rollout not found or ambiguous: {session_id}")
         events: list[tuple[int, Mapping[str, Any]]] = []
         next_watermark = after_id
-        with open(path) as stream:
+        with open(path, encoding="utf-8") as stream:
             for line_no, line in enumerate(stream, 1):
                 if line_no <= after_id:
                     continue
@@ -116,7 +157,59 @@ class CodexAdapter:
         return AdapterBatch(tuple(events), next_watermark)
 
     def _find_rollout(self, session_id: str) -> Path | None:
-        for path in self._rollout_paths():
-            if path.stem == session_id:
-                return path
-        return None
+        matches = [path for path in self._rollout_paths() if path.stem == session_id]
+        return matches[0] if len(matches) == 1 else None
+
+    def _external_id_from_transcript(
+        self, raw_transcript_path: Any, claimed_id: str
+    ) -> str | None:
+        if not isinstance(raw_transcript_path, str) or not raw_transcript_path:
+            return None
+        transcript_path = Path(raw_transcript_path)
+        if not transcript_path.is_absolute() or transcript_path.suffix != ".jsonl":
+            return None
+        try:
+            sessions_dir = self.sessions_dir.resolve(strict=True)
+            resolved_path = transcript_path.resolve(strict=True)
+            resolved_path.relative_to(sessions_dir)
+        except (FileNotFoundError, OSError, RuntimeError, ValueError):
+            return None
+        if not resolved_path.is_file() or resolved_path.suffix != ".jsonl":
+            return None
+
+        external_id = transcript_path.stem
+        if not claimed_id or not _matches_hook_session(external_id, claimed_id):
+            return None
+        stem_matches = [
+            path for path in self._rollout_paths() if path.stem == external_id
+        ]
+        if len(stem_matches) != 1 or not self._same_file(stem_matches[0], resolved_path):
+            return None
+        return external_id
+
+    def _resolve_legacy_external_id(self, claimed_id: str) -> str | None:
+        if not claimed_id:
+            return None
+        exact_matches = [
+            path for path in self._rollout_paths() if path.stem == claimed_id
+        ]
+        if len(exact_matches) == 1:
+            return claimed_id
+        if exact_matches:
+            return None
+        try:
+            normalized_id = str(UUID(claimed_id))
+        except (AttributeError, ValueError):
+            return None
+        suffix = f"-{normalized_id}"
+        uuid_matches = [
+            path for path in self._rollout_paths() if path.stem.lower().endswith(suffix)
+        ]
+        return uuid_matches[0].stem if len(uuid_matches) == 1 else None
+
+    @staticmethod
+    def _same_file(path: Path, resolved_path: Path) -> bool:
+        try:
+            return path.resolve(strict=True) == resolved_path
+        except (FileNotFoundError, OSError, RuntimeError):
+            return False
