@@ -12,6 +12,14 @@ from khala.secure_files import (
     ensure_private_directory,
     tighten_private_file,
 )
+from khala.workspaces import (
+    WORKSPACE_GIT_COMMON_DIRS_KEY,
+    normalize_git_common_dirs,
+    reconcile_git_common_dirs,
+)
+from khala.workspaces import (
+    is_enabled_workspace as workspace_is_enabled,
+)
 
 CONFIG_DIR = Path(os.environ.get("KHALA_CONFIG_DIR", Path.home() / ".khala"))
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -40,6 +48,11 @@ def load_config() -> dict[str, Any]:
     if not isinstance(workspaces, list):
         workspaces = []
     data["workspaces"] = [str(w) for w in workspaces]
+    git_common_dirs = normalize_git_common_dirs(data.get(WORKSPACE_GIT_COMMON_DIRS_KEY))
+    if git_common_dirs:
+        data[WORKSPACE_GIT_COMMON_DIRS_KEY] = git_common_dirs
+    else:
+        data.pop(WORKSPACE_GIT_COMMON_DIRS_KEY, None)
     data["remote"] = data.get("remote")
     return data
 
@@ -55,23 +68,35 @@ def is_connected() -> bool:
 
 
 def save_config(data: dict[str, Any]) -> None:
+    serialized = dict(data)
+    workspaces = serialized.get("workspaces")
+    workspace_paths = (
+        [str(value) for value in workspaces] if isinstance(workspaces, list) else []
+    )
+    git_common_dirs = reconcile_git_common_dirs(
+        workspace_paths,
+        serialized.get(WORKSPACE_GIT_COMMON_DIRS_KEY),
+    )
+    if git_common_dirs:
+        serialized[WORKSPACE_GIT_COMMON_DIRS_KEY] = git_common_dirs
+    else:
+        serialized.pop(WORKSPACE_GIT_COMMON_DIRS_KEY, None)
+
     ensure_private_directory(CONFIG_DIR)
     atomic_write_private_text(
         CONFIG_FILE,
-        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+        json.dumps(serialized, indent=2, ensure_ascii=False) + "\n",
     )
 
 
 def is_enabled_workspace(cwd: str) -> bool:
-    """True when cwd is inside any configured khala workspace (path prefix match)."""
-    from pathlib import Path as P
-
-    cwd_path = P(cwd).resolve()
-    for workspace in load_config().get("workspaces", []):
-        ws = P(workspace).resolve()
-        if cwd_path == ws or ws in cwd_path.parents:
-            return True
-    return False
+    """True when cwd is inside a configured path or one of its Git worktrees."""
+    data = load_config()
+    return workspace_is_enabled(
+        cwd,
+        data.get("workspaces", []),
+        data.get(WORKSPACE_GIT_COMMON_DIRS_KEY),
+    )
 
 
 def mask_dsn(dsn: str) -> str:
