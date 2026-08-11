@@ -36,6 +36,12 @@ class KhalaConfigTest(unittest.TestCase):
         self.assertEqual(self.cfg.load_config(), {"workspaces": [], "remote": None})
         self.assertFalse(self.cfg.is_enabled_workspace("/anywhere"))
 
+    def test_missing_config_returns_fresh_workspace_list(self):
+        first = self.cfg.load_config()
+        first["workspaces"].append("/mutated")
+
+        self.assertEqual(self.cfg.load_config(), {"workspaces": [], "remote": None})
+
     @unittest.skipUnless(os.name == "posix", "POSIX permission bits required")
     def test_load_tightens_existing_config_directory_when_file_is_missing(self):
         self.cfg.CONFIG_DIR.chmod(0o755)

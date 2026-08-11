@@ -24,7 +24,9 @@ from khala.workspaces import (
 CONFIG_DIR = Path(os.environ.get("KHALA_CONFIG_DIR", Path.home() / ".khala"))
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
-_DEFAULT = {"workspaces": [], "remote": None}
+
+def _default_config() -> dict[str, Any]:
+    return {"workspaces": [], "remote": None}
 
 
 def ensure_config_directory() -> None:
@@ -35,15 +37,15 @@ def ensure_config_directory() -> None:
 def load_config() -> dict[str, Any]:
     ensure_config_directory()
     if not CONFIG_FILE.is_file():
-        return dict(_DEFAULT)
+        return _default_config()
     ensure_private_directory(CONFIG_FILE.parent)
     tighten_private_file(CONFIG_FILE)
     try:
         data = json.loads(CONFIG_FILE.read_text())
         if not isinstance(data, dict):
-            return dict(_DEFAULT)
+            return _default_config()
     except (json.JSONDecodeError, OSError):
-        return dict(_DEFAULT)
+        return _default_config()
     workspaces = data.get("workspaces")
     if not isinstance(workspaces, list):
         workspaces = []
