@@ -4,6 +4,15 @@ Local-first shared agent memory. Khala records sessions from agents (Hermes,
 Codex, ...) into a single canonical store and makes them searchable across
 vendors — everyone on the network shares one "thoughtstream".
 
+Khala is not a response cache. A cache stores answers for exact repeats; Khala
+stores **reasoning as a shared asset** — vendor-neutral events, attributed to
+the people who produced them, reachable semantically and structurally across
+sessions, containers, and machines. The experiment below demonstrates the
+reuse mechanism; the sections it links to ([Canonical schema](#canonical-schema),
+[User identity](#user-identity), [Usage statistics](#usage-statistics),
+[File identifier evidence graph](#file-identifier-evidence-graph)) are what
+make it a *team network* rather than a lookup table.
+
 ## Semantic Reuse: Controlled Cross-Sandbox Experiment
 
 > **Result: the reuse path worked.** A second, isolated sandbox submitted a
@@ -74,8 +83,17 @@ Khala is more than a session archive:
   A's answer.
 - **Generation avoidance:** the second agent can spend its context budget on
   new work instead of regenerating an existing explanation.
+- **People, not just sessions:** events are attributed to
+  `user_name`/`user_email` and [usage statistics](#usage-statistics) report
+  recall and creation **per actor** — the network is shaped by who thought
+  what, not just what was said.
 - **Vendor-neutral storage:** the shared boundary is canonical `user` and
-  `assistant` events, not a vendor-specific transcript format.
+  `assistant` events, not a vendor-specific transcript format
+  ([Canonical schema](#canonical-schema)).
+- **Structural context, not only answers:** recall is one payload type.
+  [File identifier evidence graph](#file-identifier-evidence-graph) and
+  `recall --graph` also retrieve same-session context and file references, so
+  the network carries *how reasoning connects*, not just finished answers.
 - **Local-first isolation:** each client keeps local state while Khala provides
   a shared memory layer when connected.
 
