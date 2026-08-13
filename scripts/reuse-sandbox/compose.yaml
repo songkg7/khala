@@ -1,0 +1,27 @@
+services:
+  box-a:
+    build:
+      context: ../..
+      dockerfile: scripts/reuse-sandbox/Dockerfile
+    container_name: khala-box-a
+    restart: "no"
+    environment:
+      KHALA_DSN: ${KHALA_DSN}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      BOX: a
+    networks: [khala_exp]
+  box-b:
+    build:
+      context: ../..
+      dockerfile: scripts/reuse-sandbox/Dockerfile
+    container_name: khala-box-b
+    restart: "no"
+    environment:
+      KHALA_DSN: ${KHALA_DSN}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      BOX: b
+    networks: [khala_exp]
+networks:
+  khala_exp:
+    external: true
+    name: goblin_default

@@ -4,6 +4,137 @@ Local-first shared agent memory. Khala records sessions from agents (Hermes,
 Codex, ...) into a single canonical store and makes them searchable across
 vendors — everyone on the network shares one "thoughtstream".
 
+## Semantic Reuse: Controlled Cross-Sandbox Experiment
+
+> **Result: the reuse path worked.** A second, isolated sandbox submitted a
+> paraphrased request and retrieved the first sandbox's stored answer from the
+> shared Khala store, without making another chat-completion request.
+
+### Executive summary
+
+The core value proposition is simple: an agent should not spend tokens
+reconstructing knowledge that another agent has already produced. Khala records
+that knowledge once, embeds it in a shared store, and makes it available to
+other agents through semantic recall.
+
+We tested that claim with two Docker containers. Each container had its own
+filesystem and local SQLite state. The only shared resource was the central
+PostgreSQL + pgvector Khala store.
+
+![Cross-sandbox semantic reuse architecture](docs/semantic-reuse-architecture.svg)
+
+### Hypothesis
+
+> When two isolated agents receive semantically similar requests, the second
+> agent can reuse a relevant response already stored by the first agent,
+> reducing repeated LLM generation and its token cost.
+
+### Experimental protocol
+
+1. **Sandbox A** received:
+   `khala 프로젝트의 구조와 목적을 분석해서 정리해줘.`
+2. A real chat completion generated the answer. The prompt and answer were
+   recorded as canonical Khala events, pushed to the central store, and
+   embedded.
+3. **Sandbox B**, with separate local state, received the paraphrase:
+   `khala 프로젝트를 대략 훑어보고 어떤 구조로 되어있는지 설명해줘.`
+4. B ran `khala recall --mode semantic --limit 5` against the same central
+   store. No answer-generation call was made in B.
+5. We verified the result in the database: A's session contained two events
+   (one `user`, one `assistant`) and both had remote embeddings before B ran.
+
+### Observed evidence
+
+- Sandbox A's fresh analysis used **600 chat tokens**:
+  - 22 prompt tokens
+  - 578 completion tokens
+  - OpenRouter-reported cost: **$0.0003501**
+- Sandbox B's semantic recall returned **5 hits**.
+- A's stored assistant analysis appeared in the **top 2** results returned to B.
+- B made **no new chat-completion request**. It used the embedding-backed recall
+  path and returned the already-stored response.
+- The two containers were isolated; the shared PostgreSQL + pgvector store was
+  the cross-sandbox communication boundary.
+
+![Observed token economics](docs/semantic-reuse-token-economics.svg)
+
+The exact token count for B's embedding request was not exposed by the Khala
+CLI, so this experiment does **not** claim a precise total-token or dollar
+saving. The defensible result is that B avoided another 600-token chat
+completion in this run; the embedding-query cost must be measured separately
+for a complete cost model.
+
+### What this demonstrates
+
+Khala is more than a session archive:
+
+- **Cross-agent memory:** the response is available outside the process and
+  machine that created it.
+- **Semantic, not exact, matching:** B used different wording and still found
+  A's answer.
+- **Generation avoidance:** the second agent can spend its context budget on
+  new work instead of regenerating an existing explanation.
+- **Vendor-neutral storage:** the shared boundary is canonical `user` and
+  `assistant` events, not a vendor-specific transcript format.
+- **Local-first isolation:** each client keeps local state while Khala provides
+  a shared memory layer when connected.
+
+This is the important scaling property: a useful project explanation, decision,
+incident diagnosis, or implementation rationale can be generated once and
+reused by every connected agent that asks a sufficiently similar question.
+
+### Limitations and honest interpretation
+
+This was a **path and value-proposition experiment**, not a benchmark of answer
+quality or production hit rate.
+
+- Sandbox A did not mount the Khala source tree into the container, so the
+  generated analysis was generic. The experiment validates storage, embedding,
+  cross-container connectivity, and semantic retrieval—not repository-analysis
+  accuracy.
+- One successful pair is proof that the mechanism works, not a claim that every
+  paraphrase will hit. Production quality depends on embedding coverage,
+  prompt boundaries, similarity ranking, freshness, and answer relevance.
+- B's exact embedding token usage was not reported in the observed CLI output.
+- A production evaluation should use real project-aware prompts, multiple
+  paraphrase pairs, a no-memory control group, recall rank/score, relevance
+  judgments, and measured model usage.
+
+### Reproduce the experiment
+
+The minimal harness lives in [`scripts/reuse-sandbox/`](scripts/reuse-sandbox/):
+
+- `Dockerfile` builds the same Khala checkout into each sandbox.
+- `compose.yaml` creates `box-a` and `box-b` on a shared Docker network.
+- `box.py` runs the generation path for A and the semantic-recall path for B.
+
+Create an environment file without committing it:
+
+```dotenv
+KHALA_DSN=postgresql://khala:<password>@khala-postgres:5432/khala
+OPENROUTER_API_KEY=<your-key>
+```
+
+The experiment network must be able to resolve `khala-postgres`; adjust the
+external network name in `compose.yaml` for a different Docker setup. Then run:
+
+```bash
+cd scripts/reuse-sandbox
+docker compose --env-file /path/to/experiment.env build
+docker compose --env-file /path/to/experiment.env run --rm box-a python /app/box.py
+docker compose --env-file /path/to/experiment.env run --rm box-b python /app/box.py
+```
+
+Run A before B. Do not commit the environment file or print the DSN/password.
+
+### Why this matters for Khala
+
+Without a shared memory layer, every isolated agent treats the same question as
+new work. With Khala, completed reasoning becomes a reusable organizational
+asset: searchable across sessions, vendors, containers, and eventually
+machines. Token savings are one benefit; the larger benefit is that decisions,
+analysis, and context stop disappearing when the original agent process ends.
+
 ## Setup
 
 ```bash
