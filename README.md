@@ -172,7 +172,7 @@ For development, install the pinned quality tools and run the same gates as CI:
 ```bash
 uv sync --locked --extra dev --python 3.9
 .venv/bin/ruff check .
-.venv/bin/pyright
+.venv/bin/pyright --pythonpath .venv/bin/python
 .venv/bin/coverage run -m unittest discover -s tests -v
 .venv/bin/coverage report
 .venv/bin/python -m khala eval --baseline
@@ -285,7 +285,8 @@ khala recall "how do I sync agent sessions" --role user       # only user events
   surface. It silently falls back to lexical-only when the embedding API is
   unavailable.
 - Embedding generation runs in the background `remote-worker` (spawned by
-  `khala connect` / `khala hook`), never blocking the CLI.
+  `khala connect`, `khala hook`, `khala sync`, and the `embed`/`outbox` retry
+  commands), never blocking the CLI.
 - Failed remote writes use bounded exponential backoff with jitter. After eight
   attempts they remain as queryable dead letters instead of hot-looping.
   `khala status` reports due, retrying, dead-letter, last-error, and durable
