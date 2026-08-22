@@ -219,6 +219,7 @@ def _fuse_hybrid_results(
         event_id = str(source["id"])
         if event_id in merged:
             merged[event_id].setdefault("semantic_rank", rank)
+            merged[event_id].setdefault("semantic_distance", source.get("semantic_distance"))
         else:
             row = dict(source)
             row["semantic_rank"] = rank

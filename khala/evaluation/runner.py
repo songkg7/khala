@@ -98,6 +98,13 @@ def evaluate_queries(
                         {
                             "id": str(row["id"]),
                             "content": contents[index][:300],
+                            "session_id": row.get("session_id"),
+                            "role": row.get("role"),
+                            "created_at": row.get("created_at"),
+                            "semantic_rank": row.get("semantic_rank"),
+                            "semantic_distance": row.get("semantic_distance"),
+                            "lexical_rank": row.get("lexical_rank"),
+                            "rank": row.get("rank"),
                             "score": judgments[index].score if judgments else None,
                             "reason": judgments[index].reason if judgments else "",
                         }

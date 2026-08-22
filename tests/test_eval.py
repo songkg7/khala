@@ -205,6 +205,53 @@ class EvaluationRunnerTest(unittest.TestCase):
         self.assertEqual(result["reason"], "")
         self.assertNotIn("judge", report)
 
+    def test_collect_preserves_provenance_fields_when_present(self) -> None:
+        row = {
+            "id": "event-1",
+            "session_id": "session-1",
+            "role": "assistant",
+            "created_at": "2026-01-01T00:00:00Z",
+            "content": "answer text",
+            "semantic_rank": 1,
+            "semantic_distance": 0.12,
+            "lexical_rank": 2,
+            "rank": 0.5,
+        }
+        report = evaluate_queries(
+            [EvalCase("needle", ("event-1",))],
+            lambda _query, _limit: [row],
+            collect=True,
+        )
+
+        result = report["rows"][0]["results"][0]
+        self.assertEqual(result["id"], "event-1")
+        self.assertEqual(result["session_id"], "session-1")
+        self.assertEqual(result["role"], "assistant")
+        self.assertEqual(result["created_at"], "2026-01-01T00:00:00Z")
+        self.assertEqual(result["semantic_rank"], 1)
+        self.assertEqual(result["semantic_distance"], 0.12)
+        self.assertEqual(result["lexical_rank"], 2)
+        self.assertEqual(result["rank"], 0.5)
+
+    def test_collect_omits_missing_provenance_as_none(self) -> None:
+        row = {
+            "id": "event-1",
+            "session_id": "session-1",
+            "role": "user",
+            "content": "question",
+        }
+        report = evaluate_queries(
+            [EvalCase("needle", ("event-1",))],
+            lambda _query, _limit: [row],
+            collect=True,
+        )
+
+        result = report["rows"][0]["results"][0]
+        self.assertIsNone(result["semantic_rank"])
+        self.assertIsNone(result["semantic_distance"])
+        self.assertIsNone(result["lexical_rank"])
+        self.assertIsNone(result["rank"])
+
     def test_empty_judged_results_have_zero_judge_metrics(self) -> None:
         report = evaluate_queries(
             [EvalCase("needle", ("gold",))],

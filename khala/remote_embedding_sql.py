@@ -186,6 +186,7 @@ scores AS (
 SELECT event.id, event.session_id, event.role, event.content, event.created_at,
        session.agent, session.user_name, session.user_email,
        COALESCE(recall.count, 0) AS recall_count,
+       score.distance AS semantic_distance,
        0 AS lexical_rank,
        row_number() OVER (
            ORDER BY score.distance, event.id
@@ -200,7 +201,7 @@ ORDER BY score.distance, event.id
 LIMIT %(limit)s
 """
 
-LEGACY_SEMANTIC_SEARCH_SQL = """
+LEGACY_SEMANTIC_SEARCH_SQL = """\
 WITH canonical_embeddings AS (
     SELECT DISTINCT ON (embedding.event_id)
            embedding.event_id, embedding.embedding
@@ -213,6 +214,7 @@ WITH canonical_embeddings AS (
 SELECT event.id, event.session_id, event.role, event.content, event.created_at,
        session.agent, session.user_name, session.user_email,
        COALESCE(recall.count, 0) AS recall_count,
+       canonical.embedding <=> %(vec)s::vector AS semantic_distance,
        0 AS lexical_rank,
        row_number() OVER (
            ORDER BY canonical.embedding <=> %(vec)s::vector, event.id

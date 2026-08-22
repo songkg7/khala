@@ -278,6 +278,86 @@ class RemoteSearchTest(unittest.TestCase):
         self.assertIn("event.role = %(role)s", str(select_call.args[0]))
         self.assertEqual(select_call.args[1]["role"], "assistant")
 
+    def test_chunked_semantic_results_include_semantic_distance(self) -> None:
+        row = {
+            "id": "event-1",
+            "session_id": "session-1",
+            "content": "deploy complete",
+            "semantic_distance": 0.15,
+        }
+        connection, cursor = self._connection([row])
+        cursor.execute.return_value.fetchone.return_value = {
+            "chunk_table_exists": True
+        }
+        store = RemoteStore("postgresql://example/db")
+
+        with (
+            patch("khala.remote.psycopg.connect", return_value=connection),
+            patch("khala.embeddings.embed", return_value=[[0.25, 0.5]]),
+        ):
+            result = store.search_semantic("deploy", limit=3)
+
+        self.assertIn("semantic_distance", result[0])
+        self.assertIsNotNone(result[0]["semantic_distance"])
+
+    def test_legacy_semantic_results_include_semantic_distance(self) -> None:
+        row = {
+            "id": "event-1",
+            "session_id": "session-1",
+            "content": "deploy complete",
+            "semantic_distance": 0.15,
+        }
+        connection, cursor = self._connection([row])
+        cursor.execute.return_value.fetchone.return_value = {
+            "chunk_table_exists": False
+        }
+        store = RemoteStore("postgresql://example/db")
+
+        with (
+            patch("khala.remote.psycopg.connect", return_value=connection),
+            patch("khala.embeddings.embed", return_value=[[0.25, 0.5]]),
+        ):
+            result = store.search_semantic("deploy", limit=3)
+
+        self.assertIn("semantic_distance", result[0])
+        self.assertIsNotNone(result[0]["semantic_distance"])
+
+    def test_hybrid_fusion_preserves_semantic_distance_on_overlap(self) -> None:
+        lexical_rows = [
+            {"id": "shared", "created_at": "2"},
+            {"id": "lexical", "created_at": "1"},
+        ]
+        semantic_rows = [
+            {"id": "shared", "created_at": "2", "semantic_distance": 0.12},
+            {"id": "semantic", "created_at": "3", "semantic_distance": 0.05},
+        ]
+        store = RemoteStore("postgresql://example/db")
+
+        with (
+            patch.object(store, "search_lexical", return_value=lexical_rows),
+            patch.object(store, "search_semantic", return_value=semantic_rows),
+        ):
+            result = store.search_hybrid("deploy", limit=3)
+
+        shared = next(r for r in result if r["id"] == "shared")
+        self.assertIn("semantic_distance", shared)
+        self.assertEqual(shared["semantic_distance"], 0.12)
+        sem_only = next(r for r in result if r["id"] == "semantic")
+        self.assertEqual(sem_only["semantic_distance"], 0.05)
+
+    def test_lexical_only_results_omit_semantic_distance(self) -> None:
+        row = {"id": "event-1", "session_id": "session-1", "content": "hello"}
+        connection, cursor = self._connection([row])
+        store = RemoteStore("postgresql://example/db")
+
+        with (
+            patch("khala.remote.psycopg.connect", return_value=connection),
+            patch.object(store, "_record_recall_usage"),
+        ):
+            result = store.search_lexical("hello", limit=3)
+
+        self.assertNotIn("semantic_distance", result[0])
+
     def test_semantic_search_rejects_invalid_limit_before_api_or_database(self) -> None:
         store = RemoteStore("postgresql://example/db")
 
