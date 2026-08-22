@@ -682,6 +682,119 @@ class RemoteSearchTest(unittest.TestCase):
             "query", 2, user=None, role="assistant"
         )
 
+    def test_consumer_contract_hybrid_assistant_graph_returns_full_provenance(self) -> None:
+        """Verify the documented consumer contract output shape.
+
+        ``khala recall "$PROMPT" --mode hybrid --role assistant --graph --limit 3``
+        must return results with every field a consumer needs to label them as
+        prior team reasoning.
+        """
+        semantic_hit = {
+            "id": "sem-1",
+            "session_id": "sess-1",
+            "role": "assistant",
+            "content": "deploy via helm",
+            "created_at": "2026-01-01T00:00:00Z",
+            "semantic_rank": 1,
+            "semantic_distance": 0.12,
+            "lexical_rank": 0,
+            "rank": 0.0164,
+        }
+        lexical_hit = {
+            "id": "lex-1",
+            "session_id": "sess-2",
+            "role": "assistant",
+            "content": "helm deployment",
+            "created_at": "2026-01-01T00:00:01Z",
+            "semantic_rank": 2,
+            "semantic_distance": 0.34,
+            "lexical_rank": 1,
+            "rank": 0.0158,
+        }
+        lexical_only = {
+            "id": "lex-only",
+            "session_id": "sess-3",
+            "role": "user",
+            "content": "how to deploy",
+            "created_at": "2026-01-01T00:00:02Z",
+            "lexical_rank": 2,
+            "semantic_rank": 0,
+            "rank": 0.0151,
+        }
+        store = RemoteStore("postgresql://example/db")
+
+        with (
+            patch.object(store, "search_semantic", return_value=[semantic_hit]),
+            patch.object(
+                store, "search_lexical", return_value=[lexical_hit, lexical_only]
+            ),
+            patch.object(store, "attach_neighbors", side_effect=lambda hits: [
+                {**h, "adjacent": [{"role": "user", "content": "question"}]}
+                for h in hits
+            ]),
+        ):
+            hybrid = store.search_hybrid("deploy", limit=3, role="assistant")
+            enriched = store.attach_neighbors(hybrid)
+
+        self.assertGreater(len(enriched), 0)
+        for row in enriched:
+            # Provenance fields required by consumer contract
+            for field in (
+                "id", "session_id", "role", "created_at",
+                "semantic_rank", "lexical_rank", "rank",
+            ):
+                self.assertIn(field, row, f"consumer contract: missing {field}")
+            # semantic_distance present only when available from source
+            if row["id"] in ("sem-1", "lex-1"):
+                self.assertIn("semantic_distance", row,
+                    f"consumer contract: semantic hybrid row {row['id']} missing distance")
+                self.assertIsInstance(row["semantic_distance"], float)
+            # Graph adjacency
+            self.assertIn("adjacent", row)
+            if row["adjacent"]:
+                for adj in row["adjacent"]:
+                    self.assertIn("role", adj)
+                    self.assertIn("content", adj)
+
+    def test_consumer_contract_deterministic_lexical_fallback_on_remote_outage(
+        self,
+    ) -> None:
+        """When semantic backend is unavailable, hybrid recall falls back to
+        lexical without hiding the error or mutating the caller's data."""
+        lexical_rows = [
+            {
+                "id": "lex-1",
+                "created_at": "2026-01-01T00:00:00Z",
+                "lexical_rank": 0,
+                "semantic_rank": 0,
+            }
+        ]
+        store = RemoteStore("postgresql://example/db")
+
+        with (
+            patch.object(
+                store, "search_lexical", return_value=lexical_rows
+            ) as lexical,
+            patch.object(
+                store,
+                "search_semantic",
+                side_effect=ValueError("semantic unavailable"),
+            ) as semantic,
+            patch.object(store, "_record_recall_usage") as record_usage,
+        ):
+            result = store.recall_hybrid("deploy", limit=2)
+
+        self.assertEqual(result, lexical_rows)
+        lexical.assert_called_once_with("deploy", limit=4)
+        semantic.assert_called_once_with("deploy", limit=4)
+        record_usage.assert_called_once_with(
+            ["lex-1"],
+            requested_mode="hybrid",
+            effective_mode="lexical",
+            requested_limit=2,
+            user=None,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
