@@ -1,7 +1,7 @@
 # Khala
 
-> What is a Khala?
-> -> You look first [StarCraft II: Legacy of the Void Opening Cinematic](https://www.youtube.com/watch?v=M_XwzBMTJaM)
+> What is Khala?
+> Start with the [StarCraft II: Legacy of the Void opening cinematic](https://www.youtube.com/watch?v=M_XwzBMTJaM).
 
 Local-first shared agent memory. Khala records sessions from agents (Hermes,
 Codex, ...) into a single canonical store and makes them searchable across
