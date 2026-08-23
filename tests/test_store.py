@@ -132,6 +132,34 @@ class KhalaStoreTest(unittest.TestCase):
             ["assistant"],
         )
 
+    def test_recall_deduplicates_exact_content_but_preserves_role_and_replay(self):
+        session = self.store.add_session("test")
+        user_copy = self.store.add_event(session, "user", "duplicate recall needle")
+        user_duplicate = self.store.add_event(session, "user", "duplicate recall needle")
+        assistant_copy = self.store.add_event(
+            session, "assistant", "duplicate recall needle"
+        )
+        assistant_duplicate = self.store.add_event(
+            session, "assistant", "duplicate recall needle"
+        )
+        tool_summary = self.store.add_event(session, "assistant", "[tool_calls: terminal]")
+
+        results = self.store.search("duplicate", limit=10)
+
+        self.assertEqual(
+            {(row["role"], row["content"]) for row in results},
+            {
+                ("user", "duplicate recall needle"),
+                ("assistant", "duplicate recall needle"),
+            },
+        )
+        self.assertEqual(len(results), 2)
+        self.assertIn(tool_summary, [row["id"] for row in self.store.replay(session)])
+        self.assertEqual(self.store.search("terminal", limit=10), [])
+        selected = {row["role"]: row["id"] for row in results}
+        self.assertIn(selected["user"], {user_copy, user_duplicate})
+        self.assertIn(selected["assistant"], {assistant_copy, assistant_duplicate})
+
     def test_invalid_role_filter_fails_before_query(self):
         session = self.store.add_session("test")
         with self.assertRaisesRegex(ValueError, "unsupported role filter"):

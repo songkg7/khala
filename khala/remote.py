@@ -25,6 +25,7 @@ from khala.identifier_graph import (
 )
 from khala.identity import User
 from khala.models import ArchivedSession
+from khala.recall_results import deduplicate_recall_results
 from khala.recall_usage import (
     RecallMode,
     UsageQuery,
@@ -232,7 +233,7 @@ def _fuse_hybrid_results(
         merged.values(),
         key=lambda row: (-row["rank"], row["created_at"], str(row["id"])),
     )
-    return ordered[:limit]
+    return deduplicate_recall_results(ordered, limit)
 
 
 class RemoteStore:
@@ -359,6 +360,14 @@ class RemoteStore:
             """,
             {"orphan_error": _ORPHAN_EMBED_JOB_ERROR},
         )
+        cur.execute(
+            """
+            DELETE FROM embedding_jobs job
+            USING events event
+            WHERE job.event_id = event.id
+              AND event.content LIKE '[tool_calls:%%'
+            """
+        )
 
     def archive_sessions(self, sessions: Sequence[ArchivedSession]) -> None:
         """Converge monotonic local archive tombstones without sending content."""
@@ -436,6 +445,7 @@ class RemoteStore:
                     JOIN sessions session ON session.id = event.session_id
                     WHERE event.id = %(event_id)s
                       AND (to_jsonb(session)->>'archived_at') IS NULL
+                      AND event.content NOT LIKE '[tool_calls:%%'
                     ON CONFLICT (event_id, provider, model, content_hash) DO UPDATE
                     SET attempt_count = 0,
                         next_attempt_at = now(),
@@ -515,6 +525,7 @@ class RemoteStore:
                 JOIN sessions session ON session.id = event.session_id
                 WHERE event.id = %(event_id)s
                   AND (to_jsonb(session)->>'archived_at') IS NULL
+                  AND event.content NOT LIKE '[tool_calls:%%'
                 ON CONFLICT (event_id, provider, model, content_hash) DO NOTHING
                 """,
                 rows,
@@ -552,6 +563,7 @@ class RemoteStore:
                 WHERE j.provider = %(provider)s
                   AND j.model = %(model)s
                   AND (to_jsonb(s)->>'archived_at') IS NULL
+                  AND e.content NOT LIKE '[tool_calls:%%'
                   AND j.dead_lettered_at IS NULL
                   AND j.next_attempt_at <= now()
                 ORDER BY j.next_attempt_at
@@ -819,6 +831,7 @@ class RemoteStore:
                 FROM events e
                 JOIN sessions s ON s.id = e.session_id
                 WHERE e.role IN ('user', 'assistant') AND length(e.content) > 30
+                  AND e.content NOT LIKE '[tool_calls:%%'
                   AND (to_jsonb(s)->>'archived_at') IS NULL
                 ORDER BY e.created_at DESC, e.id
                 LIMIT %(limit)s
@@ -896,23 +909,37 @@ class RemoteStore:
         with self._read_cursor() as cur:
             rows = cur.execute(
                 f"""
-                SELECT e.id, e.session_id, e.role, e.content, e.created_at,
-                       s.agent, s.user_name, s.user_email,
-                       COALESCE(r.count, 0) AS recall_count,
-                       0 AS lexical_rank, 0 AS semantic_rank,
-                       0 AS rank
-                FROM events e
-                JOIN sessions s ON s.id = e.session_id
-                LEFT JOIN recalls r ON r.event_id = e.id
-                WHERE e.content ILIKE %(pattern)s ESCAPE E'\\\\'
-                  {role_clause}
-                  AND (to_jsonb(s)->>'archived_at') IS NULL
-                ORDER BY e.created_at DESC, e.id
+                WITH matches AS (
+                    SELECT e.id, e.session_id, e.role, e.content, e.created_at,
+                           s.agent, s.user_name, s.user_email,
+                           COALESCE(r.count, 0) AS recall_count,
+                           0 AS lexical_rank, 0 AS semantic_rank,
+                           0 AS rank,
+                           row_number() OVER (
+                               PARTITION BY e.role, e.content
+                               ORDER BY e.created_at DESC, e.id
+                           ) AS content_rank
+                    FROM events e
+                    JOIN sessions s ON s.id = e.session_id
+                    LEFT JOIN recalls r ON r.event_id = e.id
+                    WHERE e.content ILIKE %(pattern)s ESCAPE E'\\\\'
+                      {role_clause}
+                      AND (to_jsonb(s)->>'archived_at') IS NULL
+                      AND e.content NOT LIKE '[tool_calls:%%'
+                )
+                SELECT id, session_id, role, content, created_at,
+                       agent, user_name, user_email, recall_count,
+                       lexical_rank, semantic_rank, rank
+                FROM matches
+                WHERE content_rank = 1
+                ORDER BY created_at DESC, id
                 LIMIT %(limit)s
                 """,
                 parameters,
             ).fetchall()
-            return [dict(row) for row in rows]
+            return deduplicate_recall_results(
+                [dict(row) for row in rows], validated_limit
+            )
 
     def recall_lexical(
         self,
@@ -956,7 +983,7 @@ class RemoteStore:
             raise ValueError("semantic recall unavailable: unexpected query vector count")
         vec = _fmt(vectors[0])
         with self._read_cursor() as cur:
-            return search_chunk_semantic(
+            rows = search_chunk_semantic(
                 cur,
                 query_vector=vec,
                 provider=PROVIDER,
@@ -965,6 +992,7 @@ class RemoteStore:
                 limit=validated_limit,
                 role=validated_role,
             )
+        return deduplicate_recall_results(rows, validated_limit)
 
     def recall_semantic(
         self,
@@ -1027,6 +1055,7 @@ class RemoteStore:
             )
         except ValueError:
             rows = lex[:validated_limit]
+            rows = deduplicate_recall_results(rows, validated_limit)
             effective_mode: RecallMode = "lexical"
         else:
             rows = _fuse_hybrid_results(lex, sem, validated_limit)

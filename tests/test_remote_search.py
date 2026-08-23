@@ -252,7 +252,9 @@ class RemoteSearchTest(unittest.TestCase):
         self.assertLess(statement.index("MIN(chunk.embedding"), statement.index("LIMIT"))
         self.assertIn("JOIN sessions session ON session.id = event.session_id", statement)
         self.assertIn("(to_jsonb(session)->>'archived_at') IS NULL", statement)
-        self.assertIn("ORDER BY score.distance, event.id", statement)
+        self.assertIn("PARTITION BY role, content", statement)
+        self.assertIn("event.content NOT LIKE '[tool_calls:%%'", statement)
+        self.assertIn("ORDER BY semantic_distance, id", statement)
         self.assertEqual(select_call.args[1]["limit"], 3)
         self.assertEqual(select_call.args[1]["provider"], PROVIDER)
         self.assertEqual(select_call.args[1]["model"], MODEL)
@@ -344,6 +346,49 @@ class RemoteSearchTest(unittest.TestCase):
         self.assertEqual(shared["semantic_distance"], 0.12)
         sem_only = next(r for r in result if r["id"] == "semantic")
         self.assertEqual(sem_only["semantic_distance"], 0.05)
+
+    def test_hybrid_fusion_deduplicates_same_role_and_content(self) -> None:
+        lexical_rows = [
+            {
+                "id": "other",
+                "role": "user",
+                "content": "other content",
+                "created_at": "1",
+            },
+            {
+                "id": "old-copy",
+                "role": "assistant",
+                "content": "same content",
+                "created_at": "1",
+            },
+        ]
+        semantic_rows = [
+            {
+                "id": "new-copy",
+                "role": "assistant",
+                "content": "same content",
+                "created_at": "2",
+                "semantic_distance": 0.01,
+            },
+            {
+                "id": "semantic-only",
+                "role": "assistant",
+                "content": "semantic only",
+                "created_at": "3",
+                "semantic_distance": 0.02,
+            },
+        ]
+        store = RemoteStore("postgresql://example/db")
+
+        with (
+            patch.object(store, "search_lexical", return_value=lexical_rows),
+            patch.object(store, "search_semantic", return_value=semantic_rows),
+        ):
+            result = store.search_hybrid("deploy", limit=3)
+
+        logical_keys = [(row["role"], row["content"]) for row in result]
+        self.assertEqual(len(logical_keys), len(set(logical_keys)))
+        self.assertIn(("assistant", "same content"), logical_keys)
 
     def test_lexical_only_results_omit_semantic_distance(self) -> None:
         row = {"id": "event-1", "session_id": "session-1", "content": "hello"}

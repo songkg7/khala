@@ -1115,9 +1115,28 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
         query_vector = fixed_vector(1.0)
         sessions = [session_row()]
         events = [
-            event_row("event-1", created_at="2026-01-01T00:00:01+00:00"),
-            event_row("event-2", created_at="2026-01-01T00:00:02+00:00"),
-            event_row("event-3", created_at="2026-01-01T00:00:03+00:00"),
+            event_row(
+                "event-1",
+                content="needle integration memory",
+                created_at="2026-01-01T00:00:01+00:00",
+            ),
+            event_row(
+                "event-2",
+                content="second needle integration memory",
+                created_at="2026-01-01T00:00:02+00:00",
+            ),
+            event_row(
+                "event-3",
+                content="third needle integration memory",
+                created_at="2026-01-01T00:00:03+00:00",
+            ),
+            # Exact duplicate of event-1's content; must collapse into its
+            # group before the result limit is applied.
+            event_row(
+                "event-4",
+                content="needle integration memory",
+                created_at="2025-12-31T00:00:00+00:00",
+            ),
         ]
         self.remote.push_batch(sessions, events, [])
         self._insert_embedding(
@@ -1151,12 +1170,19 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
             created_at="2026-01-03T00:00:00+00:00",
             provider="other-provider",
         )
+        self._insert_embedding(
+            "event-4",
+            content_hash="event-4-current",
+            vector=fixed_vector(1.0, 0.01),
+            created_at="2026-01-01T00:00:00+00:00",
+        )
 
         with patch("khala.embeddings.embed", return_value=[query_vector]):
-            rows = self.remote.search_semantic("semantic query", limit=2)
+            rows = self.remote.search_semantic("semantic query", limit=3)
 
-        self.assertEqual([row["id"] for row in rows], ["event-1", "event-2"])
-        self.assertEqual([int(row["semantic_rank"]) for row in rows], [1, 2])
+        self.assertEqual([row["id"] for row in rows], ["event-1", "event-2", "event-3"])
+        self.assertEqual([int(row["semantic_rank"]) for row in rows], [1, 2, 3])
+        self.assertNotIn("event-4", [row["id"] for row in rows])
 
     def test_chunk_completion_dual_writes_and_empty_jobs_ack_atomically(self) -> None:
         event_id = "chunked-event"

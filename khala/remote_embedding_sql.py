@@ -182,22 +182,42 @@ scores AS (
     SELECT event_id, distance FROM chunk_scores
     UNION ALL
     SELECT event_id, distance FROM legacy_scores
+),
+scored_events AS (
+    SELECT event.id, event.session_id, event.role, event.content, event.created_at,
+           session.agent, session.user_name, session.user_email,
+           COALESCE(recall.count, 0) AS recall_count,
+           score.distance AS semantic_distance,
+           0 AS lexical_rank,
+           0 AS rank
+    FROM scores score
+    JOIN events event ON event.id = score.event_id
+    JOIN sessions session ON session.id = event.session_id
+    LEFT JOIN recalls recall ON recall.event_id = event.id
+    WHERE (to_jsonb(session)->>'archived_at') IS NULL
+      AND event.content NOT LIKE '[tool_calls:%%'
+),
+deduplicated_events AS (
+    SELECT scored_events.*,
+           row_number() OVER (
+               PARTITION BY role, content
+               ORDER BY semantic_distance, created_at DESC, id
+           ) AS content_rank
+    FROM scored_events
+),
+ranked_events AS (
+    SELECT deduplicated_events.*,
+           row_number() OVER (
+               ORDER BY semantic_distance, id
+           ) AS semantic_rank
+    FROM deduplicated_events
+    WHERE content_rank = 1
 )
-SELECT event.id, event.session_id, event.role, event.content, event.created_at,
-       session.agent, session.user_name, session.user_email,
-       COALESCE(recall.count, 0) AS recall_count,
-       score.distance AS semantic_distance,
-       0 AS lexical_rank,
-       row_number() OVER (
-           ORDER BY score.distance, event.id
-       ) AS semantic_rank,
-       0 AS rank
-FROM scores score
-JOIN events event ON event.id = score.event_id
-JOIN sessions session ON session.id = event.session_id
-LEFT JOIN recalls recall ON recall.event_id = event.id
-WHERE (to_jsonb(session)->>'archived_at') IS NULL
-ORDER BY score.distance, event.id
+SELECT id, session_id, role, content, created_at,
+       agent, user_name, user_email, recall_count,
+       semantic_distance, lexical_rank, semantic_rank, rank
+FROM ranked_events
+ORDER BY semantic_distance, id
 LIMIT %(limit)s
 """
 
@@ -210,22 +230,42 @@ WITH canonical_embeddings AS (
       AND embedding.model = %(model)s
     ORDER BY embedding.event_id, embedding.created_at DESC,
              embedding.content_hash DESC
+),
+scored_events AS (
+    SELECT event.id, event.session_id, event.role, event.content, event.created_at,
+           session.agent, session.user_name, session.user_email,
+           COALESCE(recall.count, 0) AS recall_count,
+           canonical.embedding <=> %(vec)s::vector AS semantic_distance,
+           0 AS lexical_rank,
+           0 AS rank
+    FROM canonical_embeddings canonical
+    JOIN events event ON event.id = canonical.event_id
+    JOIN sessions session ON session.id = event.session_id
+    LEFT JOIN recalls recall ON recall.event_id = event.id
+    WHERE (to_jsonb(session)->>'archived_at') IS NULL
+      AND event.content NOT LIKE '[tool_calls:%%'
+),
+deduplicated_events AS (
+    SELECT scored_events.*,
+           row_number() OVER (
+               PARTITION BY role, content
+               ORDER BY semantic_distance, created_at DESC, id
+           ) AS content_rank
+    FROM scored_events
+),
+ranked_events AS (
+    SELECT deduplicated_events.*,
+           row_number() OVER (
+               ORDER BY semantic_distance, id
+           ) AS semantic_rank
+    FROM deduplicated_events
+    WHERE content_rank = 1
 )
-SELECT event.id, event.session_id, event.role, event.content, event.created_at,
-       session.agent, session.user_name, session.user_email,
-       COALESCE(recall.count, 0) AS recall_count,
-       canonical.embedding <=> %(vec)s::vector AS semantic_distance,
-       0 AS lexical_rank,
-       row_number() OVER (
-           ORDER BY canonical.embedding <=> %(vec)s::vector, event.id
-       ) AS semantic_rank,
-       0 AS rank
-FROM canonical_embeddings canonical
-JOIN events event ON event.id = canonical.event_id
-JOIN sessions session ON session.id = event.session_id
-LEFT JOIN recalls recall ON recall.event_id = event.id
-WHERE (to_jsonb(session)->>'archived_at') IS NULL
-ORDER BY canonical.embedding <=> %(vec)s::vector, event.id
+SELECT id, session_id, role, content, created_at,
+       agent, user_name, user_email, recall_count,
+       semantic_distance, lexical_rank, semantic_rank, rank
+FROM ranked_events
+ORDER BY semantic_distance, id
 LIMIT %(limit)s
 """
 
@@ -259,6 +299,7 @@ JOIN sessions session ON session.id = event.session_id
 WHERE event.role IN ('user', 'assistant')
   AND length(event.content) > 30
   AND (to_jsonb(session)->>'archived_at') IS NULL
+  AND event.content NOT LIKE '[tool_calls:%%'
 ORDER BY event.created_at DESC, event.id
 LIMIT %(limit)s
 """
@@ -279,6 +320,7 @@ JOIN sessions session ON session.id = event.session_id
 WHERE event.role IN ('user', 'assistant')
   AND length(event.content) > 30
   AND (to_jsonb(session)->>'archived_at') IS NULL
+  AND event.content NOT LIKE '[tool_calls:%%'
 ORDER BY event.created_at DESC, event.id
 LIMIT %(limit)s
 """
@@ -290,6 +332,7 @@ FROM embedded_event_ids embedded
 JOIN events event ON event.id = embedded.event_id
 JOIN sessions session ON session.id = event.session_id
 WHERE (to_jsonb(session)->>'archived_at') IS NULL
+  AND event.content NOT LIKE '[tool_calls:%%'
 """
 
 LEGACY_STATUS_SQL = """
@@ -300,6 +343,7 @@ JOIN sessions session ON session.id = event.session_id
 WHERE embedding.provider = %(provider)s
   AND embedding.model = %(model)s
   AND (to_jsonb(session)->>'archived_at') IS NULL
+  AND event.content NOT LIKE '[tool_calls:%%'
 """
 
 ENQUEUE_MISSING_SQL = """
@@ -323,6 +367,7 @@ JOIN sessions session ON session.id = event.session_id
 WHERE event.role IN ('user', 'assistant')
   AND octet_length(event.content) > 0
   AND (to_jsonb(session)->>'archived_at') IS NULL
+  AND event.content NOT LIKE '[tool_calls:%%'
   AND NOT EXISTS (
       SELECT 1 FROM complete_generations complete
       WHERE complete.event_id = event.id
