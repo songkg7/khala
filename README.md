@@ -161,7 +161,7 @@ analysis, and context stop disappearing when the original agent process ends.
 ```bash
 uv sync                          # install into .venv
 uv tool install . --force        # install `khala` on PATH globally
-khala install codex              # install the user-level Codex Stop hook
+khala install codex --workspace .  # enable this repo + install recall/remember hooks
 khala install hermes             # install Hermes per-turn hooks
 ```
 
@@ -229,7 +229,7 @@ khala replay <sid> [--role user|assistant]  # dump a session's events
 khala ingest --agent <a> [--adapter M:C]   # bulk import (stdin JSONL by default)
 khala sync [--adapter hermes|codex] [--session-id X] [--name/--email]
 khala hook <adapter>             # vendor hook entrypoint (reads stdin JSON)
-khala install codex              # merge the per-turn hook into Codex user config
+khala install codex [--workspace PATH]  # enable workspace + install recall/remember hooks
 khala install hermes             # merge per-turn hooks into Hermes config
 khala workspace add|remove|list  # manage auto-sync workspaces
 khala connect <postgres dsn>     # Khalai: connect to a shared store (pgvector)
@@ -389,40 +389,57 @@ network or output workload, judging is capped at 1,000 possible results,
 `--read` at 10,000 results, and remote semantic/hybrid evaluation at 1,000
 queries per run.
 
-## Codex hook (auto record every turn)
+## Codex hooks (recall and auto-record every turn)
 
-Codex can call Khala's user-level `Stop` hook after every completed turn. The
-hook resolves Codex's bare session UUID through its validated transcript path,
-then incrementally stores complete prompt and response events. Repeated hooks
-are idempotent, and an incomplete final JSONL record is left for the next turn.
+Khala installs two user-level Codex hooks for enabled workspaces:
+
+- `UserPromptSubmit` recalls relevant assistant memory before each model call
+  and supplies it as bounded, explicitly untrusted developer context.
+- `Stop` incrementally stores the completed prompt and response after each turn.
+
+The `Stop` hook resolves Codex's bare session UUID through its validated
+transcript path. Repeated hooks are idempotent, and an incomplete final JSONL
+record is left for the next turn.
 
 ### 1. Install and enable one checkout
 
 ```bash
 uv tool install . --force
-khala workspace add /path/to/any/worktree
-khala install codex
+khala install codex --workspace /path/to/any/worktree
 ```
 
-One workspace registration enables every worktree that shares the same Git
-common directory. Re-running `workspace add` is safe and upgrades legacy
-path-only registrations with durable repository identity metadata.
+`--workspace` defaults to the current directory, so `khala install codex` is
+also sufficient when run from the intended repository. One registration
+enables every worktree that shares the same Git common directory. Re-running
+the installer is safe and refreshes legacy path-only repository metadata.
 
-`khala install codex` merges one Khala handler at the end of
-`$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`). It preserves existing
-hooks and is idempotent.
+The installer merges one Khala handler into both `UserPromptSubmit` and `Stop`
+in `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`). It preserves
+existing hooks and is idempotent.
 
-### 2. Restart and trust the hook
+### 2. Restart and trust the hooks
 
 Restart Codex so it reloads the user hook file. In the interactive client, run
-`/hooks`, review the exact Khala command, and trust it. Codex stores trust for
-the exact hook definition, so repeat this review after the installed executable
-path or handler changes.
+`/hooks`, review both exact Khala commands, and trust them. Codex stores trust
+for each exact hook definition, so repeat this review after the installed
+executable path or handler changes.
 
-The installed command uses a Codex-specific fail-open boundary: even if Khala's
-database or synchronization fails, the hook exits successfully and writes only
-a neutral JSON object to stdout. Diagnostics go to stderr, so a memory outage
-cannot accidentally ask Codex to continue the agent turn.
+While they run, Codex displays `Khala: recalling relevant memory` before the
+model call and `Khala: remembering this turn` after the turn. A recall with no
+eligible results returns neutral output and adds no model context.
+
+Both commands use a Codex-specific fail-open boundary: database, recall, and
+synchronization failures exit successfully with neutral JSON. Diagnostics go
+to stderr, so a memory outage cannot block a prompt or accidentally ask Codex
+to continue the agent turn. Recalled fields are allowlisted, redacted again,
+limited to three assistant hits plus adjacent context, and capped at 12,000
+characters. Historical text is labeled as untrusted reference data rather than
+instructions.
+
+In Khalai mode, automatic recall uses hybrid search. The redacted prompt is
+therefore sent to the configured embedding provider (OpenRouter by default)
+when semantic search is available; otherwise hybrid recall falls back to local
+lexical matching.
 
 ## Hermes hook (auto record every turn)
 

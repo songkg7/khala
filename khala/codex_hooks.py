@@ -5,15 +5,44 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from khala.secure_files import atomic_write_private_text
 
-KHALA_HOOK_STATUS_MESSAGE = "Khala: syncing turn memory"
+KHALA_RECALL_STATUS_MESSAGE = "Khala: recalling relevant memory"
+KHALA_REMEMBER_STATUS_MESSAGE = "Khala: remembering this turn"
+# Backward-compatible import name. Ownership no longer depends on display text.
+KHALA_HOOK_STATUS_MESSAGE = KHALA_REMEMBER_STATUS_MESSAGE
+LEGACY_KHALA_HOOK_STATUS_MESSAGE = "Khala: syncing turn memory"
 HOOK_TIMEOUT_SECONDS = 30
+RECALL_ADDITIONAL_CONTEXT_LIMIT = 4000
+
+
+@dataclass(frozen=True)
+class CodexHookSpec:
+    event: str
+    flag: str
+    status_message: str
+    additional_context_limit: int | None = None
+
+
+CODEX_HOOK_SPECS = (
+    CodexHookSpec(
+        event="UserPromptSubmit",
+        flag="--codex-recall",
+        status_message=KHALA_RECALL_STATUS_MESSAGE,
+        additional_context_limit=RECALL_ADDITIONAL_CONTEXT_LIMIT,
+    ),
+    CodexHookSpec(
+        event="Stop",
+        flag="--codex-stop",
+        status_message=KHALA_REMEMBER_STATUS_MESSAGE,
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -26,6 +55,8 @@ class CodexHookInstallResult:
             "integration": "codex",
             "status": "installed" if self.changed else "already_installed",
             "hooks_file": str(self.path),
+            "events": [spec.event for spec in CODEX_HOOK_SPECS],
+            "recall_enabled": True,
             # Installation cannot observe whether every running Codex client
             # reloaded this file or whether the exact handler hash was trusted.
             "restart_required": True,
@@ -42,13 +73,21 @@ def codex_home(environ: Mapping[str, str] | None = None) -> Path:
 
 
 def resolve_khala_executable() -> Path:
+    invoked = Path(sys.argv[0]).expanduser()
+    invoked_names = {
+        invoked.name.lower(),
+        PureWindowsPath(sys.argv[0]).name.lower(),
+    }
+    if invoked_names & {"khala", "khala.exe"} and invoked.is_file():
+        return _validated_executable(invoked)
+
     executable = shutil.which("khala")
     if not executable:
         raise OSError("khala executable is not on PATH")
     return _validated_executable(Path(executable))
 
 
-def install_codex_stop_hook(
+def install_codex_hooks(
     executable: Path | None = None,
     *,
     home: Path | None = None,
@@ -60,13 +99,28 @@ def install_codex_stop_hook(
     )
     hooks_path = (codex_home() if home is None else home.expanduser().absolute()) / "hooks.json"
     document = _load_hooks_document(hooks_path)
-    changed = _merge_stop_hook(document, _handler(hook_executable))
+    changed = False
+    for spec in CODEX_HOOK_SPECS:
+        changed = _merge_event_hook(
+            document,
+            spec,
+            _handler(hook_executable, spec),
+        ) or changed
     if changed:
         atomic_write_private_text(
             hooks_path,
             json.dumps(document, indent=2, ensure_ascii=False) + "\n",
         )
     return CodexHookInstallResult(path=hooks_path, changed=changed)
+
+
+def install_codex_stop_hook(
+    executable: Path | None = None,
+    *,
+    home: Path | None = None,
+) -> CodexHookInstallResult:
+    """Compatibility wrapper; Codex installation now includes recall and sync."""
+    return install_codex_hooks(executable, home=home)
 
 
 def _validated_executable(executable: Path) -> Path:
@@ -78,15 +132,18 @@ def _validated_executable(executable: Path) -> Path:
     return candidate
 
 
-def _handler(executable: Path) -> dict[str, Any]:
-    arguments = [str(executable), "hook", "codex", "--codex-stop"]
-    return {
+def _handler(executable: Path, spec: CodexHookSpec) -> dict[str, Any]:
+    arguments = [str(executable), "hook", "codex", spec.flag]
+    handler: dict[str, Any] = {
         "type": "command",
         "command": " ".join(shlex.quote(argument) for argument in arguments),
         "commandWindows": subprocess.list2cmdline(arguments),
         "timeout": HOOK_TIMEOUT_SECONDS,
-        "statusMessage": KHALA_HOOK_STATUS_MESSAGE,
+        "statusMessage": spec.status_message,
     }
+    if spec.additional_context_limit is not None:
+        handler["additionalContextLimit"] = spec.additional_context_limit
+    return handler
 
 
 def _load_hooks_document(path: Path) -> dict[str, Any]:
@@ -102,29 +159,37 @@ def _load_hooks_document(path: Path) -> dict[str, Any]:
     return value
 
 
-def _merge_stop_hook(document: dict[str, Any], handler: dict[str, Any]) -> bool:
+def _merge_event_hook(
+    document: dict[str, Any],
+    spec: CodexHookSpec,
+    handler: dict[str, Any],
+) -> bool:
     hooks = document.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         raise ValueError("Codex hooks field must be a JSON object")
-    stop_groups = hooks.setdefault("Stop", [])
-    if not isinstance(stop_groups, list):
-        raise ValueError("Codex Stop hooks field must be a JSON array")
+    event_groups = hooks.setdefault(spec.event, [])
+    if not isinstance(event_groups, list):
+        raise ValueError(f"Codex {spec.event} hooks field must be a JSON array")
 
     matches: list[tuple[list[Any], int]] = []
-    for group in stop_groups:
+    for group in event_groups:
         if not isinstance(group, dict):
-            raise ValueError("each Codex Stop hook group must be a JSON object")
+            raise ValueError(
+                f"each Codex {spec.event} hook group must be a JSON object"
+            )
         handlers = group.get("hooks")
         if not isinstance(handlers, list):
-            raise ValueError("each Codex Stop hook group must contain a hooks array")
+            raise ValueError(
+                f"each Codex {spec.event} hook group must contain a hooks array"
+            )
         for index, existing in enumerate(handlers):
-            if _is_khala_handler(existing):
+            if _is_khala_handler(existing, spec):
                 matches.append((handlers, index))
 
     if len(matches) == 1 and matches[0][0][matches[0][1]] == handler:
         return False
     if not matches:
-        stop_groups.append({"hooks": [handler]})
+        event_groups.append({"hooks": [handler]})
         return True
 
     first_handlers, first_index = matches[0]
@@ -138,9 +203,38 @@ def _merge_stop_hook(document: dict[str, Any], handler: dict[str, Any]) -> bool:
     return True
 
 
-def _is_khala_handler(value: Any) -> bool:
+def _is_khala_handler(value: Any, spec: CodexHookSpec) -> bool:
+    if not isinstance(value, dict) or value.get("type") != "command":
+        return False
+
+    tokens = _command_tokens(value)
+    if not tokens or not _is_khala_executable(tokens[0]):
+        return False
+    if tokens[-3:] == ["hook", "codex", spec.flag]:
+        return True
+
+    # Migrate the original unflagged Stop command in place. The status is only
+    # consulted for this legacy shape; current ownership is the stable command.
     return (
-        isinstance(value, dict)
-        and value.get("type") == "command"
-        and value.get("statusMessage") == KHALA_HOOK_STATUS_MESSAGE
+        spec.event == "Stop"
+        and tokens[-2:] == ["hook", "codex"]
+        and value.get("statusMessage")
+        in {KHALA_REMEMBER_STATUS_MESSAGE, LEGACY_KHALA_HOOK_STATUS_MESSAGE}
     )
+
+
+def _command_tokens(value: Mapping[str, Any]) -> list[str]:
+    for field, posix in (("command", True), ("commandWindows", False)):
+        command = value.get(field)
+        if not isinstance(command, str) or not command.strip():
+            continue
+        try:
+            return [token.strip('"\'') for token in shlex.split(command, posix=posix)]
+        except ValueError:
+            continue
+    return []
+
+
+def _is_khala_executable(token: str) -> bool:
+    names = {Path(token).name.lower(), PureWindowsPath(token).name.lower()}
+    return bool(names & {"khala", "khala.exe"})

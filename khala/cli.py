@@ -14,7 +14,6 @@ from khala.adapter import ingest_events
 from khala.errors import public_error_message
 from khala.identifier_graph import IdentifierGraphQuery
 from khala.identity import resolve_user
-from khala.redact import redact
 from khala.roles import ROLE_FILTER_CHOICES
 from khala.store import Store
 
@@ -175,14 +174,28 @@ def parser() -> argparse.ArgumentParser:
         default=None,
         help="Workspace whose sessions to sync (default: payload cwd if enabled)",
     )
-    hook.add_argument(
+    codex_hook_mode = hook.add_mutually_exclusive_group()
+    codex_hook_mode.add_argument(
         "--codex-stop",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    codex_hook_mode.add_argument(
+        "--codex-recall",
         action="store_true",
         help=argparse.SUPPRESS,
     )
     install = commands.add_parser("install", help="Install agent integrations")
     install_targets = install.add_subparsers(dest="install_target", required=True)
-    install_targets.add_parser("codex", help="Install per-turn Codex synchronization")
+    install_codex = install_targets.add_parser(
+        "codex", help="Install per-turn Codex recall and synchronization"
+    )
+    install_codex.add_argument(
+        "--workspace",
+        type=Path,
+        default=Path.cwd(),
+        help="Workspace to enable (default: current directory)",
+    )
     install_targets.add_parser("hermes", help="Install per-turn Hermes synchronization")
     ws = commands.add_parser("workspace", help="Manage khala-enabled workspaces")
     ws_sub = ws.add_subparsers(dest="ws_action", required=True)
@@ -239,40 +252,23 @@ def _open_store(database_path: Path) -> Store:
     return Store(database_path)
 
 
-def _run_codex_stop_hook(args: argparse.Namespace, database_path: Path) -> int:
-    """Run a best-effort Codex Stop hook without affecting the agent turn.
+def _run_codex_hook(args: argparse.Namespace, database_path: Path) -> int:
+    """Run a Codex-specific hook without allowing memory failures to block Codex."""
+    from khala.codex_hook_runtime import (
+        run_codex_recall_hook,
+        run_codex_stop_hook,
+    )
 
-    Codex treats exit code 2 from a Stop hook as a request to continue the
-    agent. Khala synchronization must never accidentally trigger that control
-    flow, so every ordinary initialization, payload, database, and sync failure
-    is reported on stderr while stdout remains one neutral JSON object.
-    """
-    store: Store | None = None
-    try:
-        from khala.hooks import read_hook_payload, sync_hook
-
-        store = _open_store(database_path)
-        payload = read_hook_payload(sys.stdin)
-        sync_hook(
-            store,
-            adapter_name="codex",
-            payload=payload,
-            database_path=database_path,
-            workspace_override=args.workspace,
-        )
-    except Exception as error:
-        message = redact(public_error_message(error))
-        print(f"khala: Codex Stop sync failed: {message}", file=sys.stderr)
-    finally:
-        if store is not None:
-            try:
-                store.close()
-            except Exception as error:
-                print(
-                    f"khala: Codex Stop store close failed: {redact(str(error))}",
-                    file=sys.stderr,
-                )
-        output({})
+    runner = run_codex_recall_hook if args.codex_recall else run_codex_stop_hook
+    result = runner(
+        sys.stdin,
+        database_path=database_path,
+        store_factory=_open_store,
+        workspace_override=args.workspace,
+    )
+    for diagnostic in result.diagnostics:
+        print(diagnostic, file=sys.stderr)
+    output(result.output)
     return 0
 
 
@@ -327,25 +323,35 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "install":
         try:
             if args.install_target == "codex":
-                from khala.codex_hooks import install_codex_stop_hook
+                from khala.codex_hooks import install_codex_hooks
+                from khala.workspace_registry import add_workspace
 
-                result = install_codex_stop_hook()
+                workspace_path = args.workspace.expanduser().resolve()
+                if not workspace_path.is_dir():
+                    raise ValueError(
+                        f"workspace is not a directory: {workspace_path}"
+                    )
+                result = install_codex_hooks()
+                registration = add_workspace(workspace_path)
+                report = result.public_report()
+                report["workspace"] = str(registration.workspace)
             elif args.install_target == "hermes":
                 from khala.hermes_hooks import install_hermes_hooks
 
                 result = install_hermes_hooks()
+                report = result.public_report()
             else:
                 raise ValueError(f"unsupported install target: {args.install_target}")
-            output(result.public_report())
+            output(report)
             return 0
         except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as error:
             print(f"khala: {error}", file=sys.stderr)
             return 2
-    if args.command == "hook" and args.codex_stop:
+    if args.command == "hook" and (args.codex_stop or args.codex_recall):
         if args.adapter != "codex":
-            print("khala: --codex-stop requires the codex adapter", file=sys.stderr)
+            print("khala: Codex hook flags require the codex adapter", file=sys.stderr)
             return 2
-        return _run_codex_stop_hook(args, database_path)
+        return _run_codex_hook(args, database_path)
     store = _open_store(database_path)
     try:
         if args.command == "status":
@@ -483,22 +489,22 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         elif args.command == "workspace":
-            from khala.config import load_config, save_config
+            from khala.config import load_config
+            from khala.workspace_registry import add_workspace, remove_workspace
 
             config_data = load_config()
             if args.ws_action == "add":
-                path_str = str(args.path.resolve())
-                if path_str not in config_data["workspaces"]:
-                    config_data["workspaces"].append(path_str)
-                # Save even when the path was already registered so legacy
-                # path-only configs gain repository/worktree identity metadata.
-                save_config(config_data)
-                output({"ok": True, "workspace": path_str, "workspaces": config_data["workspaces"]})
+                registration = add_workspace(args.path)
+                output(
+                    {
+                        "ok": True,
+                        "workspace": str(registration.workspace),
+                        "workspaces": list(registration.workspaces),
+                    }
+                )
             elif args.ws_action == "remove":
-                path_str = str(args.path.resolve())
-                config_data["workspaces"] = [w for w in config_data["workspaces"] if w != path_str]
-                save_config(config_data)
-                output({"ok": True, "workspaces": config_data["workspaces"]})
+                registration = remove_workspace(args.path)
+                output({"ok": True, "workspaces": list(registration.workspaces)})
             elif args.ws_action == "list":
                 output({"workspaces": config_data["workspaces"]})
         elif args.command == "compat-check":

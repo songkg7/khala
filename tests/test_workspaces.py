@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from khala import config
+from khala.workspace_registry import add_workspace, remove_workspace
 from khala.workspaces import (
     WORKSPACE_GIT_COMMON_DIRS_KEY,
     is_enabled_workspace,
@@ -272,6 +273,71 @@ class WorkspaceTrackingTest(unittest.TestCase):
 
         self.assertIsNone(resolve_git_common_dir(loop))
         self.assertFalse(is_enabled_workspace(loop, [str(self.root / "unrelated")]))
+
+
+class WorkspaceRegistryTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        self.config_directory_patcher = patch.object(
+            config, "CONFIG_DIR", self.root / "config"
+        )
+        self.config_file_patcher = patch.object(
+            config, "CONFIG_FILE", self.root / "config" / "config.json"
+        )
+        self.config_directory_patcher.start()
+        self.config_file_patcher.start()
+
+    def tearDown(self) -> None:
+        self.config_file_patcher.stop()
+        self.config_directory_patcher.stop()
+        self.temporary_directory.cleanup()
+
+    def test_add_is_idempotent_and_remove_accepts_a_deleted_checkout(self) -> None:
+        first = self.root / "first"
+        second = self.root / "second"
+        first.mkdir()
+        second.mkdir()
+
+        add_workspace(first)
+        repeated = add_workspace(first)
+        added = add_workspace(second)
+        shutil.rmtree(first)
+        removed = remove_workspace(first)
+
+        self.assertEqual(repeated.workspaces, (str(first.resolve()),))
+        self.assertEqual(
+            added.workspaces,
+            (str(first.resolve()), str(second.resolve())),
+        )
+        self.assertEqual(removed.workspaces, (str(second.resolve()),))
+        self.assertEqual(config.load_config()["workspaces"], [str(second.resolve())])
+
+    def test_add_rejects_missing_or_unresolvable_workspace(self) -> None:
+        missing = self.root / "missing"
+        with self.assertRaisesRegex(ValueError, "not a directory"):
+            add_workspace(missing)
+
+        with (
+            patch("khala.workspace_registry.resolve_workspace_path", return_value=None),
+            self.assertRaisesRegex(ValueError, "cannot be resolved"),
+        ):
+            add_workspace(self.root)
+
+    def test_invalid_persisted_workspace_collection_is_replaced(self) -> None:
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        with (
+            patch("khala.config.load_config", return_value={"workspaces": "invalid"}),
+            patch("khala.config.save_config") as save_config,
+        ):
+            registration = add_workspace(workspace)
+
+        self.assertEqual(registration.workspaces, (str(workspace.resolve()),))
+        self.assertEqual(
+            save_config.call_args.args[0]["workspaces"],
+            [str(workspace.resolve())],
+        )
 
 
 if __name__ == "__main__":
