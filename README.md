@@ -162,6 +162,7 @@ analysis, and context stop disappearing when the original agent process ends.
 uv sync                          # install into .venv
 uv tool install . --force        # install `khala` on PATH globally
 khala install codex              # install the user-level Codex Stop hook
+khala install hermes             # install Hermes per-turn hooks
 ```
 
 Run the test suite:
@@ -229,6 +230,7 @@ khala ingest --agent <a> [--adapter M:C]   # bulk import (stdin JSONL by default
 khala sync [--adapter hermes|codex] [--session-id X] [--name/--email]
 khala hook <adapter>             # vendor hook entrypoint (reads stdin JSON)
 khala install codex              # merge the per-turn hook into Codex user config
+khala install hermes             # merge per-turn hooks into Hermes config
 khala workspace add|remove|list  # manage auto-sync workspaces
 khala connect <postgres dsn>     # Khalai: connect to a shared store (pgvector)
 khala disconnect                 # back to Nerazim (local-only)
@@ -436,40 +438,22 @@ uv tool install . --force
 khala workspace add /path/to/any/worktree
 ```
 
-### 2. Register the hooks in `~/.hermes/config.yaml`
+### 2. Install the Hermes hooks
 
-Append a `hooks:` block (Hermes shell hooks):
-
-```yaml
-hooks:
-  post_llm_call:
-    - command: "khala hook hermes"
-      timeout: 30
-  on_session_end:
-    - command: "khala hook hermes"
-      timeout: 30
-  on_session_reset:
-    - command: "khala hook hermes"
-      timeout: 30
+```bash
+khala install hermes
 ```
 
-`hermes config set` cannot build the list-of-map shape Hermes requires, so
-edit the file directly (`hermes config edit`).
+The installer uses Hermes's own JSON config commands to merge the three hook
+events without replacing unrelated hooks. It records the absolute Khala
+executable path and is safe to run again after upgrading or relocating Khala.
 
-### 3. Allowlist the hook commands
+### 3. Restart and trust the hooks
 
-Shell hooks need first-use consent. Non-TTY runs (cron, gateway) need a
-pre-populated allowlist. Create `~/.hermes/shell-hooks-allowlist.json`:
-
-```json
-{
-  "approvals": [
-    { "event": "post_llm_call",  "command": "khala hook hermes" },
-    { "event": "on_session_end", "command": "khala hook hermes" },
-    { "event": "on_session_reset", "command": "khala hook hermes" }
-  ]
-}
-```
+Restart Hermes, review the first-use consent prompt, and approve the three
+Khala commands. For a headless gateway, run `hermes --accept-hooks` once from
+an interactive terminal before starting the gateway. The installer deliberately
+does not bypass Hermes's security allowlist.
 
 ### 4. Verify
 
@@ -479,9 +463,9 @@ hermes hooks test post_llm_call --payload-file payload.json
 # expect: exit=0, stdout {"status":"synced", ...}
 ```
 
-Note: `hermes hooks doctor` reports "script missing" because `khala` is a PATH
-command, not a script file — this is a false positive; the hooks function
-correctly (see `hermes hooks test`).
+Then complete one real TUI turn inside an enabled workspace and confirm the new
+Hermes session appears in Khala. `hooks list` and `hooks test` alone do not prove
+that the live TUI process fired the callback.
 
 ## Adding a vendor adapter
 

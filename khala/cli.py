@@ -183,6 +183,7 @@ def parser() -> argparse.ArgumentParser:
     install = commands.add_parser("install", help="Install agent integrations")
     install_targets = install.add_subparsers(dest="install_target", required=True)
     install_targets.add_parser("codex", help="Install per-turn Codex synchronization")
+    install_targets.add_parser("hermes", help="Install per-turn Hermes synchronization")
     ws = commands.add_parser("workspace", help="Manage khala-enabled workspaces")
     ws_sub = ws.add_subparsers(dest="ws_action", required=True)
     ws_add = ws_sub.add_parser("add", help="Enable a workspace for auto-sync")
@@ -325,13 +326,19 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     if args.command == "install":
         try:
-            if args.install_target != "codex":
-                raise ValueError(f"unsupported install target: {args.install_target}")
-            from khala.codex_hooks import install_codex_stop_hook
+            if args.install_target == "codex":
+                from khala.codex_hooks import install_codex_stop_hook
 
-            output(install_codex_stop_hook().public_report())
+                result = install_codex_stop_hook()
+            elif args.install_target == "hermes":
+                from khala.hermes_hooks import install_hermes_hooks
+
+                result = install_hermes_hooks()
+            else:
+                raise ValueError(f"unsupported install target: {args.install_target}")
+            output(result.public_report())
             return 0
-        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as error:
             print(f"khala: {error}", file=sys.stderr)
             return 2
     if args.command == "hook" and args.codex_stop:
