@@ -435,7 +435,8 @@ class RemoteChunkReadTest(unittest.TestCase):
         self.assertIn("NOT EXISTS", statement)
         self.assertIn("UNION ALL", statement)
         self.assertIn("row_number() OVER", statement)
-        self.assertIn("ORDER BY score.distance, event.id", statement)
+        self.assertIn("PARTITION BY role, content", statement)
+        self.assertIn("ORDER BY semantic_distance, id", statement)
         self.assertIn("(to_jsonb(session)->>'archived_at') IS NULL", statement)
         self.assertLess(statement.index("MIN(chunk.embedding"), statement.rindex("LIMIT %(limit)s"))
 
@@ -455,7 +456,9 @@ class RemoteChunkReadTest(unittest.TestCase):
         self.assertIn("canonical_embeddings AS", statement)
         self.assertIn("DISTINCT ON (embedding.event_id)", statement)
         self.assertNotIn("event_embedding_chunks", statement)
-        self.assertIn("ORDER BY canonical.embedding <=> %(vec)s::vector, event.id", statement)
+        self.assertIn("),\nscored_events AS", statement)
+        self.assertIn("PARTITION BY role, content", statement)
+        self.assertIn("ORDER BY semantic_distance, id", statement)
         self.assertIn("(to_jsonb(session)->>'archived_at') IS NULL", statement)
 
     def test_semantic_sampling_is_distinct_by_event_with_legacy_fallback(self) -> None:
@@ -592,6 +595,7 @@ class RemoteChunkEnqueueTest(unittest.TestCase):
         self.assertIn("FROM event_embeddings legacy", statement)
         self.assertIn("octet_length(event.content) > %(legacy_full_content_max_bytes)s", statement)
         self.assertIn("md5(event.content)", statement)
+        self.assertIn("event.content NOT LIKE '[tool_calls:%%'", statement)
         self.assertIn("(to_jsonb(session)->>'archived_at') IS NULL", statement)
         self.assertEqual(parameters["legacy_full_content_max_bytes"], 6000)
 

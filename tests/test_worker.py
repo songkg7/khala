@@ -121,6 +121,18 @@ class WorkerReliabilityTest(unittest.TestCase):
         self.assertEqual(result["pushed"], [event_id])
         self.assertEqual(remote.pushed[0][2], [])
 
+    def test_push_preserves_tool_call_summary_but_does_not_enqueue_embedding(self):
+        event_id = self.store.add_event(
+            self.session_id, "assistant", "[tool_calls: terminal]"
+        )
+        remote = FakeRemote()
+
+        result = push_outbox(self.store, remote)
+
+        self.assertEqual(result["pushed"], [event_id])
+        self.assertEqual([event["id"] for event in remote.pushed[0][1]], [event_id])
+        self.assertEqual(remote.pushed[0][2], [])
+
     def test_push_failure_persists_sanitized_backoff_for_every_event(self):
         event_ids = self._add_events()
         remote = FakeRemote()

@@ -17,6 +17,7 @@ from khala.embeddings import DIMENSIONS, EMBED_ROLES, MODEL, PROVIDER, embed
 from khala.errors import public_error_message
 from khala.models import ArchivedSession
 from khala.outbox import OutboxClaim
+from khala.recall_results import is_tool_call_summary
 from khala.redact import redact
 from khala.remote import WORKER_LOCK_KEY, RemoteStore
 from khala.secure_files import (
@@ -149,7 +150,11 @@ def push_outbox(
                 "metadata": row["metadata"],
             }
         )
-        if row["role"] in EMBED_ROLES and str(row["content"]):
+        if (
+            row["role"] in EMBED_ROLES
+            and str(row["content"])
+            and not is_tool_call_summary(row["content"])
+        ):
             jobs.append(
                 {
                     "event_id": event_id,

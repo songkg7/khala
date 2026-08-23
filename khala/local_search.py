@@ -4,6 +4,7 @@ import re
 import sqlite3
 from typing import Any
 
+from khala.recall_results import deduplicate_recall_results
 from khala.roles import RoleFilter, validate_role_filter
 
 _QUESTION_STOP_WORDS = frozenset(
@@ -91,21 +92,38 @@ def lexical_search(
         parameters = (match_query, validated_role, limit)
     rows = db.execute(
         f"""
-        SELECT e.id, e.session_id, e.role, e.content, e.created_at, s.agent,
-               s.user_name, s.user_email,
-               COALESCE(r.count, 0) AS recall_count,
-               bm25(events_fts) - COALESCE(r.count, 0) * 0.1 AS rank
-        FROM events_fts
-        JOIN events e ON e.rowid = events_fts.rowid
-        JOIN sessions s ON s.id = e.session_id
-        LEFT JOIN recalls r ON r.event_id = e.id
-        WHERE events_fts MATCH ? AND s.archived_at IS NULL{role_clause}
-        ORDER BY rank, e.created_at DESC, e.rowid
+        WITH matches AS (
+            SELECT e.id, e.session_id, e.role, e.content, e.created_at, s.agent,
+                   s.user_name, s.user_email,
+                   COALESCE(r.count, 0) AS recall_count,
+                   bm25(events_fts) - COALESCE(r.count, 0) * 0.1 AS rank,
+                   e.rowid AS event_rowid
+            FROM events_fts
+            JOIN events e ON e.rowid = events_fts.rowid
+            JOIN sessions s ON s.id = e.session_id
+            LEFT JOIN recalls r ON r.event_id = e.id
+            WHERE events_fts MATCH ?
+              AND s.archived_at IS NULL
+              AND e.content NOT LIKE '[tool_calls:%'{role_clause}
+        ),
+        deduplicated AS (
+            SELECT matches.*,
+                   row_number() OVER (
+                       PARTITION BY role, content
+                       ORDER BY rank, created_at DESC, event_rowid
+                   ) AS content_rank
+            FROM matches
+        )
+        SELECT id, session_id, role, content, created_at, agent,
+               user_name, user_email, recall_count, rank
+        FROM deduplicated
+        WHERE content_rank = 1
+        ORDER BY rank, created_at DESC, event_rowid
         LIMIT ?
         """,
         parameters,
     ).fetchall()
-    return [dict(row) for row in rows]
+    return deduplicate_recall_results([dict(row) for row in rows], limit)
 
 
 def sample_events(
@@ -120,6 +138,7 @@ def sample_events(
         JOIN sessions s ON s.id = e.session_id
         WHERE e.role IN ('user', 'assistant')
           AND length(e.content) > 30
+          AND e.content NOT LIKE '[tool_calls:%'
           AND s.archived_at IS NULL
         ORDER BY e.created_at DESC, e.rowid
         LIMIT ?
