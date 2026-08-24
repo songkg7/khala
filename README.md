@@ -174,7 +174,7 @@ Run the test suite:
 For development, install the pinned quality tools and run the same gates as CI:
 
 ```bash
-uv sync --locked --extra dev --python 3.9
+uv sync --locked --extra dev --python 3.14
 .venv/bin/ruff check .
 .venv/bin/pyright --pythonpath .venv/bin/python
 .venv/bin/coverage run -m unittest discover -s tests -v

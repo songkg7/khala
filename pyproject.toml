@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "khala"
 version = "0.1.0"
 description = "Local-first shared agent memory"
-requires-python = ">=3.9"
+requires-python = ">=3.14"
 dependencies = [
     "psycopg[binary]>=3.2.13",
 ]
@@ -41,7 +41,7 @@ select = ["E", "F", "I", "UP"]
 
 [tool.pyright]
 include = ["khala", "tests"]
-pythonVersion = "3.9"
+pythonVersion = "3.14"
 typeCheckingMode = "standard"
 
 [tool.coverage.run]

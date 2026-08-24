@@ -24,7 +24,7 @@ import urllib.request
 
 DSN = os.environ["KHALA_DSN"]
 BOX = os.environ["BOX"]
-DB = "/tmp/khala-{}.db".format(BOX)
+DB = f"/tmp/khala-{BOX}.db"
 CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 GEN_MODEL = "openai/gpt-4o-mini"
 PROMPT_A = "khala 프로젝트의 구조와 목적을 분석해서 정리해줘."

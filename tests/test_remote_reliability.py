@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, call, patch
 
 from khala.models import ArchivedSession
 from khala.remote import RemoteStore
+from khala.remote_schema import build_event_indexes
 
 
 class RemoteTransactionTest(unittest.TestCase):
@@ -110,8 +111,8 @@ class RemoteTransactionTest(unittest.TestCase):
         connection, cursor = self._connection()
         cursor.execute.return_value.fetchone.side_effect = [(True,), (False,), None]
 
-        with patch("khala.remote.psycopg.connect", return_value=connection):
-            RemoteStore("postgresql://example/db")._ensure_event_indexes()
+        with patch("khala.remote_schema.psycopg.connect", return_value=connection):
+            build_event_indexes("postgresql://example/db")
 
         statements = [str(call.args[0]) for call in cursor.execute.call_args_list]
         self.assertEqual(
@@ -135,10 +136,10 @@ class RemoteTransactionTest(unittest.TestCase):
             None,
         ]
 
-        with patch("khala.remote.psycopg.connect", return_value=connection), patch(
-            "khala.remote.time.sleep"
+        with patch("khala.remote_schema.psycopg.connect", return_value=connection), patch(
+            "khala.remote_schema.time.sleep"
         ) as sleep:
-            RemoteStore("postgresql://example/db")._ensure_event_indexes()
+            build_event_indexes("postgresql://example/db")
 
         lock_statements = [
             str(call.args[0])

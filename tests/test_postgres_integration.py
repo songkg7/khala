@@ -23,6 +23,7 @@ from khala.identity import User
 from khala.models import ArchivedSession
 from khala.recall_usage import UsageQuery, build_recall_usage
 from khala.remote_recall_usage import record_remote_recall_usage
+from khala.remote_schema import build_event_indexes
 from khala.store import Store
 from khala.worker import OutboxPushError, process_embedding_jobs, push_outbox, run_worker
 
@@ -349,7 +350,7 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
 
         def migrate_index() -> None:
             try:
-                self.remote._ensure_event_indexes()
+                build_event_indexes(self.remote.dsn)
             except BaseException as error:
                 migration_errors.append(error)
 

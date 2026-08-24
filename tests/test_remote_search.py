@@ -158,7 +158,7 @@ class RemoteSearchTest(unittest.TestCase):
         cursor_context.__enter__.return_value = cursor
 
         with patch.object(store, "_cursor", return_value=cursor_context), patch(
-            "khala.remote.record_remote_recall_usage"
+            "khala.remote_recall.record_remote_recall_usage"
         ) as record_usage:
             store._record_recall_usage(
                 ["event-1", "event-1", "event-2"],
