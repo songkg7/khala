@@ -81,7 +81,7 @@ class LocalRecallUsageTest(unittest.TestCase):
             "needle", requested_mode="semantic", user=user
         )
 
-        self.assertEqual([row["id"] for row in hits], [event_id])
+        self.assertEqual([row.get("id") for row in hits], [event_id])
         requests = self.store.db.execute(
             """
             SELECT actor_name, email, requested_mode, effective_mode,

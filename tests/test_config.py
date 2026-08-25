@@ -28,7 +28,7 @@ class KhalaConfigTest(unittest.TestCase):
 
     def test_workspace_add_and_is_enabled(self):
         self.cfg.save_config({"workspaces": ["/ws/a"], "remote": None})
-        self.assertEqual(self.cfg.load_config()["workspaces"], ["/ws/a"])
+        self.assertEqual(self.cfg.load_config().get("workspaces"), ["/ws/a"])
         self.assertTrue(self.cfg.is_enabled_workspace("/ws/a/sub/dir"))
         self.assertFalse(self.cfg.is_enabled_workspace("/ws/b"))
 
@@ -38,7 +38,7 @@ class KhalaConfigTest(unittest.TestCase):
 
     def test_missing_config_returns_fresh_workspace_list(self):
         first = self.cfg.load_config()
-        first["workspaces"].append("/mutated")
+        (first.get("workspaces") or []).append("/mutated")
 
         self.assertEqual(self.cfg.load_config(), {"workspaces": [], "remote": None})
 
@@ -63,7 +63,7 @@ class KhalaConfigTest(unittest.TestCase):
         self.cfg.CONFIG_FILE.write_text('{"workspaces": [], "remote": null}\n')
         self.cfg.CONFIG_FILE.chmod(0o644)
 
-        self.assertEqual(self.cfg.load_config()["workspaces"], [])
+        self.assertEqual(self.cfg.load_config().get("workspaces"), [])
         self.assertEqual(stat.S_IMODE(self.cfg.CONFIG_DIR.stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(self.cfg.CONFIG_FILE.stat().st_mode), 0o600)
 
@@ -147,7 +147,7 @@ class KhalaConfigSetGetTest(unittest.TestCase):
         d = {"workspaces": []}
         self.cli.config_set(d, "workspaces[0]", "/a")
         self.cli.config_set(d, "workspaces[1]", "/b")
-        self.assertEqual(d["workspaces"], ["/a", "/b"])
+        self.assertEqual(d.get("workspaces"), ["/a", "/b"])
         self.assertEqual(self.cli.config_get(d, "workspaces[1]"), "/b")
 
     def test_get_missing_returns_none(self):

@@ -21,6 +21,7 @@ from khala.evaluation.backends import RemoteEvalBackend
 from khala.identifier_graph import IdentifierGraphQuery
 from khala.identity import User
 from khala.models import ArchivedSession
+from khala.recall_results import RecallHit
 from khala.recall_usage import UsageQuery, build_recall_usage
 from khala.remote_recall_usage import record_remote_recall_usage
 from khala.remote_schema import build_event_indexes
@@ -577,7 +578,7 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
 
         rows = self.remote.search_lexical("needle", limit=5)
 
-        self.assertEqual([row["id"] for row in rows], ["event-1"])
+        self.assertEqual([row.get("id") for row in rows], ["event-1"])
         self.assertEqual(
             self._counts("recalls", "recall_requests"),
             {"recalls": 0, "recall_requests": 0},
@@ -616,7 +617,7 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
 
         with patch("khala.embeddings.embed", return_value=[query_vector]):
             search_rows = self.remote.search_hybrid("needle", limit=1)
-            self.assertEqual([row["id"] for row in search_rows], ["event-1"])
+            self.assertEqual([row.get("id") for row in search_rows], ["event-1"])
             self.assertEqual(
                 self._counts("recalls", "recall_requests"),
                 {"recalls": 0, "recall_requests": 0},
@@ -624,7 +625,7 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
 
             recall_rows = self.remote.recall_hybrid("needle", limit=1)
 
-        self.assertEqual([row["id"] for row in recall_rows], ["event-1"])
+        self.assertEqual([row.get("id") for row in recall_rows], ["event-1"])
         with self.sandbox.connection() as connection:
             popularity = connection.execute(
                 "SELECT event_id, count FROM recalls"
@@ -1181,9 +1182,9 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
         with patch("khala.embeddings.embed", return_value=[query_vector]):
             rows = self.remote.search_semantic("semantic query", limit=3)
 
-        self.assertEqual([row["id"] for row in rows], ["event-1", "event-2", "event-3"])
-        self.assertEqual([int(row["semantic_rank"]) for row in rows], [1, 2, 3])
-        self.assertNotIn("event-4", [row["id"] for row in rows])
+        self.assertEqual([row.get("id") for row in rows], ["event-1", "event-2", "event-3"])
+        self.assertEqual([int(row.get("semantic_rank") or 0) for row in rows], [1, 2, 3])
+        self.assertNotIn("event-4", [row.get("id") for row in rows])
 
     def test_chunk_completion_dual_writes_and_empty_jobs_ack_atomically(self) -> None:
         event_id = "chunked-event"
@@ -1403,7 +1404,7 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
         )
         with patch("khala.embeddings.embed", return_value=[fixed_vector(1.0)]):
             rows = self.remote.search_semantic("tail", limit=1)
-        self.assertEqual([row["id"] for row in rows], [event_id])
+        self.assertEqual([row.get("id") for row in rows], [event_id])
 
     def test_semantic_search_ranks_events_by_best_complete_current_chunk(self) -> None:
         event_ids = ["a-tail", "b-single", "c-incomplete", "d-current", "e-old"]
@@ -1513,10 +1514,10 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
             rows = self.remote.search_semantic("tail meaning", limit=5)
 
         self.assertEqual(
-            [row["id"] for row in rows],
+            [row.get("id") for row in rows],
             ["a-tail", "c-incomplete", "b-single", "d-current", "e-old"],
         )
-        self.assertEqual([int(row["semantic_rank"]) for row in rows], [1, 2, 3, 4, 5])
+        self.assertEqual([int(row.get("semantic_rank") or 0) for row in rows], [1, 2, 3, 4, 5])
         sampled = self.remote.sample_events(10, mode="semantic")
         self.assertEqual(set(row["id"] for row in sampled), set(event_ids))
         self.assertEqual(len(sampled), len(event_ids))
@@ -1683,12 +1684,7 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
 
         archived_graph = self.remote.graph(archived_event_id, limit=3)
         archived_hit = self.remote.attach_neighbors(
-            [
-                {
-                    "id": archived_event_id,
-                    "session_id": archived_session_id,
-                }
-            ],
+            [RecallHit(id=archived_event_id, session_id=archived_session_id)],
             per_hit=3,
         )
         self.assertFalse(archived_graph["found"])
@@ -1788,7 +1784,7 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
             connection.execute("DROP TABLE event_embedding_chunks")
 
         self.assertEqual(
-            [row["id"] for row in self.remote.search_lexical("compatibility", 10)],
+            [row.get("id") for row in self.remote.search_lexical("compatibility", 10)],
             [event_id],
         )
         with patch("khala.embeddings.embed", return_value=[query_vector]):
@@ -1799,12 +1795,12 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
         for mode in ("lexical", "semantic", "hybrid"):
             with self.subTest(mode=mode):
                 self.assertEqual(
-                    [row["id"] for row in self.remote.sample_events(10, mode=mode)],
+                    [row.get("id") for row in self.remote.sample_events(10, mode=mode)],
                     [event_id],
                 )
         self.assertTrue(self.remote.graph(event_id, 3)["found"])
         attached = self.remote.attach_neighbors(
-            [{"id": event_id, "session_id": "session-1"}], per_hit=3
+            [RecallHit(id=event_id, session_id="session-1")], per_hit=3
         )
         self.assertEqual(attached[0]["adjacent"], [])
         self.assertEqual(
@@ -2016,11 +2012,11 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
                             per_hit=limit,
                         )
                         self.assertEqual(
-                            [row["content"] for row in local_attached[0]["adjacent"]],
+                            [row["content"] for row in (local_attached[0].get("adjacent") or [])],
                             expected_content,
                         )
                         self.assertEqual(
-                            [row["content"] for row in remote_attached[0]["adjacent"]],
+                            [row["content"] for row in (remote_attached[0].get("adjacent") or [])],
                             expected_content,
                         )
             finally:
@@ -2081,7 +2077,7 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
                     self.assertEqual(len(graph["event"]["content"]), 200)
                     self.assertEqual(len(graph["same_session"][0]["content"]), 500)
                 for attached in (local_attached, remote_attached):
-                    self.assertEqual(len(attached[0]["adjacent"][0]["content"]), 500)
+                    self.assertEqual(len((attached[0].get("adjacent")or[{}])[0].get("content","")),500)
             finally:
                 local.close()
 
@@ -2122,7 +2118,7 @@ class PostgreSQLIntegrationTest(unittest.TestCase):
         self.assertEqual(len(executed_statements), 1)
         self.assertIn("unnest", executed_statements[0])
         self.assertEqual(
-            [[row["content"] for row in hit["adjacent"]] for hit in attached],
+            [[row["content"] for row in (hit.get("adjacent") or [])] for hit in attached],
             [
                 ["tie-before", "hit", "tie-after"],
                 ["other one", "other three"],

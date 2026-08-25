@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, call, patch
 
 from khala.embedding_chunks import CHUNKER_VERSION
 from khala.embeddings import MODEL, PROVIDER
+from khala.recall_results import RecallHit
 from khala.remote import RemoteStore, recall_by_mode, search_by_mode
 
 READ_ONLY_TRANSACTION = "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
@@ -216,7 +217,7 @@ class RemoteSearchTest(unittest.TestCase):
         ):
             result = store.search_hybrid("deploy", limit=3)
 
-        self.assertEqual(result[0]["id"], "shared")
+        self.assertEqual(result[0].get("id"), "shared")
         self.assertEqual(lexical_rows, original_lexical)
         self.assertEqual(semantic_rows, original_semantic)
 
@@ -300,7 +301,7 @@ class RemoteSearchTest(unittest.TestCase):
             result = store.search_semantic("deploy", limit=3)
 
         self.assertIn("semantic_distance", result[0])
-        self.assertIsNotNone(result[0]["semantic_distance"])
+        self.assertIsNotNone(result[0].get("semantic_distance"))
 
     def test_legacy_semantic_results_include_semantic_distance(self) -> None:
         row = {
@@ -322,7 +323,7 @@ class RemoteSearchTest(unittest.TestCase):
             result = store.search_semantic("deploy", limit=3)
 
         self.assertIn("semantic_distance", result[0])
-        self.assertIsNotNone(result[0]["semantic_distance"])
+        self.assertIsNotNone(result[0].get("semantic_distance"))
 
     def test_hybrid_fusion_preserves_semantic_distance_on_overlap(self) -> None:
         lexical_rows = [
@@ -341,11 +342,11 @@ class RemoteSearchTest(unittest.TestCase):
         ):
             result = store.search_hybrid("deploy", limit=3)
 
-        shared = next(r for r in result if r["id"] == "shared")
+        shared = next(r for r in result if r.get("id") == "shared")
         self.assertIn("semantic_distance", shared)
-        self.assertEqual(shared["semantic_distance"], 0.12)
-        sem_only = next(r for r in result if r["id"] == "semantic")
-        self.assertEqual(sem_only["semantic_distance"], 0.05)
+        self.assertEqual(shared.get("semantic_distance"), 0.12)
+        sem_only = next(r for r in result if r.get("id") == "semantic")
+        self.assertEqual(sem_only.get("semantic_distance"), 0.05)
 
     def test_hybrid_fusion_deduplicates_same_role_and_content(self) -> None:
         lexical_rows = [
@@ -386,7 +387,7 @@ class RemoteSearchTest(unittest.TestCase):
         ):
             result = store.search_hybrid("deploy", limit=3)
 
-        logical_keys = [(row["role"], row["content"]) for row in result]
+        logical_keys = [(row.get("role"), row.get("content")) for row in result]
         self.assertEqual(len(logical_keys), len(set(logical_keys)))
         self.assertIn(("assistant", "same content"), logical_keys)
 
@@ -585,7 +586,7 @@ class RemoteSearchTest(unittest.TestCase):
             )
 
         self.assertEqual(
-            [row["content"] for row in result[0]["adjacent"]],
+            [row.get("content") for row in result[0].get("adjacent", [])],
             ["content-1", "content-2", "content-3"],
         )
         self.assertEqual(cursor.execute.call_args_list[0], call(READ_ONLY_TRANSACTION))
@@ -640,18 +641,18 @@ class RemoteSearchTest(unittest.TestCase):
         connection, cursor = self._connection(first_window + second_window + duplicate_window)
         store = RemoteStore("postgresql://example/db")
         hits = [
-            {"id": "event-0", "session_id": "session-1"},
-            {"id": "other-2", "session_id": "session-2"},
-            {"id": "event-0", "session_id": "session-1"},
-            {"id": "event-0", "session_id": "session-2"},
-            {"id": "missing", "session_id": "session-1"},
+            RecallHit(id="event-0", session_id="session-1"),
+            RecallHit(id="other-2", session_id="session-2"),
+            RecallHit(id="event-0", session_id="session-1"),
+            RecallHit(id="event-0", session_id="session-2"),
+            RecallHit(id="missing", session_id="session-1"),
         ]
 
         with patch("khala.remote.psycopg.connect", return_value=connection):
             result = store.attach_neighbors(hits, per_hit=3)
 
         self.assertEqual(
-            [[row["content"] for row in hit["adjacent"]] for hit in result],
+            [[row.get("content") for row in hit.get("adjacent", [])] for hit in result],
             [
                 ["content-1", "content-2", "content-3"],
                 ["other one", "other three"],
@@ -681,7 +682,7 @@ class RemoteSearchTest(unittest.TestCase):
         with patch("khala.remote.psycopg.connect", return_value=connection):
             result = store.attach_neighbors([{"id": "real-event", "session_id": "spoofed-session"}])
 
-        self.assertEqual(result[0]["adjacent"], [])
+        self.assertEqual(result[0].get("adjacent"), [])
         neighbor_query = cursor.execute.call_args_list[1]
         self.assertIn(
             "event.session_id = request.session_id",
@@ -790,14 +791,14 @@ class RemoteSearchTest(unittest.TestCase):
             ):
                 self.assertIn(field, row, f"consumer contract: missing {field}")
             # semantic_distance present only when available from source
-            if row["id"] in ("sem-1", "lex-1"):
+            if row.get("id") in ("sem-1", "lex-1"):
                 self.assertIn("semantic_distance", row,
-                    f"consumer contract: semantic hybrid row {row['id']} missing distance")
-                self.assertIsInstance(row["semantic_distance"], float)
+                    f"consumer contract: semantic hybrid row {row.get('id')} missing distance")
+                self.assertIsInstance(row.get("semantic_distance"), float)
             # Graph adjacency
             self.assertIn("adjacent", row)
-            if row["adjacent"]:
-                for adj in row["adjacent"]:
+            if adjacent := row.get("adjacent"):
+                for adj in adjacent:
                     self.assertIn("role", adj)
                     self.assertIn("content", adj)
 

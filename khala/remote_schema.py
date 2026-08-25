@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import contextlib
 import time
-from typing import Any
 
 import psycopg
 from psycopg import sql
 
+from khala.pg_cursor import Cursor
 from khala.remote_embeddings import ensure_chunk_schema
 from khala.remote_identifiers import ensure_remote_identifier_schema
 from khala.remote_recall_usage import ensure_remote_recall_usage_schema
@@ -93,7 +93,7 @@ EVENT_INDEXES = (
 )
 
 
-def ensure_schema(cur: Any) -> None:
+def ensure_schema(cur: Cursor) -> None:
     cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
     cur.execute(SCHEMA_SESSIONS)
     cur.execute(
@@ -136,7 +136,7 @@ def ensure_schema(cur: Any) -> None:
     )
 
 
-def acquire_schema_migration_lock(cur: Any) -> None:
+def acquire_schema_migration_lock(cur: Cursor) -> None:
     """Wait without holding a transaction that blocks concurrent index builds."""
     while True:
         row = cur.execute(
@@ -148,12 +148,12 @@ def acquire_schema_migration_lock(cur: Any) -> None:
         time.sleep(SCHEMA_LOCK_POLL_SECONDS)
 
 
-def release_schema_migration_lock(cur: Any) -> None:
+def release_schema_migration_lock(cur: Cursor) -> None:
     with contextlib.suppress(psycopg.Error):
         cur.execute("SELECT pg_advisory_unlock(%s)", (SCHEMA_MIGRATION_LOCK_KEY,))
 
 
-def repair_or_build_invalid_index(cur: Any, index_name: str) -> None:
+def repair_or_build_invalid_index(cur: Cursor, index_name: str) -> None:
     row = cur.execute(
         """
         SELECT index_row.indisvalid

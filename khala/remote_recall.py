@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import AbstractContextManager
 from typing import Any, Protocol
 
 from khala.adjacency import validate_neighbor_limit
@@ -18,7 +19,8 @@ from khala.identifier_graph import (
     assemble_identifier_graph,
 )
 from khala.identity import User
-from khala.recall_results import deduplicate_recall_results
+from khala.pg_cursor import Cursor
+from khala.recall_results import RecallHit, deduplicate_recall_results
 from khala.recall_usage import (
     RecallMode,
     build_recall_usage,
@@ -37,9 +39,9 @@ from khala.roles import RoleFilter, validate_role_filter
 
 
 class _CursorHost(Protocol):
-    def _cursor(self) -> Any: ...
+    def _cursor(self) -> AbstractContextManager[Cursor]: ...
 
-    def _read_cursor(self) -> Any: ...
+    def _read_cursor(self) -> AbstractContextManager[Cursor]: ...
 
 _FUSE_RANK_BASE = 60
 _FUSE_MISSING_RANK = 1_000_000
@@ -61,13 +63,13 @@ def _literal_ilike_pattern(query: str) -> str:
 
 
 def fuse_hybrid_results(
-    lexical: list[dict[str, Any]],
-    semantic: list[dict[str, Any]],
+    lexical: list[RecallHit],
+    semantic: list[RecallHit],
     limit: int,
-) -> list[dict[str, Any]]:
+) -> list[RecallHit]:
     merged: dict[str, dict[str, Any]] = {}
     for rank, source in enumerate(lexical, start=1):
-        event_id = str(source["id"])
+        event_id = str(source.get("id"))
         if event_id in merged:
             merged[event_id].setdefault("lexical_rank", rank)
             continue
@@ -75,7 +77,7 @@ def fuse_hybrid_results(
         row["lexical_rank"] = rank
         merged[event_id] = row
     for rank, source in enumerate(semantic, start=1):
-        event_id = str(source["id"])
+        event_id = str(source.get("id"))
         if event_id in merged:
             merged[event_id].setdefault("semantic_rank", rank)
             merged[event_id].setdefault("semantic_distance", source.get("semantic_distance"))
@@ -91,9 +93,11 @@ def fuse_hybrid_results(
         )
     ordered = sorted(
         merged.values(),
-        key=lambda row: (-row["rank"], row["created_at"], str(row["id"])),
+        key=lambda row: (-row["rank"], str(row["created_at"]), str(row["id"])),
     )
-    return deduplicate_recall_results(ordered, limit)
+    return deduplicate_recall_results(
+        [RecallHit(**row) for row in ordered], limit
+    )
 
 
 class RemoteRecallMixin(_CursorHost):
@@ -124,7 +128,7 @@ class RemoteRecallMixin(_CursorHost):
         limit: int = 5,
         *,
         role: RoleFilter | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[RecallHit]:
         """Full-text search over the shared store, ordered by recency.
 
         ponytail: simple ILIKE matches (no PG FTS setup needed for Phase 2).
@@ -140,7 +144,7 @@ class RemoteRecallMixin(_CursorHost):
         *,
         user: User | None = None,
         role: RoleFilter | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[RecallHit]:
         validated_role = validate_role_filter(role)
         return self.recall_lexical(
             query, limit, user=user, **_role_kwargs(validated_role)
@@ -152,7 +156,7 @@ class RemoteRecallMixin(_CursorHost):
         limit: int = 5,
         *,
         role: RoleFilter | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[RecallHit]:
         validated_limit = validate_recall_limit(limit)
         validated_role = validate_role_filter(role)
         role_clause = ""
@@ -195,7 +199,7 @@ class RemoteRecallMixin(_CursorHost):
                 parameters,
             ).fetchall()
             return deduplicate_recall_results(
-                [dict(row) for row in rows], validated_limit
+                [RecallHit(**dict(row)) for row in rows], validated_limit
             )
 
     def recall_lexical(
@@ -205,14 +209,14 @@ class RemoteRecallMixin(_CursorHost):
         *,
         user: User | None = None,
         role: RoleFilter | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[RecallHit]:
         validated_limit = validate_recall_limit(limit)
         validated_role = validate_role_filter(role)
         rows = self.search_lexical(
             query, validated_limit, **_role_kwargs(validated_role)
         )
         self._record_recall_usage(
-            [str(row["id"]) for row in rows],
+            [str(row.get("id")) for row in rows],
             requested_mode="lexical",
             effective_mode="lexical",
             requested_limit=validated_limit,
@@ -226,7 +230,7 @@ class RemoteRecallMixin(_CursorHost):
         limit: int = 5,
         *,
         role: RoleFilter | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[RecallHit]:
         """Embed the query and return nearest events by cosine distance."""
         from khala.embeddings import embed
 
@@ -249,7 +253,7 @@ class RemoteRecallMixin(_CursorHost):
                 limit=validated_limit,
                 role=validated_role,
             )
-        return deduplicate_recall_results(rows, validated_limit)
+        return deduplicate_recall_results([RecallHit(**r) for r in rows], validated_limit)
 
     def recall_semantic(
         self,
@@ -258,14 +262,14 @@ class RemoteRecallMixin(_CursorHost):
         *,
         user: User | None = None,
         role: RoleFilter | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[RecallHit]:
         validated_limit = validate_recall_limit(limit)
         validated_role = validate_role_filter(role)
         rows = self.search_semantic(
             query, validated_limit, **_role_kwargs(validated_role)
         )
         self._record_recall_usage(
-            [str(row["id"]) for row in rows],
+            [str(row.get("id")) for row in rows],
             requested_mode="semantic",
             effective_mode="semantic",
             requested_limit=validated_limit,
@@ -279,7 +283,7 @@ class RemoteRecallMixin(_CursorHost):
         limit: int = 5,
         *,
         role: RoleFilter | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[RecallHit]:
         """Strict RRF fusion for evaluation; semantic failure is surfaced."""
         validated_limit = validate_recall_limit(limit)
         validated_role = validate_role_filter(role)
@@ -295,7 +299,7 @@ class RemoteRecallMixin(_CursorHost):
         *,
         user: User | None = None,
         role: RoleFilter | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[RecallHit]:
         validated_limit = validate_recall_limit(limit)
         validated_role = validate_role_filter(role)
         role_kwargs = _role_kwargs(validated_role)
@@ -310,7 +314,7 @@ class RemoteRecallMixin(_CursorHost):
             rows = fuse_hybrid_results(lex, sem, validated_limit)
             effective_mode = "hybrid"
         self._record_recall_usage(
-            [str(row["id"]) for row in rows],
+            [str(row.get("id")) for row in rows],
             requested_mode="hybrid",
             effective_mode=effective_mode,
             requested_limit=validated_limit,
@@ -350,8 +354,8 @@ class RemoteRecallMixin(_CursorHost):
         return [dict(row) for row in rows]
 
     def attach_neighbors(
-        self, hits: list[dict[str, Any]], per_hit: int = 3
-    ) -> list[dict[str, Any]]:
+        self, hits: list[RecallHit], per_hit: int = 3
+    ) -> list[RecallHit]:
         """Enrich recall hits with same-session adjacent context (RAG-style).
 
         For each hit, add `adjacent`: a contiguous conversational window around

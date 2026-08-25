@@ -355,7 +355,7 @@ class CodexHookInstallerTest(unittest.TestCase):
         self.assertEqual(report["status"], "installed")
         self.assertEqual(report["workspace"], str(workspace.resolve()))
         self.assertTrue(report["recall_enabled"])
-        self.assertEqual(configured["workspaces"], [str(workspace.resolve())])
+        self.assertEqual(configured.get("workspaces"), [str(workspace.resolve())])
         self.assertTrue((self.home / "hooks.json").is_file())
 
 

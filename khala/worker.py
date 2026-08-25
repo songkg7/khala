@@ -74,7 +74,7 @@ def _open_worker_log(db_path: Path) -> TextIO:
     return open_private_append(log_path)
 
 
-def _lock_conn(dsn: str) -> Any:
+def _lock_conn(dsn: str) -> psycopg.Connection[tuple[Any, ...]] | None:
     """Persistent connection that holds the advisory lock for the worker."""
     conn = None
     try:

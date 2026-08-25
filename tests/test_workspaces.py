@@ -86,7 +86,7 @@ class GitWorktreeConfigTest(unittest.TestCase):
         config.save_config({"workspaces": [str(registered)], "remote": None})
 
         stored = config.load_config()
-        common_dirs = stored[WORKSPACE_GIT_COMMON_DIRS_KEY]
+        common_dirs = stored.get(WORKSPACE_GIT_COMMON_DIRS_KEY)
         self.assertEqual(
             common_dirs,
             {str(registered.resolve()): str((self.repository / ".git").resolve())},
@@ -142,14 +142,14 @@ class GitWorktreeConfigTest(unittest.TestCase):
             [str(registered.resolve())],
         )
         self.assertEqual(
-            stored[WORKSPACE_GIT_COMMON_DIRS_KEY],
+            stored.get(WORKSPACE_GIT_COMMON_DIRS_KEY),
             {str(registered.resolve()): str((self.repository / ".git").resolve())},
         )
 
     def test_registration_survives_deletion_of_original_worktree(self) -> None:
         registered = self._add_worktree("ephemeral")
         config.save_config({"workspaces": [str(registered)], "remote": None})
-        common_dirs = config.load_config()[WORKSPACE_GIT_COMMON_DIRS_KEY]
+        common_dirs = config.load_config().get(WORKSPACE_GIT_COMMON_DIRS_KEY)
 
         self._git("worktree", "remove", str(registered), cwd=self.repository)
         config_data = config.load_config()
@@ -157,7 +157,7 @@ class GitWorktreeConfigTest(unittest.TestCase):
         config.save_config(config_data)
 
         self.assertEqual(
-            config.load_config()[WORKSPACE_GIT_COMMON_DIRS_KEY],
+            config.load_config().get(WORKSPACE_GIT_COMMON_DIRS_KEY),
             common_dirs,
         )
         future_sibling = self._add_worktree("replacement")
@@ -172,8 +172,8 @@ class GitWorktreeConfigTest(unittest.TestCase):
         config_data["workspaces"] = [str(second)]
         config.save_config(config_data)
 
-        common_dirs = config.load_config()[WORKSPACE_GIT_COMMON_DIRS_KEY]
-        self.assertEqual(set(common_dirs), {str(second.resolve())})
+        common_dirs = config.load_config().get(WORKSPACE_GIT_COMMON_DIRS_KEY)
+        self.assertEqual(set(common_dirs or {}), {str(second.resolve())})
         self.assertTrue(config.is_enabled_workspace(str(first)))
 
         config_data = config.load_config()
@@ -311,7 +311,7 @@ class WorkspaceRegistryTest(unittest.TestCase):
             (str(first.resolve()), str(second.resolve())),
         )
         self.assertEqual(removed.workspaces, (str(second.resolve()),))
-        self.assertEqual(config.load_config()["workspaces"], [str(second.resolve())])
+        self.assertEqual(config.load_config().get("workspaces"), [str(second.resolve())])
 
     def test_add_rejects_missing_or_unresolvable_workspace(self) -> None:
         missing = self.root / "missing"

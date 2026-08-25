@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 from khala.identity import resolve_user
+from khala.recall_results import RecallHit
 from khala.recall_usage import validate_recall_limit
 from khala.redact import redact
 from khala.roles import RoleFilter, validate_role_filter
@@ -17,7 +17,7 @@ def recall_for_prompt(
     cwd: Path,
     limit: int = 3,
     role: RoleFilter = "assistant",
-) -> list[dict[str, Any]]:
+) -> list[RecallHit]:
     """Recall prompt-relevant memory from the active backend with graph context."""
     normalized_query = redact(query.strip())
     if not normalized_query:

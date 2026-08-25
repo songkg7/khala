@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from khala.adjacency import select_centered_neighbors, validate_neighbor_limit
+from khala.pg_cursor import Cursor
 
 _NEIGHBOR_QUERY = """
 WITH requested AS (
@@ -65,7 +66,7 @@ ORDER BY anchor.request_index,
 
 
 def load_remote_event_neighbors(
-    cursor: Any,
+    cursor: Cursor,
     requests: Sequence[tuple[str, str | None]],
     limit: int,
 ) -> dict[int, tuple[dict[str, Any], list[dict[str, Any]]]]:

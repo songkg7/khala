@@ -7,6 +7,7 @@ from typing import Any
 
 from khala.embedding_chunks import CHUNKER_VERSION, MAX_CHUNK_UTF8_BYTES
 from khala.embeddings import MODEL, PROVIDER
+from khala.pg_cursor import Cursor
 from khala.redact import redact
 from khala.retry import DEFAULT_RETRY_POLICY, RetryPolicy
 
@@ -18,7 +19,7 @@ def _now() -> datetime:
 
 
 def enqueue_missing_embed_jobs(
-    cur: Any,
+    cur: Cursor,
     provider: str = PROVIDER,
     model: str = MODEL,
 ) -> int:
@@ -37,7 +38,7 @@ def enqueue_missing_embed_jobs(
 
 
 def pending_embed_jobs(
-    cur: Any,
+    cur: Cursor,
     limit: int = 100,
     provider: str = PROVIDER,
     model: str = MODEL,
@@ -65,7 +66,7 @@ def pending_embed_jobs(
 
 
 def mark_embed_success(
-    cur: Any, event_id: str, provider: str, model: str, content_hash: str
+    cur: Cursor, event_id: str, provider: str, model: str, content_hash: str
 ) -> None:
     cur.execute(
         "DELETE FROM embedding_jobs "
@@ -75,7 +76,7 @@ def mark_embed_success(
 
 
 def mark_embed_errors(
-    cur: Any,
+    cur: Cursor,
     jobs: list[dict[str, Any]],
     error: str,
     retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
@@ -125,7 +126,7 @@ def mark_embed_errors(
         )
 
 
-def embedding_status(cur: Any) -> dict[str, Any]:
+def embedding_status(cur: Cursor) -> dict[str, Any]:
     from khala.remote_embeddings import count_embedded_events
 
     done = count_embedded_events(
@@ -185,7 +186,7 @@ def embedding_status(cur: Any) -> dict[str, Any]:
     }
 
 
-def requeue_dead_embed_jobs(cur: Any) -> int:
+def requeue_dead_embed_jobs(cur: Cursor) -> int:
     updated = cur.execute(
         """
         UPDATE embedding_jobs job

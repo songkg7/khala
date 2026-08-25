@@ -5,6 +5,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
 
 from khala.embedding_chunks import CHUNKER_VERSION, EmbeddingChunk, chunk_text
+from khala.pg_cursor import Cursor
 from khala.remote_embedding_sql import (
     ACK_COMPLETE_JOB_SQL,
     CHUNK_LOOKUP_INDEX_SQL,
@@ -24,24 +25,6 @@ from khala.remote_embedding_sql import (
 from khala.roles import RoleFilter, validate_role_filter
 
 VECTOR_DIMENSIONS = 1536
-
-
-class Cursor(Protocol):
-    """Small structural boundary shared by psycopg cursors and test doubles."""
-
-    rowcount: int
-
-    def execute(
-        self, statement: str, parameters: Mapping[str, object] | None = None
-    ) -> Cursor: ...
-
-    def executemany(
-        self, statement: str, parameters: Sequence[Mapping[str, object]]
-    ) -> object: ...
-
-    def fetchone(self) -> Mapping[str, object] | Sequence[object] | None: ...
-
-    def fetchall(self) -> Sequence[Mapping[str, Any]]: ...
 
 
 class ChunkEmbedding(Protocol):

@@ -857,7 +857,7 @@ class LocalEvaluationBackendTest(unittest.TestCase):
         first = store.search("needle")
         second = store.search("needle")
         self.assertEqual(first, second)
-        self.assertEqual(int(first[0]["recall_count"]), 0)
+        self.assertEqual(int(first[0].get("recall_count", 0)), 0)
         self.assertEqual(
             int(store.db.execute("SELECT count(*) FROM recalls").fetchone()[0]), 0
         )
@@ -867,7 +867,7 @@ class LocalEvaluationBackendTest(unittest.TestCase):
         )
 
         recalled = store.recall("needle")
-        self.assertEqual([row["id"] for row in recalled], [event_id])
+        self.assertEqual([row.get("id") for row in recalled], [event_id])
         self.assertEqual(
             int(
                 store.db.execute(
@@ -876,7 +876,7 @@ class LocalEvaluationBackendTest(unittest.TestCase):
             ),
             1,
         )
-        self.assertEqual(int(store.search("needle")[0]["recall_count"]), 1)
+        self.assertEqual(int(store.search("needle")[0].get("recall_count", 0)), 1)
         self.assertEqual(
             int(store.db.execute("SELECT count(*) FROM recall_requests").fetchone()[0]),
             1,

@@ -4,7 +4,7 @@ import hashlib
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, cast
 
 from khala.identifiers import (
     EXTRACTOR_VERSION,
@@ -14,6 +14,7 @@ from khala.identifiers import (
     extract_file_identifiers,
     normalize_file_identifier,
 )
+from khala.pg_cursor import Cursor
 
 IdentifierResolutionStatus = Literal["exact", "basename", "ambiguous", "not_found"]
 
@@ -23,18 +24,6 @@ MAX_COREFERENCE_ROWS = 100
 MAX_BACKFILL_EVENTS = 1_000
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-
-
-class Cursor(Protocol):
-    """Transaction-owned PostgreSQL cursor boundary."""
-
-    def execute(self, statement: str, parameters: Mapping[str, object] | None = None) -> Cursor: ...
-
-    def executemany(self, statement: str, parameters: Sequence[Mapping[str, object]]) -> object: ...
-
-    def fetchone(self) -> Mapping[str, Any] | Sequence[object] | None: ...
-
-    def fetchall(self) -> Sequence[Mapping[str, Any] | Sequence[object]]: ...
 
 
 @dataclass(frozen=True)

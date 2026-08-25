@@ -4,7 +4,7 @@ import re
 import sqlite3
 from typing import Any
 
-from khala.recall_results import deduplicate_recall_results
+from khala.recall_results import RecallHit, deduplicate_recall_results
 from khala.roles import RoleFilter, validate_role_filter
 
 _QUESTION_STOP_WORDS = frozenset(
@@ -76,7 +76,7 @@ def lexical_search(
     limit: int = 5,
     *,
     role: RoleFilter | None = None,
-) -> list[dict[str, Any]]:
+) -> list[RecallHit]:
     validated_role = validate_role_filter(role)
     if limit < 1:
         return []
@@ -123,7 +123,7 @@ def lexical_search(
         """,
         parameters,
     ).fetchall()
-    return deduplicate_recall_results([dict(row) for row in rows], limit)
+    return deduplicate_recall_results([RecallHit(**dict(row)) for row in rows], limit)
 
 
 def sample_events(

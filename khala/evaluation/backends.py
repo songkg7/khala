@@ -32,7 +32,7 @@ class LocalEvalBackend:
         self.db.execute("PRAGMA query_only = ON")
 
     def search(self, query: str, limit: int) -> list[dict[str, Any]]:
-        return lexical_search(self.db, query, limit)
+        return [dict(hit) for hit in lexical_search(self.db, query, limit)]
 
     def sample_events(self, limit: int) -> list[dict[str, Any]]:
         return sample_events(self.db, limit)
@@ -60,7 +60,7 @@ class RemoteEvalBackend:
     def search(self, query: str, limit: int) -> list[dict[str, Any]]:
         from khala.remote import search_by_mode
 
-        return search_by_mode(self.remote, query, self.mode, limit)
+        return [dict(hit) for hit in search_by_mode(self.remote, query, self.mode, limit)]
 
     def sample_events(self, limit: int) -> list[dict[str, Any]]:
         return self.remote.sample_events(limit, mode=self.mode)
