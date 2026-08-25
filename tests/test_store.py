@@ -8,6 +8,7 @@ from pathlib import Path
 
 from khala import Store, load_adapter, read_jsonl, redact
 from khala.identifier_graph import IdentifierGraphQuery
+from khala.recall_results import RecallHit
 
 
 class KhalaStoreTest(unittest.TestCase):
@@ -97,15 +98,15 @@ class KhalaStoreTest(unittest.TestCase):
         # Boost e1 by recalling it
         self.store.recall("alpha beta gamma", limit=1)
         r2 = self.store.recall("alpha", limit=3)
-        self.assertEqual(r2[0]["recall_count"], 2)
-        self.assertEqual(r2[0]["id"], e1)
+        self.assertEqual(r2[0].get("recall_count"), 2)
+        self.assertEqual(r2[0].get("id"), e1)
 
     def test_recall_hyphen_query_is_tokenized_as_literal_text(self):
         """FTS5 syntax characters in natural-language queries stay literal."""
         session = self.store.add_session("test")
         self.store.add_event(session, "assistant", "cross-agent recall target")
         hits = self.store.recall("cross-agent")
-        self.assertTrue(any("cross-agent" in h["content"] for h in hits))
+        self.assertTrue(any("cross-agent" in str(h.get("content")) for h in hits))
 
     def test_role_filter_limits_recall_and_replay(self):
         session = self.store.add_session("test")
@@ -116,11 +117,11 @@ class KhalaStoreTest(unittest.TestCase):
         self.store.add_event(session, "system", "role filter needle")
 
         self.assertEqual(
-            [row["id"] for row in self.store.recall("role filter", role="user")],
+            [row.get("id") for row in self.store.recall("role filter", role="user")],
             [user_event],
         )
         self.assertEqual(
-            [row["id"] for row in self.store.recall("role filter", role="assistant")],
+            [row.get("id") for row in self.store.recall("role filter", role="assistant")],
             [assistant_event],
         )
         self.assertEqual(
@@ -147,7 +148,7 @@ class KhalaStoreTest(unittest.TestCase):
         results = self.store.search("duplicate", limit=10)
 
         self.assertEqual(
-            {(row["role"], row["content"]) for row in results},
+            {(row.get("role"), row.get("content")) for row in results},
             {
                 ("user", "duplicate recall needle"),
                 ("assistant", "duplicate recall needle"),
@@ -156,7 +157,7 @@ class KhalaStoreTest(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertIn(tool_summary, [row["id"] for row in self.store.replay(session)])
         self.assertEqual(self.store.search("terminal", limit=10), [])
-        selected = {row["role"]: row["id"] for row in results}
+        selected = {row.get("role"): row.get("id") for row in results}
         self.assertIn(selected["user"], {user_copy, user_duplicate})
         self.assertIn(selected["assistant"], {assistant_copy, assistant_duplicate})
 
@@ -281,11 +282,13 @@ class KhalaStoreTest(unittest.TestCase):
         self.store.add_event(session, "assistant", "n" * 600)
 
         graph = self.store.graph(hit_id, limit=1)
-        attached = self.store.attach_neighbors([{"id": hit_id, "session_id": session}], per_hit=1)
+        attached = self.store.attach_neighbors(
+            [RecallHit(id=hit_id, session_id=session)], per_hit=1
+        )
 
         self.assertEqual(len(graph["event"]["content"]), 200)
         self.assertEqual(len(graph["same_session"][0]["content"]), 500)
-        self.assertEqual(len(attached[0]["adjacent"][0]["content"]), 500)
+        self.assertEqual(len(attached[0].get("adjacent", [])[0]["content"]), 500)
 
     def test_attach_neighbors_excludes_hit_and_centers_window(self):
         session = self.store.add_session("test")
@@ -294,21 +297,21 @@ class KhalaStoreTest(unittest.TestCase):
         hit_id = self.store.add_event(session, "user", "alpha")
         self.store.add_event(session, "assistant", "after-a")
         self.store.add_event(session, "assistant", "after-b")
-        hits = [{"id": hit_id, "session_id": session, "role": "user", "content": "alpha"}]
+        hits = [RecallHit(id=hit_id, session_id=session, role="user", content="alpha")]
 
         # Contiguous window centered on the hit, hit itself excluded.
-        adj = self.store.attach_neighbors(hits)[0]["adjacent"]
+        adj = self.store.attach_neighbors(hits)[0].get("adjacent", [])
         self.assertEqual([a["content"] for a in adj], ["before-b", "after-a", "after-b"])
         self.assertNotIn("alpha", [a["content"] for a in adj])
 
         # A larger window still excludes the hit.
-        wide = self.store.attach_neighbors(hits, per_hit=4)[0]["adjacent"]
+        wide = self.store.attach_neighbors(hits, per_hit=4)[0].get("adjacent", [])
         self.assertNotIn("alpha", [a["content"] for a in wide])
         self.assertEqual(len(wide), 4)
 
     def test_attach_neighbors_handles_missing_session(self):
-        hits = [{"id": "x", "role": "user", "content": "alpha"}]
-        self.assertEqual(self.store.attach_neighbors(hits)[0]["adjacent"], [])
+        hits = [RecallHit(id="x", role="user", content="alpha")]
+        self.assertEqual(self.store.attach_neighbors(hits)[0].get("adjacent"), [])
 
     def test_graph_and_attach_use_canonical_order_with_interleaved_rowids(self):
         target_session = self.store.add_session("target")
@@ -334,13 +337,14 @@ class KhalaStoreTest(unittest.TestCase):
 
         graph = self.store.graph("target-m", limit=4)
         attached = self.store.attach_neighbors(
-            [{"id": "target-m", "session_id": target_session}], per_hit=4
+            [RecallHit(id="target-m", session_id=target_session)], per_hit=4
         )
 
         expected_ids = ["target-before", "target-a", "target-z", "target-after"]
         expected_content = ["before", "tie-before", "tie-after", "after"]
         self.assertEqual([row["id"] for row in graph["same_session"]], expected_ids)
-        self.assertEqual([row["content"] for row in attached[0]["adjacent"]], expected_content)
+        self.assertEqual([row["content"] for row in attached[0].get("adjacent",[])],
+             expected_content)
 
     def test_adjacency_keyset_queries_use_composite_index(self):
         session = self.store.add_session("test")
@@ -399,7 +403,7 @@ class KhalaStoreTest(unittest.TestCase):
                     [{"id": hit_id, "session_id": session}], per_hit=3
                 )
                 graph_ids = [row["id"] for row in graph["same_session"]]
-                attached_content = [row["content"] for row in attached[0]["adjacent"]]
+                attached_content = [row["content"] for row in attached[0].get("adjacent", [])]
 
                 self.assertEqual(graph_ids, expected_ids)
                 self.assertEqual(len(attached_content), 3)
@@ -416,10 +420,10 @@ class KhalaStoreTest(unittest.TestCase):
         self.store.add_event(spoofed_session, "assistant", "spoofed after")
 
         attached = self.store.attach_neighbors(
-            [{"id": hit_id, "session_id": spoofed_session}], per_hit=3
+            [RecallHit(id=hit_id, session_id=spoofed_session)], per_hit=3
         )
 
-        self.assertEqual(attached[0]["adjacent"], [])
+        self.assertEqual(attached[0].get("adjacent"), [])
 
     def test_graph_and_attach_exclude_archived_sessions(self):
         session = self.store.add_session("archived")
@@ -432,10 +436,10 @@ class KhalaStoreTest(unittest.TestCase):
         self.store.db.commit()
 
         graph = self.store.graph(hit_id)
-        attached = self.store.attach_neighbors([{"id": hit_id, "session_id": session}])
+        attached = self.store.attach_neighbors([RecallHit(id=hit_id, session_id=session)])
 
         self.assertFalse(graph["found"])
-        self.assertEqual(attached[0]["adjacent"], [])
+        self.assertEqual(attached[0].get("adjacent"), [])
 
     def test_archived_sessions_returns_sorted_content_free_tombstones(self):
         active = self.store.add_session("active")

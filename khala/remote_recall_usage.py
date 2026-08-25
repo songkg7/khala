@@ -2,28 +2,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any
 
+from khala.pg_cursor import Cursor
 from khala.usage_timestamps import EVENT_TIMESTAMP_PATTERN
 
 if TYPE_CHECKING:
     from khala.recall_usage import RecallUsage, UsageQuery, UsageReport
-
-
-class Cursor(Protocol):
-    """Small transaction-owned boundary for psycopg cursors and test doubles."""
-
-    def execute(
-        self, statement: str, parameters: Mapping[str, object] | None = None
-    ) -> Cursor: ...
-
-    def executemany(
-        self, statement: str, parameters: Sequence[Mapping[str, object]]
-    ) -> object: ...
-
-    def fetchone(self) -> Mapping[str, Any] | Sequence[object] | None: ...
-
-    def fetchall(self) -> Sequence[Mapping[str, Any]]: ...
 
 
 RECALL_REQUESTS_SCHEMA_SQL = """

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
@@ -25,7 +25,15 @@ CONFIG_DIR = Path(os.environ.get("KHALA_CONFIG_DIR", Path.home() / ".khala"))
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 
-def _default_config() -> dict[str, Any]:
+class KhalaConfig(TypedDict, total=False):
+    """Persisted khala.json document (all keys optional for legacy files)."""
+
+    workspaces: list[str]
+    remote: str | None
+    workspace_git_common_dirs: dict[str, str]
+
+
+def _default_config() -> KhalaConfig:
     return {"workspaces": [], "remote": None}
 
 
@@ -34,7 +42,7 @@ def ensure_config_directory() -> None:
     ensure_private_directory(CONFIG_DIR)
 
 
-def load_config() -> dict[str, Any]:
+def load_config() -> KhalaConfig:
     ensure_config_directory()
     if not CONFIG_FILE.is_file():
         return _default_config()
@@ -46,17 +54,20 @@ def load_config() -> dict[str, Any]:
             return _default_config()
     except (json.JSONDecodeError, OSError):
         return _default_config()
-    workspaces = data.get("workspaces")
+    config = KhalaConfig(**data)
+    workspaces = config.get("workspaces")
     if not isinstance(workspaces, list):
         workspaces = []
-    data["workspaces"] = [str(w) for w in workspaces]
-    git_common_dirs = normalize_git_common_dirs(data.get(WORKSPACE_GIT_COMMON_DIRS_KEY))
+    config["workspaces"] = [str(w) for w in workspaces]
+    git_common_dirs = normalize_git_common_dirs(
+        config.get(WORKSPACE_GIT_COMMON_DIRS_KEY)
+    )
     if git_common_dirs:
-        data[WORKSPACE_GIT_COMMON_DIRS_KEY] = git_common_dirs
+        config[WORKSPACE_GIT_COMMON_DIRS_KEY] = git_common_dirs  # type: ignore[literal-required]
     else:
-        data.pop(WORKSPACE_GIT_COMMON_DIRS_KEY, None)
-    data["remote"] = data.get("remote")
-    return data
+        config.pop(WORKSPACE_GIT_COMMON_DIRS_KEY, None)  # type: ignore[misc]
+    config["remote"] = config.get("remote")
+    return config
 
 
 def get_remote_dsn() -> str | None:
@@ -69,7 +80,7 @@ def is_connected() -> bool:
     return bool(get_remote_dsn())
 
 
-def save_config(data: dict[str, Any]) -> None:
+def save_config(data: KhalaConfig) -> None:
     serialized = dict(data)
     workspaces = serialized.get("workspaces")
     workspace_paths = (
@@ -181,7 +192,7 @@ def config_segments(key: str) -> list[str | int]:
     return parts
 
 
-def config_get(data: dict, key: str) -> Any:
+def config_get(data: dict[str, Any], key: str) -> Any:
     cur: Any = data
     for seg in config_segments(key):
         if isinstance(cur, dict) and isinstance(seg, str) and seg in cur:
@@ -193,7 +204,7 @@ def config_get(data: dict, key: str) -> Any:
     return cur
 
 
-def config_set(data: dict, key: str, value: Any) -> None:
+def config_set(data: dict[str, Any], key: str, value: Any) -> None:
     segs = config_segments(key)
     cur: Any = data
     for seg in segs[:-1]:

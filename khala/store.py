@@ -35,6 +35,7 @@ from khala.local_recall_usage import (
 from khala.local_search import lexical_search, sample_events
 from khala.models import ArchivedSession, SyncEvent
 from khala.outbox import OutboxClaim, OutboxRepository, migrate_outbox
+from khala.recall_results import RecallHit
 from khala.recall_usage import (
     RecallMode,
     UsageQuery,
@@ -576,7 +577,7 @@ class Store:
         limit: int = 5,
         *,
         role: RoleFilter | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[RecallHit]:
         """Read-only lexical search used by evaluation and recall."""
         return lexical_search(self.db, query, limit, role=role)
 
@@ -607,14 +608,14 @@ class Store:
         requested_mode: RecallMode = "lexical",
         user: User | None = None,
         role: RoleFilter | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[RecallHit]:
         """Search and record returned events as real product usage."""
         validated_limit = validate_recall_limit(limit)
         validated_mode = validate_recall_mode(requested_mode)
         validated_role = validate_role_filter(role)
         rows = self.search(query, validated_limit, role=validated_role)
         self._record_recall_usage(
-            (str(row["id"]) for row in rows),
+            (str(row.get("id")) for row in rows),
             requested_mode=validated_mode,
             effective_mode="lexical",
             requested_limit=validated_limit,
@@ -839,8 +840,8 @@ class Store:
         )
 
     def attach_neighbors(
-        self, hits: list[dict[str, Any]], per_hit: int = 3
-    ) -> list[dict[str, Any]]:
+        self, hits: list[RecallHit], per_hit: int = 3
+    ) -> list[RecallHit]:
         """Enrich recall hits with same-session adjacent context (Nerazim).
 
         For each hit, `adjacent` is a contiguous conversational window around

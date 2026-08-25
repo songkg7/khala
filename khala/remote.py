@@ -16,7 +16,10 @@ from psycopg.rows import dict_row
 
 from khala.embedding_pipeline import ChunkEmbeddingRow
 from khala.embeddings import MODEL, PROVIDER
+from khala.identity import User
 from khala.models import ArchivedSession
+from khala.pg_cursor import Cursor
+from khala.recall_results import RecallHit
 from khala.recall_usage import (
     UsageQuery,
     UsageReport,
@@ -67,9 +70,9 @@ def recall_by_mode(
     mode: str,
     limit: int = 5,
     *,
-    user: Any | None = None,
+    user: User | None = None,
     role: RoleFilter | None = None,
-) -> list[dict[str, Any]]:
+) -> list[RecallHit]:
     """Dispatch remote recall by mode; hybrid falls back to lexical automatically."""
     validated_mode = validate_recall_mode(mode)
     validated_limit = validate_recall_limit(limit)
@@ -94,7 +97,7 @@ def search_by_mode(
     limit: int = 5,
     *,
     role: RoleFilter | None = None,
-) -> list[dict[str, Any]]:
+) -> list[RecallHit]:
     """Dispatch read-only remote search without usage-stat mutations."""
     validated_mode = validate_recall_mode(mode)
     validated_limit = validate_recall_limit(limit)
@@ -122,7 +125,7 @@ class RemoteStore(RemoteRecallMixin):
         self.dsn = dsn
 
     @contextlib.contextmanager
-    def _cursor(self) -> Iterator[Any]:
+    def _cursor(self) -> Iterator[Cursor]:
         conn = psycopg.connect(self.dsn)
         try:
             with conn.cursor(row_factory=dict_row) as cur:
@@ -132,7 +135,7 @@ class RemoteStore(RemoteRecallMixin):
             conn.close()
 
     @contextlib.contextmanager
-    def _read_cursor(self) -> Iterator[Any]:
+    def _read_cursor(self) -> Iterator[Cursor]:
         """Own a PostgreSQL transaction that cannot perform accidental writes."""
         conn = psycopg.connect(self.dsn)
         try:

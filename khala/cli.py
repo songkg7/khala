@@ -506,7 +506,7 @@ def main(argv: list[str] | None = None) -> int:
                 registration = remove_workspace(args.path)
                 output({"ok": True, "workspaces": list(registration.workspaces)})
             elif args.ws_action == "list":
-                output({"workspaces": config_data["workspaces"]})
+                output({"workspaces": config_data.get("workspaces")})
         elif args.command == "compat-check":
             from khala.compat import compat_check
 
@@ -560,7 +560,7 @@ def main(argv: list[str] | None = None) -> int:
                     "api_key_set": api_key_set(),
                 }
                 if config_data.get("remote"):
-                    shown["remote"] = mask_dsn(str(config_data["remote"]))
+                    shown["remote"] = mask_dsn(str(config_data.get("remote")))
                 output(shown)
             elif action == "set":
                 value: Any = args.value
@@ -568,7 +568,7 @@ def main(argv: list[str] | None = None) -> int:
                     value = json.loads(args.value)
                 except json.JSONDecodeError:
                     pass  # keep as plain string
-                config_set(config_data, args.key, value)
+                config_set(config_data, args.key, value)  # type: ignore[arg-type]
                 save_config(config_data)
                 output(
                     {
@@ -578,7 +578,7 @@ def main(argv: list[str] | None = None) -> int:
                     }
                 )
             elif action == "get":
-                value = config_get(config_data, args.key)
+                value = config_get(config_data, args.key)  # type: ignore[arg-type]
                 output(public_config_value(args.key, value))
             else:
                 raise ValueError(f"unsupported config action: {action}")

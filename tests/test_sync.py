@@ -750,8 +750,8 @@ class KhalaCrossAgentCompatTest(unittest.TestCase):
         self.assertEqual(self.store.status()["sessions"], 2)
 
         hits = self.store.recall("cross-agent recall target")
-        self.assertTrue(any("cross-agent" in h["content"] for h in hits))
-        self.assertTrue(any(h["agent"] == "codex" for h in hits))
+        self.assertTrue(any("cross-agent" in str(h.get("content")) for h in hits))
+        self.assertTrue(any(h.get("agent") == "codex" for h in hits), "codex hit expected")
 
         hermes_sid = self.store.get_session_id("hermes", "sess-1")
         codex_sid = self.store.get_session_id("codex", "rollout-codex-1")

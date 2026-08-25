@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import importlib
 import json
-from collections.abc import Iterable, Mapping
-from typing import Any, cast
+from collections.abc import Callable, Iterable, Mapping
+from typing import Any
 
 
-def load_adapter(spec: str):
+def load_adapter(spec: str) -> Callable[..., Any]:
     """Load an adapter callable from MODULE:CALLABLE string."""
     module_name, separator, attribute = spec.partition(":")
     if not separator:
@@ -28,7 +28,6 @@ def read_jsonl(stream: Iterable[str]) -> Iterable[Mapping[str, Any]]:
         yield value
 
 
-# ponytail: cast due to dynamic load. Consider typed protocols for strict adapters.
 def ingest_events(
     adapter_spec: str | None,
     source: str | None,
@@ -37,7 +36,7 @@ def ingest_events(
     """Dispatch to adapter or fall back to JSONL stdin."""
     if adapter_spec:
         adapter = load_adapter(adapter_spec)
-        return cast(Iterable[Mapping[str, Any]], adapter(source))
+        return adapter(source)
     if source:
         raise ValueError("source requires --adapter")
     return read_jsonl(stdin)
