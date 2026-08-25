@@ -378,6 +378,16 @@ def backfill_remote_identifiers(cursor: Cursor, limit: int) -> int:
         raise RuntimeError("identifier backfill returned duplicate events")
     for event_id in event_ids:
         index_remote_event_identifiers(cursor, event_id)
+    cursor.execute(
+        """
+        DELETE FROM identifiers identifier
+        WHERE NOT EXISTS (
+            SELECT 1 FROM event_identifiers reference
+            WHERE reference.kind = identifier.kind
+              AND reference.value = identifier.value
+        )
+        """
+    )
     return len(event_ids)
 
 

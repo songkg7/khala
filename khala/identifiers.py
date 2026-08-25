@@ -5,7 +5,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-EXTRACTOR_VERSION = 1
+EXTRACTOR_VERSION = 3
 MAX_IDENTIFIERS_PER_EVENT = 64
 MAX_SCANNED_CONTENT_BYTES = 1_048_576
 
@@ -39,6 +39,7 @@ _COMMON_FILENAMES = frozenset(
 _TOKEN_PUNCTUATION = frozenset("._-/\\:+@~#%")
 _WRAPPING_DELIMITERS = frozenset("\"'`<>[](){}=,;|")
 _TRAILING_PROSE_PUNCTUATION = ".,;!?:"
+_TRAILING_ESCAPES = re.compile(r"(?:\\[nrt]|/n)+$")
 _FORBIDDEN_IDENTIFIER_CHARACTERS = frozenset('<>"|?*#')
 
 
@@ -234,7 +235,18 @@ def _is_token_delimiter(character: str) -> bool:
 
 
 def _clean_extracted_candidate(candidate: str) -> str:
-    return candidate.rstrip(_TRAILING_PROSE_PUNCTUATION)
+    # Log text embeds literal escapes ("-20\n"); without this they survive the
+    # backslash->slash path normalization as fake files like "-20/n".
+    # Escape and prose-punctuation suffixes combine ("instead\n..."), so strip
+    # both repeatedly until the candidate is stable.
+    cleaned = candidate
+    while True:
+        stripped = _TRAILING_ESCAPES.sub("", cleaned).rstrip(
+            _TRAILING_PROSE_PUNCTUATION
+        )
+        if stripped == cleaned:
+            return cleaned
+        cleaned = stripped
 
 
 def _looks_like_file_token(value: str) -> bool:

@@ -129,7 +129,7 @@ class RemoteIdentifierIndexTest(unittest.TestCase):
         self.assertIn("ON CONFLICT(event_id) DO UPDATE", str(state.args[0]))
         self.assertEqual(state.args[1]["content_sha256"], extraction.content_sha256)
         self.assertIs(state.args[1]["truncated"], True)
-        self.assertEqual(state.args[1]["extractor_version"], 1)
+        self.assertEqual(state.args[1]["extractor_version"], EXTRACTOR_VERSION)
 
         self.assertEqual(cursor.executemany.call_count, 2)
         dimensions, references = cursor.executemany.call_args_list
@@ -308,8 +308,8 @@ class RemoteIdentifierBackfillTest(unittest.TestCase):
             index_event.call_args_list,
             [call(cursor, "event-1"), call(cursor, "event-2")],
         )
-        statement, parameters = cursor.execute.call_args.args
-        normalized = _normalized(statement)
+        first_statement, parameters = cursor.execute.call_args_list[0].args
+        normalized = _normalized(first_statement)
         self.assertIn("(to_jsonb(session)->>'archived_at') IS NULL", normalized)
         self.assertIn("state.event_id IS NULL", normalized)
         self.assertIn("state.extractor_version <> %(extractor_version)s", normalized)
@@ -317,7 +317,7 @@ class RemoteIdentifierBackfillTest(unittest.TestCase):
         self.assertIn("ORDER BY event.created_at, event.id", normalized)
         self.assertIn("LIMIT %(limit)s", normalized)
         self.assertIn("FOR UPDATE OF event SKIP LOCKED", normalized)
-        self.assertEqual(parameters, {"extractor_version": 1, "limit": 20})
+        self.assertEqual(parameters, {"extractor_version": EXTRACTOR_VERSION, "limit": 20})
 
     def test_limit_validation_is_exact_and_precedes_sql(self) -> None:
         for limit in (True, False, 0, -1, 1001, 1.0, "10"):
@@ -604,7 +604,7 @@ class RemoteIdentifierCoverageTest(unittest.TestCase):
         self.assertIn("extractor_version = %(extractor_version)s", statement)
         self.assertIn("sha256(convert_to(content, 'UTF8'))", statement)
         self.assertIn("WHERE is_current AND truncated", statement)
-        self.assertEqual(parameters, {"extractor_version": 1})
+        self.assertEqual(parameters, {"extractor_version": EXTRACTOR_VERSION})
 
     def test_coverage_accepts_zero_positional_row(self) -> None:
         cursor = MagicMock()

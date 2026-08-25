@@ -147,7 +147,7 @@ class ExtractFileIdentifiersTest(unittest.TestCase):
 
         result = extract_file_identifiers(content)
 
-        self.assertEqual(EXTRACTOR_VERSION, 1)
+        self.assertEqual(EXTRACTOR_VERSION, 3)
         self.assertEqual(
             result.identifiers,
             (
@@ -174,6 +174,21 @@ class ExtractFileIdentifiersTest(unittest.TestCase):
         result = extract_file_identifiers(content)
 
         self.assertEqual(result.identifiers, ())
+        self.assertFalse(result.truncated)
+
+    def test_strips_trailing_literal_escapes_before_path_normalization(self) -> None:
+        # Log text embeds literal "\n"; it must not become a fake "/n" path.
+        result = extract_file_identifiers(
+            "retries=120\\n rows=-20\\n CRLF.\\r\\n module.ptr ok src/x.py"
+        )
+
+        self.assertEqual(
+            result.identifiers,
+            (
+                FileIdentifier("module.ptr", "module.ptr", 1),
+                FileIdentifier("src/x.py", "x.py", 1),
+            ),
+        )
         self.assertFalse(result.truncated)
 
     def test_understands_wrappers_prose_punctuation_and_dotfiles(self) -> None:

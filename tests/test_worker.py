@@ -70,6 +70,10 @@ class FakeRemote:
             raise self.complete_error
         self.completed.append((embeddings, jobs))
 
+    def backfill_identifiers(self, limit: int = 200) -> int:
+        self.calls.append("backfill_identifiers")
+        return 0
+
 
 class WorkerReliabilityTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -341,6 +345,20 @@ class WorkerReliabilityTest(unittest.TestCase):
         self.assertEqual(result["embedded"], ["event-1"])
         self.assertNotIn("embed me", repr(result))
 
+    def test_backfill_failure_does_not_flip_a_healthy_run_to_error(self):
+        remote = FakeRemote()
+        remote.backfill_identifiers = Mock(side_effect=RuntimeError("remote down"))
+
+        with (
+            patch("khala.worker._lock_conn", return_value=Mock()),
+            patch("khala.worker.RemoteStore", return_value=remote),
+        ):
+            result = run_worker(self.db_path, "postgresql://example/db")
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["identifiers_remote_backfilled"], 0)
+        self.assertIn("remote down", result["identifiers_backfill_error"])
+
     def test_poison_embedding_role_is_deferred_without_api_call(self):
         remote = FakeRemote()
         remote.jobs = [self._job(role="tool")]
@@ -484,8 +502,10 @@ class WorkerReliabilityTest(unittest.TestCase):
             [
                 "ensure_schema",
                 "archive_sessions",
+                "backfill_identifiers",
                 "ensure_schema",
                 "archive_sessions",
+                "backfill_identifiers",
             ],
         )
 

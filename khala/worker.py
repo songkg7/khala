@@ -15,6 +15,7 @@ from khala.embedding_pipeline import (
 )
 from khala.embeddings import DIMENSIONS, EMBED_ROLES, MODEL, PROVIDER, embed
 from khala.errors import public_error_message
+from khala.local_identifiers import backfill_local_identifiers
 from khala.models import ArchivedSession
 from khala.outbox import OutboxClaim
 from khala.recall_results import is_tool_call_summary
@@ -48,6 +49,8 @@ class RemoteWorkerStore(Protocol):
         self, embeddings: list[ChunkEmbeddingRow], jobs: list[dict[str, Any]]
     ) -> None: ...
 
+    def backfill_identifiers(self, limit: int = 200) -> int: ...
+
 
 class OutboxPushError(RuntimeError):
     """A remote push failed after its local retry state was persisted."""
@@ -58,6 +61,7 @@ class EmbeddingJobError(RuntimeError):
 
 
 WORKER_LOG_MAX_BYTES = 1_000_000
+_IDENTIFIER_BACKFILL_BATCH = 200
 
 
 def _failure_reason(error: BaseException) -> str:
@@ -335,6 +339,22 @@ def run_worker(
             result["pushed"].extend(pushed["pushed"])
             # A claim can be all missing/poison rows; keep draining within the pass budget.
         result["embedded"] = process_embedding_jobs(remote)["embedded"]
+        # Bounded identifier backfill keeps the file evidence graph converging
+        # without a dedicated scheduler; the CLI backfill remains for bulk runs.
+        # Best-effort: a backfill failure must not flip a healthy sync into an
+        # errored worker run.
+        try:
+            with store.db:
+                result["identifiers_backfilled"] = backfill_local_identifiers(
+                    store.db, _IDENTIFIER_BACKFILL_BATCH
+                )
+                result["identifiers_remote_backfilled"] = remote.backfill_identifiers(
+                    _IDENTIFIER_BACKFILL_BATCH
+                )
+        except Exception as error:
+            result["identifiers_backfilled"] = 0
+            result["identifiers_remote_backfilled"] = 0
+            result["identifiers_backfill_error"] = _failure_reason(error)
         store.mark_worker_finished(active_run_id, "ok")
         return result
     except Exception as error:
