@@ -19,6 +19,7 @@ class FakeHermesConfig:
         self.path = path
         self.hooks = hooks
         self.set_calls = 0
+        self.plugins: Any = {}
 
     def run(self, executable: Path, *arguments: str) -> str:
         self.assert_executable(executable)
@@ -28,6 +29,16 @@ class FakeHermesConfig:
             return json.dumps(self.hooks)
         if arguments[:4] == ("config", "set", "--force", "hooks"):
             self.hooks = json.loads(arguments[4])
+            self.set_calls += 1
+            return "updated"
+        if arguments == ("config", "get", "plugins", "--json"):
+            return json.dumps(self.plugins)
+        if arguments[:4] == ("config", "set", "--force", "plugins.enabled"):
+            if not isinstance(json.loads(arguments[4]), list):
+                raise AssertionError("plugins.enabled must be set as a JSON list")
+            plugins = dict(self.plugins) if isinstance(self.plugins, dict) else {}
+            plugins["enabled"] = json.loads(arguments[4])
+            self.plugins = plugins
             self.set_calls += 1
             return "updated"
         raise AssertionError(f"unexpected Hermes command: {arguments}")
@@ -76,7 +87,7 @@ class HermesHookInstallerTest(unittest.TestCase):
 
         self.assertTrue(first.changed)
         self.assertFalse(second.changed)
-        self.assertEqual(fake.set_calls, 1)
+        self.assertEqual(fake.set_calls, 2)  # one hooks write + one plugin enable
         self.assertEqual(fake.hooks["outbound"], outbound)
         self.assertEqual(fake.hooks["post_llm_call"][0], other)
         for event in HERMES_HOOK_EVENTS:
@@ -97,8 +108,32 @@ class HermesHookInstallerTest(unittest.TestCase):
                 "events": list(HERMES_HOOK_EVENTS),
                 "restart_required": True,
                 "trust_required": True,
+                "plugin": str(self.config_path.parent / "plugins" / "khala"),
             },
         )
+
+    def test_install_copies_and_enables_plugin_idempotently(self) -> None:
+        fake = FakeHermesConfig(
+            self.config_path,
+            {"post_llm_call": [{"command": "khala hook hermes", "timeout": 30}]},
+        )
+        fake.plugins = {"enabled": ["observability/langfuse"]}
+
+        with patch("khala.hermes_hooks._run_hermes", side_effect=fake.run):
+            first = install_hermes_hooks(self.khala, hermes_executable=self.hermes)
+            second = install_hermes_hooks(self.khala, hermes_executable=self.hermes)
+
+        # plugin files copied next to config (isolated hermes home in tests)
+        plugin_dir = self.config_path.parent / "plugins" / "khala"
+        self.assertTrue((plugin_dir / "plugin.yaml").is_file())
+        self.assertTrue((plugin_dir / "__init__.py").is_file())
+        self.assertEqual(first.plugin_path, plugin_dir)
+        # enabled list gained khala exactly once, existing entries preserved
+        self.assertEqual(fake.plugins["enabled"], ["observability/langfuse", "khala"])
+        # second install: no further writes at all
+        self.assertFalse(second.changed)
+        set_calls_after_first = 1
+        self.assertLessEqual(fake.set_calls, set_calls_after_first + 1)
 
     def test_invalid_hook_shape_fails_before_write(self) -> None:
         for hooks in ([], {"post_llm_call": {}}, {"post_llm_call": ["bad"]}):
@@ -109,7 +144,7 @@ class HermesHookInstallerTest(unittest.TestCase):
                     self.assertRaises((TypeError, ValueError)),
                 ):
                     install_hermes_hooks(self.khala, hermes_executable=self.hermes)
-                self.assertEqual(fake.set_calls, 0)
+                self.assertEqual(fake.set_calls, 1)  # plugin enable only, no hooks write
 
     def test_missing_or_non_executable_binary_fails_before_config_read(self) -> None:
         with self.assertRaisesRegex(OSError, "does not exist"):

@@ -26,10 +26,12 @@ packages = [
     "khala",
     "khala.adapters",
     "khala.evaluation",
+    "khala.plugins",
 ]
 
 [tool.setuptools.package-data]
 "khala.evaluation" = ["*.json"]
+"khala.plugins" = ["hermes/*"]
 
 [tool.ruff]
 line-length = 100

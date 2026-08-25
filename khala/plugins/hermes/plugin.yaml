@@ -1,0 +1,8 @@
+name: khala
+version: "1.0.0"
+description: "Khala session capture for Hermes — records TUI/CLI/gateway turns into Khala via lifecycle plugin hooks (no shell-hook registration needed)."
+author: haril song
+hooks:
+  - post_llm_call
+  - on_session_end
+  - on_session_reset

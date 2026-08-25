@@ -11,15 +11,28 @@ from typing import Any
 
 HERMES_HOOK_EVENTS = ("post_llm_call", "on_session_end", "on_session_reset")
 HOOK_TIMEOUT_SECONDS = 30
+PLUGIN_NAME = "khala"
+PLUGIN_SOURCE_DIR = Path(__file__).resolve().parent / "plugins" / "hermes"
+
+
+def install_hermes_plugin(hermes_home: Path | None = None) -> Path:
+    """Copy the bundled Hermes plugin into ~/.hermes/plugins/khala/."""
+    plugins_dir = (hermes_home or Path.home() / ".hermes") / "plugins"
+    target = plugins_dir / PLUGIN_NAME
+    if target.is_dir():
+        shutil.rmtree(target)
+    shutil.copytree(PLUGIN_SOURCE_DIR, target)
+    return target
 
 
 @dataclass(frozen=True)
 class HermesHookInstallResult:
     path: Path
     changed: bool
+    plugin_path: Path | None = None
 
     def public_report(self) -> dict[str, Any]:
-        return {
+        report: dict[str, Any] = {
             "integration": "hermes",
             "status": "installed" if self.changed else "already_installed",
             "config_file": str(self.path),
@@ -27,6 +40,36 @@ class HermesHookInstallResult:
             "restart_required": True,
             "trust_required": True,
         }
+        if self.plugin_path is not None:
+            report["plugin"] = str(self.plugin_path)
+        return report
+
+
+def _enable_plugin(hermes: Path) -> bool:
+    """Add the plugin to plugins.enabled; returns True when config changed."""
+    try:
+        raw = _run_hermes(hermes, "config", "get", "plugins", "--json")
+        plugins = json.loads(raw) if raw else {}
+    except (RuntimeError, json.JSONDecodeError):
+        plugins = {}
+    if not isinstance(plugins, dict):
+        plugins = {}
+    enabled = plugins.get("enabled")
+    if not isinstance(enabled, list):
+        enabled = []
+    if PLUGIN_NAME in enabled:
+        return False
+    enabled.append(PLUGIN_NAME)
+    plugins["enabled"] = enabled
+    _run_hermes(
+        hermes,
+        "config",
+        "set",
+        "--force",
+        "plugins.enabled",
+        json.dumps(enabled),
+    )
+    return True
 
 
 def install_hermes_hooks(
@@ -43,6 +86,8 @@ def install_hermes_hooks(
         else _validated_executable(hermes_executable, "hermes")
     )
     config_path = Path(_run_hermes(hermes, "config", "path")).expanduser().absolute()
+    plugin_path = install_hermes_plugin(config_path.parent)
+    _enable_plugin(hermes)
     hooks = _load_hooks(hermes)
     changed = _merge_hooks(hooks, _handler(khala))
     if changed:
@@ -56,7 +101,7 @@ def install_hermes_hooks(
         )
         if _load_hooks(hermes) != hooks:
             raise RuntimeError("Hermes hook configuration verification failed")
-    return HermesHookInstallResult(config_path, changed)
+    return HermesHookInstallResult(config_path, changed, plugin_path=plugin_path)
 
 
 def _resolve_executable(name: str) -> Path:
