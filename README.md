@@ -438,8 +438,10 @@ instructions.
 
 In Khalai mode, automatic recall uses hybrid search. The redacted prompt is
 therefore sent to the configured embedding provider (OpenRouter by default)
-when semantic search is available; otherwise hybrid recall falls back to local
-lexical matching.
+when semantic search is available. If the embedding provider is unavailable,
+hybrid recall uses lexical matching in the remote store. If the remote store
+itself cannot be reached or is shutting down, automatic recall falls back to
+Nerazim's local lexical matching.
 
 ## Hermes hook (auto record every turn)
 

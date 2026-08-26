@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import psycopg
 from khala.codex_context import MAX_RECALL_CONTEXT_CHARS, format_recall_context
 from khala.codex_recall import recall_for_prompt
 from khala.identity import User
@@ -203,6 +204,112 @@ class CodexRecallServiceTest(unittest.TestCase):
             role="assistant",
         )
         remote.attach_neighbors.assert_called_once_with(hits, per_hit=3)
+        self.store.recall.assert_not_called()
+        self.store.attach_neighbors.assert_not_called()
+
+    def test_remote_connection_failure_falls_back_to_local_recall(self) -> None:
+        local_hits = [{"id": "local-event", "session_id": "local-session"}]
+        enriched = [{**local_hits[0], "adjacent": []}]
+        self.store.recall.return_value = local_hits
+        self.store.attach_neighbors.return_value = enriched
+
+        with (
+            patch(
+                "khala.config.get_remote_dsn",
+                return_value="postgresql://example.invalid/khala",
+            ),
+            patch("khala.codex_recall.resolve_user", return_value=self.user),
+            patch("khala.remote.RemoteStore") as remote_store,
+            patch("khala.remote.recall_by_mode") as recall,
+        ):
+            remote = remote_store.return_value
+            remote.ensure_schema.side_effect = psycopg.OperationalError(
+                "connection refused"
+            )
+
+            result = recall_for_prompt(
+                self.store,
+                "deployment",
+                cwd=self.cwd,
+                limit=3,
+                role="assistant",
+            )
+
+        self.assertEqual(result, enriched)
+        remote.archive_sessions.assert_not_called()
+        recall.assert_not_called()
+        self.store.recall.assert_called_once_with(
+            "deployment",
+            3,
+            requested_mode="hybrid",
+            user=self.user,
+            role="assistant",
+        )
+        self.store.attach_neighbors.assert_called_once_with(local_hits, per_hit=3)
+
+    def test_remote_shutdown_during_recall_falls_back_to_local_recall(self) -> None:
+        local_hits = [{"id": "local-event", "session_id": "local-session"}]
+        enriched = [{**local_hits[0], "adjacent": []}]
+        self.store.recall.return_value = local_hits
+        self.store.attach_neighbors.return_value = enriched
+
+        with (
+            patch(
+                "khala.config.get_remote_dsn",
+                return_value="postgresql://example.invalid/khala",
+            ),
+            patch("khala.codex_recall.resolve_user", return_value=self.user),
+            patch("khala.remote.RemoteStore") as remote_store,
+            patch(
+                "khala.remote.recall_by_mode",
+                side_effect=psycopg.errors.AdminShutdown("server shutting down"),
+            ),
+        ):
+            remote = remote_store.return_value
+
+            result = recall_for_prompt(
+                self.store,
+                "deployment",
+                cwd=self.cwd,
+                limit=3,
+                role="assistant",
+            )
+
+        self.assertEqual(result, enriched)
+        remote.ensure_schema.assert_called_once_with()
+        remote.archive_sessions.assert_called_once_with(
+            self.store.archived_sessions.return_value
+        )
+        self.store.recall.assert_called_once()
+        self.store.attach_neighbors.assert_called_once_with(local_hits, per_hit=3)
+
+    def test_remote_transaction_error_does_not_fall_back_to_local(self) -> None:
+        with (
+            patch(
+                "khala.config.get_remote_dsn",
+                return_value="postgresql://example.invalid/khala",
+            ),
+            patch("khala.codex_recall.resolve_user", return_value=self.user),
+            patch("khala.remote.RemoteStore") as remote_store,
+            patch(
+                "khala.remote.recall_by_mode",
+                side_effect=psycopg.errors.SerializationFailure("retry transaction"),
+            ),
+        ):
+            remote = remote_store.return_value
+
+            with self.assertRaises(psycopg.errors.SerializationFailure):
+                recall_for_prompt(
+                    self.store,
+                    "deployment",
+                    cwd=self.cwd,
+                    limit=3,
+                    role="assistant",
+                )
+
+        remote.ensure_schema.assert_called_once_with()
+        self.store.recall.assert_not_called()
+        self.store.attach_neighbors.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import psycopg
 from khala.codex_hooks import (
     KHALA_HOOK_STATUS_MESSAGE,
     KHALA_RECALL_STATUS_MESSAGE,
@@ -569,6 +570,51 @@ class CodexStopCLIContractTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(stdout, "{}\n")
         self.assertEqual(stderr, "")
+
+    def test_codex_recall_remote_unavailable_uses_local_context(self) -> None:
+        from khala import config
+        from khala.store import Store
+
+        marker = "localfallbackcanary"
+        store = Store(self.database)
+        try:
+            session_id = store.add_session("codex")
+            store.add_event(
+                session_id,
+                "assistant",
+                f"The deployment marker is {marker}",
+            )
+        finally:
+            store.close()
+        config.save_config(
+            {
+                "workspaces": [str(self.workspace.resolve())],
+                "remote": "host=127.0.0.1 port=1 dbname=khala",
+            }
+        )
+
+        with patch(
+            "khala.remote.RemoteStore.ensure_schema",
+            side_effect=psycopg.OperationalError("connection refused"),
+        ):
+            code, stdout, stderr = self._run(
+                "hook",
+                "codex",
+                "--codex-recall",
+                stdin=json.dumps(
+                    {
+                        "hook_event_name": "UserPromptSubmit",
+                        "cwd": str(self.workspace),
+                        "prompt": marker,
+                    }
+                ),
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        response = json.loads(stdout)
+        context = response["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(marker, context)
 
     def test_codex_recall_failure_is_non_blocking_and_redacted(self) -> None:
         from unittest.mock import Mock

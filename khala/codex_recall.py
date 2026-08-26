@@ -2,12 +2,24 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from khala.identity import resolve_user
+import psycopg
+
+from khala.identity import User, resolve_user
 from khala.recall_results import RecallHit
 from khala.recall_usage import validate_recall_limit
 from khala.redact import redact
 from khala.roles import RoleFilter, validate_role_filter
 from khala.store import Store
+
+_REMOTE_UNAVAILABLE_SQLSTATES = frozenset(
+    {
+        "57P01",  # admin shutdown
+        "57P02",  # crash shutdown
+        "57P03",  # cannot connect now
+        "57P04",  # database dropped
+        "57P05",  # idle session timeout
+    }
+)
 
 
 def recall_for_prompt(
@@ -33,15 +45,62 @@ def recall_for_prompt(
 
     dsn = get_remote_dsn()
     if not dsn:
-        hits = store.recall(
+        return _recall_local(
+            store,
             normalized_query,
-            validated_limit,
-            requested_mode="hybrid",
+            limit=validated_limit,
             user=user,
             role=validated_role,
         )
-        return store.attach_neighbors(hits, per_hit=validated_limit)
 
+    try:
+        return _recall_remote(
+            store,
+            dsn,
+            normalized_query,
+            limit=validated_limit,
+            user=user,
+            role=validated_role,
+        )
+    except psycopg.OperationalError as error:
+        if not _is_remote_unavailable(error):
+            raise
+        return _recall_local(
+            store,
+            normalized_query,
+            limit=validated_limit,
+            user=user,
+            role=validated_role,
+        )
+
+
+def _recall_local(
+    store: Store,
+    query: str,
+    *,
+    limit: int,
+    user: User,
+    role: RoleFilter,
+) -> list[RecallHit]:
+    hits = store.recall(
+        query,
+        limit,
+        requested_mode="hybrid",
+        user=user,
+        role=role,
+    )
+    return store.attach_neighbors(hits, per_hit=limit)
+
+
+def _recall_remote(
+    store: Store,
+    dsn: str,
+    query: str,
+    *,
+    limit: int,
+    user: User,
+    role: RoleFilter,
+) -> list[RecallHit]:
     from khala.remote import RemoteStore, recall_by_mode
 
     remote = RemoteStore(dsn)
@@ -49,10 +108,17 @@ def recall_for_prompt(
     remote.archive_sessions(store.archived_sessions())
     hits = recall_by_mode(
         remote,
-        normalized_query,
+        query,
         mode="hybrid",
-        limit=validated_limit,
+        limit=limit,
         user=user,
-        role=validated_role,
+        role=role,
     )
-    return remote.attach_neighbors(hits, per_hit=validated_limit)
+    return remote.attach_neighbors(hits, per_hit=limit)
+
+
+def _is_remote_unavailable(error: psycopg.OperationalError) -> bool:
+    sqlstate = error.sqlstate
+    if sqlstate is None:
+        return True
+    return sqlstate.startswith("08") or sqlstate in _REMOTE_UNAVAILABLE_SQLSTATES
