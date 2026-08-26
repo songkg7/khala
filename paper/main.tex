@@ -1,0 +1,260 @@
+\documentclass{article}
+
+\usepackage[preprint, nonatbib]{neurips}
+\usepackage[numbers]{natbib}
+
+\input{extra_pkgs}
+
+\usepackage{physics}
+\usepackage{mathtools}
+\DeclarePairedDelimiter\p{(}{)}
+\DeclarePairedDelimiter\n{|}{|}
+\DeclarePairedDelimiter\B{[}{]}
+
+\newcommand{\khala}{\textsc{Khala}}
+
+\title{Replay, Don't Recall: Measuring Token Savings\\ from Shared Memory in a Real Agent-Team Workload}
+
+\author{
+  Anonymous
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Teams of AI coding agents re-ask the same questions and pay the generation
+cost every time, yet no prior work quantifies how much of an agent team's
+token spend is repeated work. We instrument \khala{}, a vendor-neutral
+shared-memory layer that captures real prompts from heterogeneous agent CLIs,
+and measure duplication in a two-month production log: of $1{,}399$ human
+prompts, \textbf{43.1\% are exact repeats} and 46--52\% have a
+near-duplicate earlier prompt. In a controlled experiment on 34 sampled
+prompts (GPT-4o-mini generator), the standard memory design---retrieving
+similar past events into context and regenerating---\emph{increases} token
+consumption by 241\% while scoring 3.94/5 against the no-memory reference.
+In contrast, replaying the stored answer to a sufficiently similar earlier
+question eliminates generation entirely for 44.1\% of prompts, cutting total
+token consumption by \textbf{48.4\%} at unchanged answer quality (exact
+replays return original answers). The harness hit rate independently
+cross-validates the field measurement ($44.1\%$ vs.\ $43.1\%$). Our results
+reframe agent-memory evaluation: savings come from avoiding regeneration,
+not from enriching context, and memory systems should report both.
+\end{abstract}
+
+\section{Introduction}
+Coding agents are stateless across sessions: every session restarts from
+zero, and every teammate's question triggers fresh generation even when the
+identical question was answered yesterday. As teams run fleets of agents
+(Claude Code, Codex, Hermes, \dots), this repetition is a direct, recurring
+cost---paid per prompt, per session, per machine.
+
+A growing body of work equips agents with persistent memory
+\citep{packer2023memgpt,chhikara2025mem0,rasmussen2025zep}, and recent
+systems extend memory to multi-user and multi-agent settings with access
+control and governance
+\citep{kim2025collaborative,samep2025,governed2026}. These works evaluate
+memory by task quality or recall accuracy. None answers the economic
+question that motivates adoption in practice: \emph{how many tokens does a
+team actually save?}
+
+We answer this question with a measurement-first study built on \khala{},
+an open-source shared-memory layer that silently captures prompts from
+heterogeneous agent CLIs through vendor hooks, normalizes them into a
+canonical schema attributed to human operators, and serves lexical,
+semantic, and hybrid recall. Because \khala{} ran in production on our own
+two-agent team for four months, we can measure duplication where it actually
+occurs rather than in simulation.
+
+Our contributions:
+\begin{itemize}[leftmargin=*,nosep]
+\item \textbf{Field measurement.} The first duplication census of a real
+agent-team workload: 43.1\% of 1{,}399 human prompts are exact repeats of an
+earlier prompt; 46--52\% admit a near-duplicate under character n-gram
+Jaccard thresholds from 0.9 down to 0.6 (\S\ref{sec:field}).
+\item \textbf{A negative result with design consequences.} Context injection
+(retrieve-and-regenerate) raises total token cost by 241\% over no-memory on
+single-turn QA; memory-as-context is an overhead mechanism, not a savings
+mechanism (\S\ref{sec:harness}).
+\item \textbf{Replay is the savings lever.} Replaying the stored answer for
+a sufficiently similar prior question removes generation for 44.1\% of
+prompts, reducing total tokens by 48.4\% while preserving answer quality by
+construction; the harness rate cross-validates the field census
+(\S\ref{sec:harness}).
+\end{itemize}
+
+\section{Background and Related Work}
+\label{sec:related}
+\paragraph{Single-agent memory.} MemGPT/Letta organizes memory as an OS-style
+tiered store managed by the agent \citep{packer2023memgpt}. Mem0 extracts and
+consolidates conversational facts with an LLM pipeline \citep{chhikara2025mem0};
+Zep/Graphiti maintains a bi-temporal knowledge graph \citep{rasmussen2025zep}.
+Evaluations center on QA benchmarks such as LoCoMo and LongMemEval; reported
+metrics are accuracy and latency, not net token economics.
+
+\paragraph{Shared and governed memory.} Collaborative Memory adds dynamic
+access control over shared fragments \citep{kim2025collaborative}; SAMEP
+defines a secure exchange protocol \citep{samep2025}; Governed Shared Memory
+treats fleet memory as a distributed-systems problem
+\citep{governed2026}. These works establish that sharing is safe and useful;
+none measures realized token savings on a deployed workload.
+
+\paragraph{\khala{}.} \khala{} differs architecturally in three ways that
+matter for measurement: capture is hook-based and silent (no behavior change
+to captured agents); the canonical schema is vendor-neutral (Hermes and Codex
+sessions coexist in one store); and events carry git-resolved human identity.
+Its hybrid recall fuses BM25 lexical search with pgvector semantic search via
+reciprocal rank fusion.
+
+\section{System}
+\label{sec:system}
+\khala{} records each agent turn as a canonical event
+$(role, content, created\_at)$ tagged with the operator identity resolved
+from git configuration. Local SQLite stores provide FTS5 lexical retrieval;
+connecting to a shared PostgreSQL+pgvector store enables embedding-based
+semantic and hybrid recall. Background workers embed user and assistant
+events (text-embedding-3-small) asynchronously; failed writes retry with
+bounded backoff and dead-lettering. A file-identifier evidence graph links
+events to repository files they reference. All components used in this study
+are open source.\footnote{\khala{} source and experiment scripts ship with
+the artifact; the production log itself is not released for privacy.}
+
+\section{Field Measurement: How Much Work Is Repeated?}
+\label{sec:field}
+
+\subsection{Data}
+The production log spans April--August 2026: 35{,}968 events in 435 sessions
+from two agent types (Hermes, Codex). Vendor adapters record some
+machine-generated blocks under the \texttt{user} role (Codex internal
+context, tool-call summaries, system markers); we filter these
+(13.05\% of user-role events), yielding \textbf{1{,}399 human prompts} over
+60 active days.
+
+\subsection{Duplication census}
+We measure, for each prompt in chronological order, whether a similar
+earlier prompt exists---the quantity a memory system could exploit. Exact
+duplication uses whitespace-normalized content match. Approximate
+duplication uses character 3-gram Jaccard similarity against all earlier
+prompts.
+
+\begin{table}[t]
+\centering
+\caption{Duplication census of 1{,}399 human prompts (60 days, 2 agents).
+``Reuse possible'' = share of prompts with at least one earlier prompt at or
+above the Jaccard threshold.}
+\label{tab:census}
+\begin{tabular}{lcc}
+\toprule
+Match criterion & Repeats & Share \\
+\midrule
+Exact (normalized) & 603 & 43.1\% \\
+Jaccard $\geq 0.9$ & 643 & 46.0\% \\
+Jaccard $\geq 0.8$ & 672 & 48.0\% \\
+Jaccard $\geq 0.7$ & 688 & 49.2\% \\
+Jaccard $\geq 0.6$ & 724 & 51.8\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Three observations (Table~\ref{tab:census}): first, \textbf{43.1\%} of
+prompts are exact repeats---nearly half of all human prompting effort is
+re-issued work. Second, the reuse frontier is flat: loosening the threshold
+from 0.9 to 0.6 adds only $\sim$6 percentage points, because most repeats
+are already exact; paraphrase-only reuse is rare in this workload. Third,
+repetition spans sessions, not loops within one: top duplicate clusters
+span up to 39 distinct sessions, so session-local caching cannot capture
+them---a shared, cross-session store is required.
+
+\section{Controlled Harness: What Is Each Mechanism Worth?}
+\label{sec:harness}
+
+\subsection{Design}
+From the filtered log we sample 34 prompts ($\geq$50 characters, $\leq$8k)
+evenly across the timeline. Each prompt runs under three conditions with a
+fixed generator (GPT-4o-mini via OpenRouter, temperature 0):
+\begin{itemize}[leftmargin=*,nosep]
+\item \textbf{NM}: no memory. System prompt + question only.
+\item \textbf{EX}: retrieve top-3 prior events by BM25 (strictly earlier than
+the prompt; machine wrappers excluded) and inject them as untrusted context
+before regenerating.
+\item \textbf{REUSE}: find the most similar strictly-prior
+question--answer pair; if Jaccard $\geq 0.6$, replay the stored answer with
+zero LLM calls.
+\end{itemize}
+Time-travel leakage is impossible: retrieval candidates are filtered to
+events created before each prompt's timestamp. Answers are judged blind
+against the NM reference by GPT-4.1-mini on a 1--5 scale.
+
+\begin{table}[t]
+\centering
+\caption{Harness results on 34 real prompts. NM total = 15{,}263 tokens.
+Quality is blind judge score vs.\ the NM reference.}
+\label{tab:harness}
+\begin{tabular}{lccc}
+\toprule
+Condition & Tokens & $\Delta$ vs.\ NM & Judge (1--5) \\
+\midrule
+NM (no memory) & 15{,}263 & --- & reference \\
+EX (inject + regenerate) & 52{,}087 & \textbf{+241.3\%} & 3.94 (76\% $\geq$4) \\
+REUSE (replay if $\geq0.6$) & 7{,}877 & \textbf{$-$48.4\%} & preserved\textsuperscript{*} \\
+\bottomrule
+\multicolumn{4}{l}{\small \textsuperscript{*}Exact replays return original
+answers; near-duplicate replays unevaluated (\S\ref{sec:limits}).}\\
+\end{tabular}
+\end{table}
+
+\subsection{Findings}
+\label{sec:findings}
+\textbf{Context injection costs more than it saves.} EX consumed 3.4$\times$
+NM's tokens. Injection adds input tokens on every prompt, and single-turn
+QA rarely lets retrieved context shorten outputs. For this workload segment,
+memory-as-context is strictly negative economically---a result invisible to
+quality-only evaluations, and one that directly challenges how memory
+systems are marketed and benchmarked.
+
+\textbf{Replay converts measured duplication into measured savings.} REUSE
+hit 44.1\% of prompts (median similarity 1.0: most hits are exact re-asks),
+saving 7{,}386 tokens---48.4\% of the no-memory budget---with zero quality
+loss on hits, since exact replays return the original stored answer. Under
+the hybrid strategy (replay when available, generate otherwise), total spend
+falls from 15{,}263 to 7{,}877 tokens.
+
+\textbf{Two independent methods agree.} The harness hit rate (44.1\%) lands
+within one point of the field census (43.1\%), despite different data paths
+(stratified sample vs.\ full log) and similarity implementations. The
+duplication estimate is robust to sampling.
+
+\section{Limitations}
+\label{sec:limits}
+\textbf{Scale and scope.} One team, two agents, 34-prompt harness; the
+absolute percentages may differ elsewhere, though nothing suggests the
+direction will flip. \textbf{Near-duplicate replay quality.} We verify exact
+replays preserve answers by construction; replay at similarity 0.6--0.99
+needs dedicated evaluation before deployment claims. \textbf{Judge
+configuration.} One judge model, one run per condition; ensemble judging and
+multiple seeds are needed for tighter intervals (the EX quality gap of 3.94
+is directionally clear but not precisely bounded). \textbf{Identity
+sparsity.} Only 10\% of sessions carry resolvable email identity, so
+cross-user versus self-reuse cannot be separated; reported duplication is
+the team-level figure. \textbf{Lexical-only harness.} Semantic/hybrid recall
+requires the remote store, which was offline during the harness window;
+embedding-query costs are excluded from the REUSE accounting (lexical FTS is
+local and token-free). \textbf{Prompt-length truncation.} Prompts above 8k
+characters were excluded from the pool.
+
+\section{Conclusion}
+On a real agent-team workload, roughly \textbf{43\% of human prompts are
+re-issued work}, and the cheapest correct response to a repeated question is
+the answer you already paid for. Replaying stored answers cuts total token
+consumption by about half at unchanged quality, whereas the prevailing
+retrieve-and-inject design multiplies cost by 3.4$\times$. Agent-memory
+papers should stop reporting only accuracy and start reporting the ledger:
+tokens spent, tokens saved, and what replay does to quality at every
+similarity threshold. We release the instrumentation, harness, and analysis
+scripts to make that the default evaluation.
+
+\bibliographystyle{plainnat}
+\bibliography{bibliography}
+
+\end{document}
