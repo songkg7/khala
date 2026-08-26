@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 import sqlite3
@@ -47,13 +48,16 @@ def _jaccard(a: set, b: set) -> float:
     return len(a & b) / len(u) if u else 0.0
 
 
-def _parse_ts(raw: str) -> tuple[int, str]:
+def _parse_ts(raw: str) -> tuple[int, str, str]:
+    """Return (order, sortable_key, display_date) from ISO or epoch timestamps."""
     raw = raw.strip()
     if raw[:4].isdigit() and raw[4] == "-":
-        return (0, raw)
+        return (0, raw, raw[:10])
     if raw.isdigit():
-        return (1, raw)
-    return (2, raw)
+        dt = datetime.fromtimestamp(int(raw), tz=timezone.utc)
+        iso = dt.strftime("%Y-%m-%dT%H:%M:%S")
+        return (1, iso, dt.strftime("%Y-%m-%d"))
+    return (2, raw, "")
 
 
 def main() -> None:
@@ -83,6 +87,7 @@ def main() -> None:
     n = len(human)
     normed = [_norm(e["content"]) for e in human]
     gram_sets = [_ngrams(c) for c in normed]
+    days = [_parse_ts(e["created_at"])[2] for e in human]
 
     # Exact duplicate (first occurrence fresh, repeats are hits)
     seen_exact: set[str] = set()
@@ -115,8 +120,8 @@ def main() -> None:
             "n_prompts_human": n,
             "n_prompts_all_user": len(all_user),
             "machine_filtered_pct": machine_frac,
-            "first_day": human[0]["created_at"][:10] if human else None,
-            "last_day": human[-1]["created_at"][:10] if human else None,
+            "first_day": min((d for d in days if d), default=None),
+            "last_day": max((d for d in days if d), default=None),
         },
         "exact": {
             "fresh": first_fresh,
