@@ -162,6 +162,36 @@ class KhalaEmbeddingsTest(unittest.TestCase):
         self.assertEqual(headers_lc.get("http-referer"), "https://github.com/songkg7/khala")
         self.assertTrue(headers_lc["authorization"].startswith("Bearer "))
 
+    def test_token_usage_accumulates_and_resets(self):
+        payload = {
+            "data": [
+                {"embedding": [0.1] * 1536, "index": 0},
+                {"embedding": [0.2] * 1536, "index": 1},
+            ],
+            "usage": {"prompt_tokens": 11, "total_tokens": 13},
+        }
+        with patch.dict(os.environ, TEST_API_KEY_ENV, clear=False):
+            with patch("urllib.request.urlopen", side_effect=lambda req, timeout=None: self._response(payload)):
+                self.emb.embedding_token_usage()  # reset
+                self.emb.embed(["a", "b"])
+        self.assertEqual(
+            self.emb.embedding_token_usage(),
+            {"prompt_tokens": 11, "total_tokens": 13},
+        )
+        # reader resets the counter
+        self.assertEqual(self.emb.embedding_token_usage(), {"prompt_tokens": 0, "total_tokens": 0})
+
+    def test_token_usage_absent_or_invalid_is_ignored(self):
+        payload = {
+            "data": [{"embedding": [0.3] * 1536, "index": 0}],
+            "usage": {"prompt_tokens": "many", "total_tokens": -5},
+        }
+        with patch.dict(os.environ, TEST_API_KEY_ENV, clear=False):
+            with patch("urllib.request.urlopen", side_effect=lambda req, timeout=None: self._response(payload)):
+                self.emb.embedding_token_usage()
+                self.emb.embed(["a"])
+        self.assertEqual(self.emb.embedding_token_usage(), {"prompt_tokens": 0, "total_tokens": 0})
+
     def test_embed_splits_batches_by_input_count(self):
         batch_sizes = []
 

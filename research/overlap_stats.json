@@ -1,0 +1,72 @@
+{
+  "scope": {
+    "total_sessions": 435,
+    "total_events": 35968,
+    "user_prompts_raw": 1609,
+    "machine_wrapper_filtered": 210,
+    "user_prompts_human": 1399,
+    "actor_count": 2,
+    "first_day": "2026-04-09",
+    "last_day": "2026-08-25",
+    "active_days": 60
+  },
+  "overlap_human": {
+    "n": 1399,
+    "distinct_prompts": 796,
+    "exact_dup_prompts_pct": 52.47,
+    "pairs_total": 977901,
+    "exact_dup_pairs_pct": 0.62,
+    "approx_jaccard_ge": {
+      "0.7": {
+        "pairs": 7786,
+        "pair_pct": 0.8
+      },
+      "0.8": {
+        "pairs": 7624,
+        "pair_pct": 0.78
+      },
+      "0.9": {
+        "pairs": 7032,
+        "pair_pct": 0.72
+      }
+    },
+    "same_actor": {
+      "pairs": 11325,
+      "exact_pairs_pct": 9.61
+    },
+    "cross_actor": {
+      "pairs": 966576,
+      "exact_pairs_pct": 0.51
+    }
+  },
+  "overlap_all_user": {
+    "n": 1609,
+    "distinct_prompts": 884,
+    "exact_dup_prompts_pct": 54.69,
+    "pairs_total": 1293636,
+    "exact_dup_pairs_pct": 0.59,
+    "approx_jaccard_ge": {
+      "0.7": {
+        "pairs": 14364,
+        "pair_pct": 1.11
+      },
+      "0.8": {
+        "pairs": 14197,
+        "pair_pct": 1.1
+      },
+      "0.9": {
+        "pairs": 13603,
+        "pair_pct": 1.05
+      }
+    },
+    "same_actor": {
+      "pairs": 11628,
+      "exact_pairs_pct": 9.36
+    },
+    "cross_actor": {
+      "pairs": 1282008,
+      "exact_pairs_pct": 0.52
+    }
+  },
+  "note": "aggregate-only; no raw prompt content included. machine_wrapper_filtered excludes codex_internal_context / tool-call summaries / system markers captured as user events."
+}

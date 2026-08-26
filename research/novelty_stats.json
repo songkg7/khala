@@ -1,0 +1,42 @@
+{
+  "scope": {
+    "n_prompts_human": 1399,
+    "n_prompts_all_user": 1609,
+    "machine_filtered_pct": 13.05,
+    "first_day": "2026-04-09",
+    "last_day": "1785583147"
+  },
+  "exact": {
+    "fresh": 796,
+    "fresh_pct": 56.9,
+    "repeats": 603,
+    "repeats_pct": 43.1
+  },
+  "approximate": {
+    "0.6": {
+      "fresh": 675,
+      "fresh_pct": 48.25,
+      "reuse_possible": 724,
+      "reuse_possible_pct": 51.75
+    },
+    "0.7": {
+      "fresh": 711,
+      "fresh_pct": 50.82,
+      "reuse_possible": 688,
+      "reuse_possible_pct": 49.18
+    },
+    "0.8": {
+      "fresh": 727,
+      "fresh_pct": 51.97,
+      "reuse_possible": 672,
+      "reuse_possible_pct": 48.03
+    },
+    "0.9": {
+      "fresh": 756,
+      "fresh_pct": 54.04,
+      "reuse_possible": 643,
+      "reuse_possible_pct": 45.96
+    }
+  },
+  "note": "'fresh' = no sufficiently similar earlier prompt (LLM generation needed). 'reuse_possible' = an earlier prompt was similar enough to serve as memory hit. Exact = normalized content match. Approximate = character 3-gram Jaccard ≥ threshold, per prompt against all chronologically earlier prompts. Very short prompts (<4 n-grams) are always counted as fresh."
+}

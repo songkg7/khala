@@ -40,6 +40,20 @@ class EmbeddingError(Exception):
     """Embedding generation failure (retryable) — never contains secrets."""
 
 
+# Token usage accumulator. Each call to embed() increments this.
+# Thread-safe for sequential worker usage; for concurrent callers add a lock.
+# ponytail: module-level counter, add threading.Lock when workers become concurrent.
+_token_usage: dict[str, int] = {"prompt_tokens": 0, "total_tokens": 0}
+
+
+def embedding_token_usage() -> dict[str, int]:
+    """Return accumulated usage and reset counters."""
+    global _token_usage
+    val = dict(_token_usage)
+    _token_usage = {"prompt_tokens": 0, "total_tokens": 0}
+    return val
+
+
 def _load_dotenv(path: Path | None = None) -> None:
     """Load OPENROUTER_API_KEY (and other KEY=VALUE lines) from a .env file.
 
@@ -159,6 +173,13 @@ def _ordered_vectors(body: object, expected_count: int) -> list[list[float]]:
     data = body.get("data")
     if not isinstance(data, list) or len(data) != expected_count:
         raise EmbeddingError("embedding response count does not match request")
+    # Accumulate usage from response if present (OpenRouter includes usage)
+    usage = body.get("usage")
+    if isinstance(usage, dict):
+        for k in ("prompt_tokens", "total_tokens"):
+            v = usage.get(k)
+            if isinstance(v, int) and v >= 0:
+                _token_usage[k] = _token_usage.get(k, 0) + v
 
     ordered: list[list[float] | None] = [None] * expected_count
     for item in data:
