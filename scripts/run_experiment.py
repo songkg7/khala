@@ -250,6 +250,8 @@ def load_reuse_pairs(db_path: str) -> list[dict[str, object]]:
                     "created_at": sort_key(row["created_at"])[1],
                 }
         elif role == "assistant" and row["session_id"] in pending_user:
+            if _is_machine(row["content"]):
+                continue  # wrapper blob, not a real answer; wait for the real reply
             user_event = pending_user.pop(row["session_id"])
             pairs.append(
                 {

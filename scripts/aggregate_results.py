@@ -10,8 +10,9 @@ def main() -> None:
     results_dir = Path("research/results")
     pids = sorted({p.name.split("_")[0] for p in results_dir.glob("*_NM.json")})
 
-    nm_tok, ex_tok, reuse_savings, hits, misses = [], [], [], 0, 0
-    judge_scores, ex_hit_judges = [], []
+    nm_tok, ex_tok, reuse_savings = [], [], []
+    hits, misses, ex_with_hits = 0, 0, 0
+    judge_scores = []
     sims_on_hit = []
 
     for pid in pids:
@@ -22,10 +23,10 @@ def main() -> None:
 
         nm_tok.append(nm["usage"]["total_tokens"])
         ex_tok.append(ex["usage"]["total_tokens"])
+        if ex["memory_hits"] > 0:
+            ex_with_hits += 1
         if jd["score_ex_vs_nm"] > 0:
             judge_scores.append(jd["score_ex_vs_nm"])
-            if ex["memory_hits"] > 0:
-                ex_hit_judges.append(jd["score_ex_vs_nm"])
         if ru.get("hit"):
             hits += 1
             reuse_savings.append(ru["saved_input_tokens"])
@@ -39,10 +40,11 @@ def main() -> None:
 
     print(f"n prompts: {n}")
     print()
-    print("=== Condition totals (all 34 prompts) ===")
+    print(f"=== Condition totals ({n} prompts) ===")
     print(f"NM   total tokens : {nm_total:>8}  mean/prompt {statistics.mean(nm_tok):>7.1f}")
     print(f"EX   total tokens : {ex_total:>8}  mean/prompt {statistics.mean(ex_tok):>7.1f}")
     print(f"EX overhead vs NM : {ex_total - nm_total:+d} tok ({100*(ex_total-nm_total)/nm_total:+.1f}%)")
+    print(f"EX prompts w/ hits: {ex_with_hits}/{n}")
     print()
     print("=== REUSE (replay prior Q&A) ===")
     print(f"hit rate          : {hits}/{n} = {100*hits/n:.1f}%")
@@ -68,7 +70,7 @@ def main() -> None:
             "NM": {"total_tokens": nm_total, "mean_per_prompt": round(statistics.mean(nm_tok), 1)},
             "EX": {"total_tokens": ex_total, "mean_per_prompt": round(statistics.mean(ex_tok), 1),
                    "overhead_vs_NM_pct": round(100 * (ex_total - nm_total) / nm_total, 1),
-                   "prompts_with_hits": sum(1 for j in range(len(pids)) if True) },
+                   "prompts_with_hits": ex_with_hits},
             "REUSE": {"hit_rate_pct": round(100 * hits / n, 1), "hits": hits,
                       "tokens_saved": reuse_total_saved,
                       "saved_vs_NM_pct": round(100 * reuse_total_saved / nm_total, 1),

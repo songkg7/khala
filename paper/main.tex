@@ -37,7 +37,7 @@ similar past events into context and regenerating---\emph{increases} token
 consumption by 241\% while scoring 3.94/5 against the no-memory reference.
 In contrast, replaying the stored answer to a sufficiently similar earlier
 question eliminates generation entirely for 44.1\% of prompts, cutting total
-token consumption by \textbf{48.4\%} at unchanged answer quality (exact
+token consumption by \textbf{46.4\%} at unchanged answer quality (exact
 replays return original answers). The harness hit rate independently
 cross-validates the field measurement ($44.1\%$ vs.\ $43.1\%$). Our results
 reframe agent-memory evaluation: savings come from avoiding regeneration,
@@ -80,7 +80,7 @@ single-turn QA; memory-as-context is an overhead mechanism, not a savings
 mechanism (\S\ref{sec:harness}).
 \item \textbf{Replay is the savings lever.} Replaying the stored answer for
 a sufficiently similar prior question removes generation for 44.1\% of
-prompts, reducing total tokens by 48.4\% while preserving answer quality by
+prompts, reducing total tokens by 46.4\% while preserving answer quality by
 construction; the harness rate cross-validates the field census
 (\S\ref{sec:harness}).
 \end{itemize}
@@ -198,7 +198,7 @@ Condition & Tokens & $\Delta$ vs.\ NM & Judge (1--5) \\
 \midrule
 NM (no memory) & 15{,}263 & --- & reference \\
 EX (inject + regenerate) & 52{,}087 & \textbf{+241.3\%} & 3.94 (76\% $\geq$4) \\
-REUSE (replay if $\geq0.6$) & 7{,}877 & \textbf{$-$48.4\%} & preserved\textsuperscript{*} \\
+REUSE (replay if $\geq0.6$) & 8{,}181 & \textbf{$-$46.4\%} & preserved\textsuperscript{*} \\
 \bottomrule
 \multicolumn{4}{l}{\small \textsuperscript{*}Exact replays return original
 answers; near-duplicate replays unevaluated (\S\ref{sec:limits}).}\\
@@ -216,10 +216,10 @@ systems are marketed and benchmarked.
 
 \textbf{Replay converts measured duplication into measured savings.} REUSE
 hit 44.1\% of prompts (median similarity 1.0: most hits are exact re-asks),
-saving 7{,}386 tokens---48.4\% of the no-memory budget---with zero quality
+saving 7{,}082 tokens---46.4\% of the no-memory budget---with zero quality
 loss on hits, since exact replays return the original stored answer. Under
 the hybrid strategy (replay when available, generate otherwise), total spend
-falls from 15{,}263 to 7{,}877 tokens.
+falls from 15{,}263 to 8{,}181 tokens.
 
 \textbf{Two independent methods agree.} The harness hit rate (44.1\%) lands
 within one point of the field census (43.1\%), despite different data paths

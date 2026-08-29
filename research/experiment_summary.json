@@ -11,18 +11,18 @@
       "total_tokens": 52087,
       "mean_per_prompt": 1532.0,
       "overhead_vs_NM_pct": 241.3,
-      "prompts_with_hits": 34
+      "prompts_with_hits": 27
     },
     "REUSE": {
       "hit_rate_pct": 44.1,
       "hits": 15,
-      "tokens_saved": 7386,
-      "saved_vs_NM_pct": 48.4,
+      "tokens_saved": 7082,
+      "saved_vs_NM_pct": 46.4,
       "median_similarity_hit": 1.0
     },
     "HYBRID_strategy": {
-      "total_tokens": 7877,
-      "reduction_vs_NM_pct": 48.4
+      "total_tokens": 8181,
+      "reduction_vs_NM_pct": 46.4
     }
   },
   "quality": {
