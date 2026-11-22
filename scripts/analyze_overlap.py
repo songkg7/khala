@@ -1,7 +1,7 @@
 """Measure natural prompt-overlap (중복률) in the real Khala event store.
 
 Read-only analysis of a *copy* of the live SQLite DB. Produces aggregate
-statistics only — never dumps raw prompt content.
+statistics only — never exports prompt text or actor identifiers.
 
 Key design decision: machine-generated wrapper events (Codex internal
 context blocks, tool-call summaries, delegation markers) are captured as
@@ -99,11 +99,7 @@ def main() -> None:
         "user_prompts_human": len(human),
     }
 
-    actor_counts = Counter(
-        (e["user_email"] or e["user_name"] or "?") for e in human
-    )
-    scope["actor_count"] = len(actor_counts)
-    scope["top_actors"] = [{"actor": a, "prompts": c} for a, c in actor_counts.most_common(10)]
+    scope["actor_count"] = len({e["user_email"] or e["user_name"] or "?" for e in human})
 
     dates = [e["created_at"][:10] for e in human if re.match(r"\d{4}-\d{2}-\d{2}", e["created_at"])]
     scope["first_day"] = min(dates) if dates else None

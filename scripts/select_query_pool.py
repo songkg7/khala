@@ -1,7 +1,7 @@
 """Select the experiment query pool from a read-only copy of khala.db.
 
 Human prompts only (machine wrappers filtered), length >= 50 chars, sampled
-evenly across the log. Output: research/query_pool.json
+evenly across the log. Output: private research/query_pool.json; do not commit.
 """
 from __future__ import annotations
 

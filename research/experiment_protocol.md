@@ -26,6 +26,16 @@ All conditions use the **same LLM** for generation (Sonnet 4, gpt-5.6-terra, or 
 All human prompts from the Khala event store (n=1,399 after machine-wrapper filtering, Apr–Aug 2026, 60 active days, 2 actors).
 
 ### Query pool selection
+Keep the real query pool (`research/query_pool.json`) and per-prompt results
+(`research/results/`) local and out of Git. Publish only reviewed aggregates of
+real sessions, without prompt text, answers, per-event timestamps, or identifiers.
+
+[`query_pool.sample.json`](query_pool.sample.json) is a hand-written example,
+not derived from real sessions or used for the paper's metrics. Pass it as
+`--pool research/query_pool.sample.json` to `scripts/run_experiment.py`. Use a
+separate synthetic Khala database (`--db`) and output directory (`--out`); the
+runner uses OpenRouter for generation and judging.
+
 Filter to prompts where LLM generation cost is non-trivial (token length ≥ 50 chars). Sample stratified by:
 - **Identity known** (user_email present vs absent)
 - **Time period** (early / middle / late)
@@ -84,8 +94,8 @@ All runs go through a `run_experiment.py` script that:
 - Reads query pool
 - For each prompt, creates the appropriate Khala recall call (or NM bypass)
 - Counts every token from generation + embedding responses
-- Pushes raw results to `research/results/raw/{condition}_{prompt_id}.json`
-- Aggregates to `research/results/aggregated_*.json`
+- Writes private per-prompt files to `research/results/`
+- Use `scripts/aggregate_results.py` to produce `research/experiment_summary.json`
 
 ### Token sourcing
 - **Generation tokens**: from LLM API response `usage` field

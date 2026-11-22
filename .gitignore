@@ -31,3 +31,7 @@ htmlcov/
 *.db-journal
 .khala-worker.log*
 .env
+
+# Private research data: publish reviewed aggregates only.
+/research/query_pool.json
+/research/results/

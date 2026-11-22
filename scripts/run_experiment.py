@@ -13,6 +13,8 @@ Usage:
         --out research/results --limit 40
 
 Incremental: skips prompt/condition pairs whose result file already exists.
+Only use data permitted for OpenRouter processing. Outputs may include session
+text or identifying context; keep per-prompt results local and out of Git.
 """
 from __future__ import annotations
 
