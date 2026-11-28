@@ -15,13 +15,22 @@ PLUGIN_NAME = "khala"
 PLUGIN_SOURCE_DIR = Path(__file__).resolve().parent / "plugins" / "hermes"
 
 
-def install_hermes_plugin(hermes_home: Path | None = None) -> Path:
-    """Copy the bundled Hermes plugin into ~/.hermes/plugins/khala/."""
+def install_hermes_plugin(
+    hermes_home: Path | None = None, *, executable: Path | None = None
+) -> Path:
+    """Copy the bundled Hermes plugin into ~/.hermes/plugins/khala/.
+
+    Writes ``khala-executable`` so the plugin never depends on the gateway's
+    PATH (launchd/LaunchServices usually lacks ``~/.local/bin``).
+    """
     plugins_dir = (hermes_home or Path.home() / ".hermes") / "plugins"
     target = plugins_dir / PLUGIN_NAME
     if target.is_dir():
         shutil.rmtree(target)
     shutil.copytree(PLUGIN_SOURCE_DIR, target)
+    resolved = (executable or _resolve_executable("khala")).expanduser().absolute()
+    if resolved.is_file():
+        (target / "khala-executable").write_text(str(resolved) + "\n", encoding="utf-8")
     return target
 
 
@@ -86,7 +95,7 @@ def install_hermes_hooks(
         else _validated_executable(hermes_executable, "hermes")
     )
     config_path = Path(_run_hermes(hermes, "config", "path")).expanduser().absolute()
-    plugin_path = install_hermes_plugin(config_path.parent)
+    plugin_path = install_hermes_plugin(config_path.parent, executable=khala)
     _enable_plugin(hermes)
     hooks = _load_hooks(hermes)
     changed = _merge_hooks(hooks, _handler(khala))

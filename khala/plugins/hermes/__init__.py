@@ -10,10 +10,24 @@ session, so double-fire alongside a shell hook is harmless.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
 _KHALA_TIMEOUT = 30
+# Written by `khala install hermes` next to this file so lookups never depend
+# on the gateway/launchd PATH (which usually lacks ~/.local/bin). Absent in
+# the source-tree copy; falls back to a PATH lookup.
+_EXECUTABLE_MARKER = Path(__file__).resolve().parent / "khala-executable"
+
+
+def _khala_executable() -> str:
+    if _EXECUTABLE_MARKER.is_file():
+        candidate = _EXECUTABLE_MARKER.read_text(encoding="utf-8").strip()
+        if candidate and Path(candidate).is_file():
+            return candidate
+    resolved = shutil.which("khala")
+    return resolved if resolved else "khala"
 
 
 def _spawn(event: str, kwargs: dict) -> None:
@@ -24,7 +38,7 @@ def _spawn(event: str, kwargs: dict) -> None:
     }
     try:
         subprocess.run(
-            ["khala", "hook", "hermes"],
+            [_khala_executable(), "hook", "hermes"],
             input=json.dumps(payload),
             capture_output=True,
             text=True,
